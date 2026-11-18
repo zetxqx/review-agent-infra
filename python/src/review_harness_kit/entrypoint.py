@@ -12,7 +12,16 @@ from urllib.parse import urlsplit
 
 from google.protobuf import json_format
 
+from review_harness_kit.adapters.aider import AiderAdapter
+from review_harness_kit.adapters.codex import CodexAdapter
+from review_harness_kit.adapters.command import CommandAdapter, MockLLMAdapter, SingleShotAdapter
+from review_harness_kit.adapters.goose import GooseAdapter
+from review_harness_kit.adapters.mini_swe_agent import MiniSWEAgentAdapter
+from review_harness_kit.adapters.opencode import OpenCodeAdapter
+from review_harness_kit.adapters.openhands import OpenHandsAdapter
+from review_harness_kit.adapters.pr_agent import PRAgentAdapter
 from review_harness_kit.contracts import (
+    HarnessAdapter,
     HarnessInvocation,
     HarnessUnsupportedError,
     ProcessResult,
@@ -24,6 +33,31 @@ from review_harness_kit.gen.review.v1 import review_pb2
 from review_harness_kit.normalizer import EMBEDDED_SCHEMA_PATH, normalize, write_report
 
 HarnessUnsupported = HarnessUnsupportedError
+
+BUILTIN_ADAPTERS: dict[str, type[HarnessAdapter]] = {
+    "pr-agent": PRAgentAdapter,
+    "openhands": OpenHandsAdapter,
+    "codex": CodexAdapter,
+    "mini-swe-agent": MiniSWEAgentAdapter,
+    "opencode": OpenCodeAdapter,
+    "goose": GooseAdapter,
+    "aider": AiderAdapter,
+    "command": CommandAdapter,
+    "external-cmd": CommandAdapter,
+    "mock-llm": MockLLMAdapter,
+    "single-shot": SingleShotAdapter,
+}
+
+
+def resolve_adapter(name: str) -> HarnessAdapter:
+    try:
+        return load_adapter(name)
+    except LookupError:
+        canonical = name.strip().replace("_", "-")
+        adapter_cls = BUILTIN_ADAPTERS.get(canonical)
+        if adapter_cls is not None:
+            return adapter_cls()
+        raise
 
 DEFAULT_IN_DIR = Path("/workspace/.review/in")
 DEFAULT_OUT_DIR = Path("/workspace/.review/out")
@@ -329,7 +363,7 @@ def run_command(stdin: BinaryIO, argv: list[str] | None = None) -> int:
     apply_task_defaults(task, task_file, args)
 
     adapter_name = task.harness.adapter or task.harness.profile
-    adapter = load_adapter(adapter_name)
+    adapter = resolve_adapter(adapter_name)
 
     out_dir = Path(task.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
