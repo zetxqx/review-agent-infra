@@ -1,74 +1,74 @@
-# review-agent-infra Go 全栈实现方案与开发计划
+# review-agent-infra Concrete Go Implementation Plan
 
-> 本文档对应 [高层架构设计（HLD）](hld.md) 的工程落地规格，定义全栈 Golang 的仓库布局、包依赖边界、核心 `interface`、PostgreSQL 并发状态机、K8s gVisor Exec 沙箱、`cmd/harness` 与 `cmd/adapter` 关键实现逻辑及 M1~M4 开发计划。
+> This document defines the engineering implementation plan for the [High-Level Design (HLD)](hld.md): Go repository layout, acyclic package boundaries, core `interface` definitions, PostgreSQL concurrent state machine, Kubernetes gVisor Exec sandbox, `cmd/harness` and `cmd/adapter` core logic, and M1-M4 milestones.
 
 ---
 
-## 1. Go-First 全栈选型与包依赖架构
+## 1. Go-First Stack and Package Dependency Architecture
 
-全系统采用 **单一 Go Module（`github.com/zetxqx/review-agent-infra`）** 产出 4 个独立二进制，既能以单一语言统一研发维护，又能把沙箱内二进制做到零 Python 运行时依赖：
+The entire system lives in a **single Go module (`github.com/zetxqx/review-agent-infra`)** producing four binaries. This unifies engineering maintenance in Go while keeping the in-sandbox binary free of any Python runtime dependencies:
 
-| 二进制入口 | 运行位置 | 核心职责 | 关键工程考量 |
+| Binary | Runtime Location | Core Responsibilities | Key Engineering Notes |
 | :--- | :--- | :--- | :--- |
-| **`cmd/controller`** | 受信任控制面 Pod | Webhook 接入与准入限流、PG 状态机、防抖取消、K8s 沙箱调度、去噪发布与反馈轮询 | 单体低内存二进制，原生用 `k8s.io/client-go` 管理沙箱 Pod 与 Exec 流 |
-| **`cmd/adapter`** | 沙箱外独立微代理 Pod（首期单副本） | 校验 HMAC-SHA256 短期令牌、CAS 预算预留结算、调用 `UpstreamProvider` 注路由 Header 与 `429/503` 重试 | `net/http` 独立暴露 ClusterIP，沙箱仅直连此端口，真凭据不入沙箱 |
-| **`cmd/harness`** | 沙箱 Pod 内 | `--wait` 空转守候、`--unpack` 安全解包、`--run-stdin-env` 两阶段只读推理循环、`--read-report` 吐出结果 | `CGO_ENABLED=0` 静态单文件打入极简镜像；同时保留 `AgentTask.json` 文件契约以兼容未来换用 OpenHands |
-| **`cmd/reviewctl`** | 开发者本地 / CI 测试 | 本地 `git diff` 审查（`localcli`）与历史 PR 离线回放评测 | 复用 `internal/harness`、`internal/llmclient`、`internal/publisher` 与 `internal/tools`，M1 即可跑通 |
+| **`cmd/controller`** | Trusted control-plane Pod | Webhook intake, admission/rate-limiting, PG state machine, debounce/cancellation, K8s sandbox orchestration, dedup/publishing, and feedback polling | Single low-memory binary using `k8s.io/client-go` directly for sandbox Pods and Exec streams |
+| **`cmd/adapter`** | Standalone micro-proxy Pod outside sandbox (1 replica in Phase 1-3) | Verify HMAC-SHA256 task tokens, atomic CAS token budget reservation/settlement, call `UpstreamProvider` to inject routing headers, and retry `429/503` | Exposes ClusterIP over `net/http`; the sandbox reaches only this port and never holds real upstream credentials |
+| **`cmd/harness`** | Inside sandbox Pod | `--wait` idle PID 1, `--unpack` safe tar extraction, `--run-stdin-env` two-stage read-only loop, `--read-report` output stream | Compiled with `CGO_ENABLED=0` into a static binary; preserves the `AgentTask.json` file contract for future OpenHands swaps |
+| **`cmd/reviewctl`** | Developer laptop / CI | Local `git diff` review (`localcli`) and offline historical PR replay evaluation | Reuses `internal/harness`, `internal/llmclient`, `internal/publisher`, and `internal/tools` without K8s or PG in M1 |
 
-### 1.1 仓库目录树与严格单向依赖
+### 1.1 Repository Layout and Strict Acyclic Dependencies
 
 ```text
 review-agent-infra/
 ├── cmd/
-│   ├── controller/           # 控制面服务入口
-│   ├── adapter/              # Inference Adapter 代理服务入口
-│   ├── harness/              # 沙箱静态执行器入口 (--wait / --unpack / --run-stdin-env / --read-report)
-│   └── reviewctl/            # 本地 CLI 与离线回放工具
+│   ├── controller/           # Control-plane service entrypoint
+│   ├── adapter/              # Inference Adapter proxy entrypoint
+│   ├── harness/              # Static sandbox runner (--wait / --unpack / --run-stdin-env / --read-report)
+│   └── reviewctl/            # Local CLI and offline replay evaluation tool
 ├── pkg/
-│   └── contract/             # 全局共享数据结构与插件接口 (仅依赖标准库)
+│   └── contract/             # Shared structs and plugin interfaces (stdlib only)
 └── internal/
-    ├── token/                # HMAC-SHA256 短期令牌签发与验签
-    ├── telemetry/            # OpenTelemetry 与 Prometheus 指标注册 (预算/KV 指标由 adapter 上报)
-    ├── llmclient/            # 纯标准库 OpenAI 兼容 HTTP 客户端 (实现 contract.InferenceClient)
-    ├── tools/                # 离线只读工具集 (os.Root 守卫 + 安全 exec rg + go/parser 大纲 + 可选 scoped_test)
-    ├── inference/            # Adapter 核心代理、CAS 预算账本、UpstreamProvider 插件 (llmd/vllm/ollama) 与重试
-    ├── harness/              # 两阶段只读循环、前缀稳定拼装、JSON Schema 校验与纠错重试
+    ├── token/                # HMAC-SHA256 short-lived token signing and verification
+    ├── telemetry/            # OpenTelemetry and Prometheus metrics (budget/KV metrics reported by adapter)
+    ├── llmclient/            # Pure stdlib OpenAI-compatible HTTP client (implements contract.InferenceClient)
+    ├── tools/                # Offline read-only tools (os.Root jail, safe exec rg, go/parser outlines, optional scoped_test)
+    ├── inference/            # Adapter proxy core, CAS budget ledger, UpstreamProvider plugin (llmd/vllm/ollama), retries
+    ├── harness/              # Two-stage read-only loop, stable prefix builder, JSON Schema validation & retry
     ├── vcs/
-    │   ├── github/           # GitHub App 验签、Tarball/Diff/BaseRules 拉取、幂等 PublishReview、可选 FetchCheckLogs
-    │   └── localcli/         # 本地 git diff 触发与终端打印
-    ├── store/                # PostgreSQL 建表迁移、SKIP LOCKED 队列、防抖锁与指纹表
-    ├── sandbox/              # K8s gVisor Pod Exec 调度器与本地 Docker Runner
-    ├── publisher/            # Diff Hunk 解析、target_line_text 原文对齐、两级降级与 Prow 清洗
-    └── orchestrator/         # 准入控制 (draft/bot/首次贡献者/限流)、调度 Worker 主循环、分片与汇总去噪
+    │   ├── github/           # GitHub App signature check, tarball/diff/base-rules fetch, idempotent PublishReview, optional FetchCheckLogs
+    │   └── localcli/         # Local git diff trigger and terminal output
+    ├── store/                # PostgreSQL migrations, SKIP LOCKED queue, debounce locks, and fingerprint store
+    ├── sandbox/              # K8s gVisor Pod Exec runner and local Docker runner
+    ├── publisher/            # Diff hunk parser, target_line_text verbatim alignment, two-tier fallback, Prow scrubbing
+    └── orchestrator/         # Admission checks (draft/bot/first-time contributor/rate limit), Worker loop, sharding & dedup pipeline
 ```
 
-各二进制与包的依赖严格单向无环，确保 `cmd/harness` 不拉入 `client-go`、`telemetry` 或 PostgreSQL 驱动：
+Dependencies stay strictly acyclic so `cmd/harness` never pulls in `client-go`, `telemetry`, or PostgreSQL drivers:
 
 ```mermaid
 flowchart LR
-    subgraph SG_CMD ["可执行二进制入口 (cmd)"]
+    subgraph SG_CMD ["Executable Binaries (cmd)"]
         C_Ctrl["cmd/controller"]
         C_Adapt["cmd/adapter"]
-        C_Harn["cmd/harness (CGO=0 静态编译)"]
+        C_Harn["cmd/harness (CGO=0 Static Binary)"]
         C_CLI["cmd/reviewctl"]
     end
 
-    subgraph SG_CORE ["业务实现层 (internal)"]
-        Orch["internal/orchestrator (含准入与 Worker)"]
-        VCS["internal/vcs/github 与 localcli"]
+    subgraph SG_CORE ["Implementations (internal)"]
+        Orch["internal/orchestrator (Admission & Worker)"]
+        VCS["internal/vcs/github & localcli"]
         Store["internal/store"]
         Sand["internal/sandbox"]
         Pub["internal/publisher"]
-        Infer["internal/inference (含 UpstreamProvider)"]
+        Infer["internal/inference (with UpstreamProvider)"]
         Harn["internal/harness"]
-        LLM["internal/llmclient (纯标准库)"]
+        LLM["internal/llmclient (Stdlib Only)"]
         Tools["internal/tools"]
         Tok["internal/token"]
         Tel["internal/telemetry"]
     end
 
-    subgraph SG_API ["纯净契约层 (pkg)"]
-        Contract["pkg/contract (纯结构体与插件接口)"]
+    subgraph SG_API ["Pure Contracts (pkg)"]
+        Contract["pkg/contract (Structs & Plugin Interfaces)"]
     end
 
     C_Ctrl --> Orch
@@ -116,9 +116,9 @@ flowchart LR
 
 ---
 
-## 2. 核心契约与 5 大插件 Go 接口（`pkg/contract`）
+## 2. Core Contracts and Five Plugin Interfaces (`pkg/contract`)
 
-`pkg/contract` 只引入 Go 标准库，定义跨二进制的统一数据结构与插件接口，确保替换任意一环时控制面 `internal/orchestrator` 无需修改：
+`pkg/contract` imports only the Go standard library and defines uniform structs and interfaces so replacing any plugin never touches `internal/orchestrator`:
 
 ```go
 package contract
@@ -141,14 +141,14 @@ type ReviewEvent struct {
 	IsBotAuthor   bool   `json:"is_bot_author"`
 	IsFork        bool   `json:"is_fork"`
 	Author        string `json:"author"`
-	TriggeredBy   string `json:"triggered_by"`    // 触发本次事件的人（评论 /review 时与 PR Author 可能不同）
-	IsMaintainer  bool   `json:"is_maintainer"`   // 由 VCS 插件按 author_association (OWNER/MEMBER/COLLABORATOR) 判定
+	TriggeredBy   string `json:"triggered_by"`    // Actor triggering event (differs from PR Author on /review comments)
+	IsMaintainer  bool   `json:"is_maintainer"`   // Set by VCS plugin from author_association (OWNER/MEMBER/COLLABORATOR)
 	TriggerType   string `json:"trigger_type"`    // auto | manual_command
-	ForceRerunSeq int64  `json:"force_rerun_seq"` // auto=0; 手动 /review 取触发评论 ID, 天然幂等
+	ForceRerunSeq int64  `json:"force_rerun_seq"` // auto=0; manual /review uses comment ID for retry idempotency
 }
 
 type ToolEndpoints struct {
-	ScopedTest string `json:"scoped_test,omitempty"` // 可选: 独立断网测试 Runner 子沙箱 Pod 地址
+	ScopedTest string `json:"scoped_test,omitempty"` // Optional: ClusterIP:port of isolated air-gapped test runner Pod
 }
 
 type TaskBudget struct {
@@ -157,15 +157,15 @@ type TaskBudget struct {
 	MaxTotalTokens   int64 `json:"max_total_tokens"`
 }
 
-// AgentTask 会落盘到沙箱 emptyDir，严禁包含任何 OPENAI_API_KEY 或平台凭据
+// AgentTask is written to sandbox emptyDir and MUST NOT contain OPENAI_API_KEY or platform secrets.
 type AgentTask struct {
 	RunID          string        `json:"run_id"`
 	PRTitle        string        `json:"pr_title"`
 	PRBody         string        `json:"pr_body"`
 	BaseBranch     string        `json:"base_branch"`
 	DiffFile       string        `json:"diff_file"`              // /workspace/.review/diff.patch
-	CILogsFile     string        `json:"ci_logs_file,omitempty"` // 可选: 截断后的 CI 失败日志
-	RepoRules      []string      `json:"repo_rules"`             // 由控制面从 base_sha 提取
+	CILogsFile     string        `json:"ci_logs_file,omitempty"` // Optional: truncated CI failure logs
+	RepoRules      []string      `json:"repo_rules"`             // Extracted by control plane from base_sha
 	WorkspaceRODir string        `json:"workspace_ro_dir"`       // /workspace/src
 	OutputFile     string        `json:"output_file"`            // /workspace/.review/report.json
 	ToolEndpoints  ToolEndpoints `json:"tool_endpoints,omitempty"`
@@ -176,20 +176,20 @@ type SandboxSpec struct {
 	ShortRunID      string
 	ShardIndex      int
 	Attempt         int
-	TarballPath     string        // 控制面已落盘并限长的临时快照归档路径（支持多片只读复用）
-	DiffPatch       []byte        // 当前分片的带行号 Diff
-	CILogs          []byte        // 可选: 截断后的 CI 日志
-	TaskJSON        []byte        // 不含凭据的 AgentTask JSON
-	AdapterURL      string        // 仅经 Exec Stdin 传入内存
-	SignedTaskToken string        // 仅经 Exec Stdin 传入内存
-	Timeout         time.Duration // 整体沙箱期限
+	TarballPath     string        // Controller temp snapshot archive path (size-capped, reused across shards)
+	DiffPatch       []byte        // Line-numbered diff for this shard
+	CILogs          []byte        // Optional: truncated CI failure logs
+	TaskJSON        []byte        // Credential-free AgentTask JSON
+	AdapterURL      string        // Passed only via Exec Stdin into Harness memory
+	SignedTaskToken string        // Passed only via Exec Stdin into Harness memory
+	Timeout         time.Duration // Overall sandbox timeout
 }
 
 type ReviewFinding struct {
 	File           string  `json:"file"`
 	Line           int     `json:"line"`
 	Side           string  `json:"side"`             // RIGHT | LEFT
-	TargetLineText string  `json:"target_line_text"` // 用于 Publisher 原文对齐
+	TargetLineText string  `json:"target_line_text"` // Verbatim line text verified by Publisher
 	Severity       string  `json:"severity"`         // critical | high | medium | low
 	Confidence     float64 `json:"confidence"`
 	Category       string  `json:"category"`         // correctness | concurrency | security | k8s | style
@@ -199,7 +199,7 @@ type ReviewFinding struct {
 	Evidence       string  `json:"evidence"`
 }
 
-// RunMetrics 仅作本地 CLI 参考；服务端计费与缓存统计全部以 cmd/adapter 上报为准
+// RunMetrics is for local CLI reference only; server billing and KV stats come exclusively from cmd/adapter.
 type RunMetrics struct {
 	Turns            int   `json:"turns"`
 	PromptTokens     int64 `json:"prompt_tokens"`
@@ -228,7 +228,7 @@ type PublishRequest struct {
 	PRNumber     int
 	CommitID     string
 	RunID        string
-	Event        string // 固定 "COMMENT"
+	Event        string // Always "COMMENT"
 	Summary      string
 	Inlines      []InlineComment
 	FileComments []InlineComment
@@ -237,7 +237,7 @@ type PublishRequest struct {
 type PublishedComment struct {
 	Fingerprint string
 	Category    string
-	CommentID   int64 // 降级并入 Summary 的问题为 0（落库为 NULL）
+	CommentID   int64 // 0 when folded into PR summary (stored as NULL in DB)
 }
 
 type PublishResult struct {
@@ -245,7 +245,7 @@ type PublishResult struct {
 	Comments []PublishedComment
 }
 
-// 1. VCS 触发与发布插件 (核心 6 方法)
+// 1. VCS Trigger & Publisher Plugin (6 core methods)
 type VCSPlugin interface {
 	VerifyAndParseWebhook(ctx context.Context, headers map[string]string, body []byte) (*ReviewEvent, error)
 	GetHeadSHA(ctx context.Context, repo string, prNumber int) (string, error)
@@ -255,33 +255,33 @@ type VCSPlugin interface {
 	PollFeedback(ctx context.Context, repo string, prNumber int, commentIDs []int64) ([]FeedbackSample, error)
 }
 
-// 可选扩展接口：由 orchestrator 按类型断言探测，按需拉取 CI 失败日志并截断
+// Optional extension interface probed by orchestrator via type assertion to fetch truncated CI failure logs.
 type CheckLogFetcher interface {
 	FetchCheckLogs(ctx context.Context, repo string, prNumber int, headSHA string, maxBytes int) ([]byte, error)
 }
 
-// 2. 沙箱运行器插件
+// 2. Sandbox Runner Plugin
 type SandboxRunner interface {
 	Run(ctx context.Context, spec SandboxSpec) (*ReviewReport, error)
 }
 
-// 3. Agent 核心执行插件 (Harness)
+// 3. Agent Harness Plugin
 type HarnessEngine interface {
 	Execute(ctx context.Context, task AgentTask) (*ReviewReport, error)
 }
 
-// 4. 上下文与只读工具插件
+// 4. Context & Read-Only Tooling Plugin
 type ToolRegistry interface {
 	Definitions() []ToolSchema
 	Dispatch(ctx context.Context, name string, rawArgs []byte) (string, error)
 }
 
-// 5a. Harness 内推理客户端 (由 internal/llmclient 实现)
+// 5a. In-Harness Inference Client (implemented by internal/llmclient)
 type InferenceClient interface {
 	ChatWithTools(ctx context.Context, req ChatRequest) (*ChatResponse, error)
 }
 
-// 5b. Adapter 上游推理端点插件 (切换 llmd-gateway / vllm-direct / ollama)
+// 5b. Adapter Upstream Endpoint Plugin (switches llmd-gateway / vllm-direct / ollama)
 type UpstreamProvider interface {
 	BuildUpstreamRequest(ctx context.Context, claims TaskClaims, normalizedBody []byte) (targetURL string, headers map[string]string, body []byte, err error)
 }
@@ -289,47 +289,47 @@ type UpstreamProvider interface {
 
 ---
 
-## 3. PostgreSQL 状态机、并发抢占与指纹去重设计（`internal/store`）
+## 3. PostgreSQL State Machine, Concurrency, and Fingerprints (`internal/store`)
 
-### 3.1 任务状态机流转图
+### 3.1 Job Lifecycle State Machine
 
 ```mermaid
 stateDiagram-v2
-    state "排队防抖中 (queued)" as queued
-    state "沙箱执行中 (running)" as running
-    state "汇总核对发布中 (publishing)" as publishing
-    state "已发布完成 (done)" as done
-    state "被新提交或关单取代 (superseded)" as superseded
-    state "重试耗尽失败 (failed)" as failed
+    state "Queued in Debounce (queued)" as queued
+    state "Running in Sandbox (running)" as running
+    state "Deduplicating & Publishing (publishing)" as publishing
+    state "Published (done)" as done
+    state "Replaced or Closed (superseded)" as superseded
+    state "Retries Exhausted (failed)" as failed
 
-    [*] --> queued : 验签且准入通过后入队
-    queued --> running : 防抖到期且 SKIP LOCKED 抢占租约
-    queued --> superseded : 收到新 Commit 或 close 事件
-    running --> publishing : 至少 1 个分片成功产出 ReviewReport
-    running --> queued : 执行失败未达上限或停机释放租约
-    running --> running : Worker 崩溃租约过期原地接管且 attempt 加 1
-    running --> superseded : 收到新 Commit 或租约续期发现被取代
-    running --> failed : 全部分片失败或重试耗尽
-    publishing --> queued : 发布失败未达上限或停机释放租约
-    publishing --> running : 发布阶段崩溃租约过期重跑或查重补登
-    publishing --> superseded : GetHeadSHA 校验远端已变更
-    publishing --> done : 原子 PublishReview 成功且指纹落库
-    publishing --> failed : 发布失败且重试耗尽
+    [*] --> queued : Signature and Admission Passed
+    queued --> running : Debounce Expired and Lease Claimed via SKIP LOCKED
+    queued --> superseded : Newer Commit or close Event Arrived
+    running --> publishing : At Least 1 Shard Returned ReviewReport
+    running --> queued : Execution Error Under Retry Limit or Graceful Shutdown Lease Release
+    running --> running : Crashed Lease Expired, Reclaimed with attempt Plus 1
+    running --> superseded : Newer Commit Arrived or Lease Heartbeat Saw Superseded
+    running --> failed : All Shards Failed or Max Retries Reached
+    publishing --> queued : Publish Error Under Retry Limit or Graceful Shutdown Lease Release
+    publishing --> running : Crashed During Publish Lease Expired, Reclaimed for Replay
+    publishing --> superseded : Remote head.sha Changed at GetHeadSHA Check
+    publishing --> done : Atomic PublishReview Succeeded & Fingerprints Saved
+    publishing --> failed : Publish Failed After Max Retries
     done --> [*]
     superseded --> [*]
     failed --> [*]
 ```
 
-### 3.2 核心表结构（SQL DDL）
+### 3.2 Core Tables (SQL DDL)
 
 ```sql
--- 1. Webhook 投递去重表（防止网络重传同一 delivery_id）
+-- 1. Webhook delivery deduplication table (prevents duplicate network deliveries)
 CREATE TABLE webhook_deliveries (
     delivery_id TEXT PRIMARY KEY,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 2. 审查任务主表
+-- 2. Main review job table
 CREATE TABLE review_runs (
     id               UUID PRIMARY KEY,
     repo             TEXT   NOT NULL,
@@ -337,7 +337,7 @@ CREATE TABLE review_runs (
     base_sha         TEXT   NOT NULL,
     head_sha         TEXT   NOT NULL,
     trigger_type     TEXT   NOT NULL, -- 'auto' | 'manual_command'
-    force_rerun_seq  BIGINT NOT NULL DEFAULT 0, -- auto=0; 手动 /review 用评论 ID 保证重跑幂等
+    force_rerun_seq  BIGINT NOT NULL DEFAULT 0, -- auto=0; manual /review uses comment ID for retry idempotency
     status           TEXT   NOT NULL, -- 'queued'|'running'|'publishing'|'done'|'superseded'|'failed'
     debounce_until   TIMESTAMPTZ NOT NULL,
     attempt          INT    NOT NULL DEFAULT 0,
@@ -349,12 +349,12 @@ CREATE TABLE review_runs (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 部分唯一幂等索引：允许 force-push 回到历史 SHA 或关闭后重开再次审查，但同一时刻不会重复排队/完成两次
+-- Partial unique idempotency index: permits re-review on force-push back to prior SHA or PR reopen without duplicating active/done runs
 CREATE UNIQUE INDEX uq_active_or_done_run_idempotency
     ON review_runs (repo, pr_number, base_sha, head_sha, trigger_type, force_rerun_seq)
     WHERE status NOT IN ('superseded', 'failed');
 
--- 数据库硬约束：同一个 PR 同时最多只有 1 个任务处于 running 或 publishing
+-- Hard DB invariant: at most 1 active running or publishing run per PR
 CREATE UNIQUE INDEX uq_active_pr_run
     ON review_runs (repo, pr_number)
     WHERE status IN ('running', 'publishing');
@@ -362,7 +362,7 @@ CREATE UNIQUE INDEX uq_active_pr_run
 CREATE INDEX idx_runs_claimable
     ON review_runs (status, debounce_until, lease_expires_at);
 
--- 3. 跨轮指纹去重表（仅用 file + prev_line + target_line，不含 category；降级进 Summary 的条目 comment_id 为 NULL）
+-- 3. Cross-round deduplication fingerprints (file + prev_line + target_line only; no category; comment_id NULL when folded into Summary)
 CREATE TABLE finding_fingerprints (
     repo         TEXT NOT NULL,
     pr_number    INT  NOT NULL,
@@ -373,7 +373,7 @@ CREATE TABLE finding_fingerprints (
     PRIMARY KEY (repo, pr_number, fingerprint)
 );
 
--- 4. 效果反馈闭环表（Webhook + 定时轮询 Reaction 汇总）
+-- 4. Quality feedback table (populated from webhooks and periodic reaction polling for comments with comment_id > 0)
 CREATE TABLE review_feedback (
     repo                    TEXT NOT NULL,
     pr_number               INT  NOT NULL,
@@ -389,10 +389,10 @@ CREATE TABLE review_feedback (
 );
 ```
 
-### 3.3 并发入队、关闭取代、抢占接管与心跳续期（Go + SQL 伪代码）
+### 3.3 Concurrent Enqueue, Close Supersede, Lease Claim, and Heartbeat (Go + SQL Pseudo-Code)
 
 ```go
-// SupersedeAll 处理 PR closed 事件：只取代进行中的任务，不插入新任务
+// SupersedeAll handles PR closed events: supersedes active runs without inserting a new job.
 func (s *PGStore) SupersedeAll(ctx context.Context, repo string, prNumber int, deliveryID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -421,7 +421,7 @@ func (s *PGStore) SupersedeAll(ctx context.Context, repo string, prNumber int, d
 	return tx.Commit()
 }
 
-// EnqueueOrSupersede 在单事务内完成：投递去重 + 取代旧任务 + 插入防抖新任务
+// EnqueueOrSupersede atomically deduplicates delivery, supersedes older jobs for the PR, and inserts a debounced run.
 func (s *PGStore) EnqueueOrSupersede(ctx context.Context, ev contract.ReviewEvent, debounce time.Duration) (uuid.UUID, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -443,7 +443,7 @@ func (s *PGStore) EnqueueOrSupersede(ctx context.Context, ev contract.ReviewEven
 		return uuid.Nil, false, err
 	}
 
-	// 释放旧的 queued / running / publishing（解除 uq_active_pr_run 占位）
+	// Supersede older queued/running/publishing jobs (frees uq_active_pr_run slot immediately)
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE review_runs SET status = 'superseded', updated_at = now()
 		WHERE repo = $1 AND pr_number = $2
@@ -467,8 +467,8 @@ func (s *PGStore) EnqueueOrSupersede(ctx context.Context, ev contract.ReviewEven
 	return runID, inserted > 0, tx.Commit()
 }
 
-// ClaimNextRun 抢占防抖到期的 queued，或回收崩溃超时（running / publishing 且租约过期）的孤儿任务
-// 若无可抢占任务返回 sql.ErrNoRows，绝不返回 (nil, nil)
+// ClaimNextRun claims a debounce-ready queued run or reclaims an expired running/publishing lease.
+// Returns sql.ErrNoRows when idle; never returns (nil, nil).
 func (s *PGStore) ClaimNextRun(ctx context.Context, workerID string, leaseTTL time.Duration) (*RunRecord, error) {
 	for {
 		tx, err := s.db.BeginTx(ctx, nil)
@@ -508,7 +508,7 @@ func (s *PGStore) ClaimNextRun(ctx context.Context, workerID string, leaseTTL ti
 			if cErr := tx.Commit(); cErr != nil {
 				return nil, cErr
 			}
-			continue // 本条已置 failed，继续抢占下一条有效任务
+			continue // Marked failed; loop to claim next available run
 		}
 
 		nextAttempt := rec.Attempt
@@ -532,7 +532,7 @@ func (s *PGStore) ClaimNextRun(ctx context.Context, workerID string, leaseTTL ti
 	}
 }
 
-// RenewLease 在 running 与 publishing 两阶段都保持续期；返回 false 说明已被 superseded
+// RenewLease keeps the lease alive across both running and publishing; returns false if superseded.
 func (s *PGStore) RenewLease(ctx context.Context, runID uuid.UUID, workerID string, leaseTTL time.Duration) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE review_runs
@@ -549,19 +549,19 @@ func (s *PGStore) RenewLease(ctx context.Context, runID uuid.UUID, workerID stri
 
 ---
 
-## 4. `internal/orchestrator` 准入控制与 Worker 主流程（含防泄漏与重试）
+## 4. Admission Control and Worker Main Loop (`internal/orchestrator`)
 
-### 4.1 准入控制策略（HLD §3.1 落地归属）
+### 4.1 Admission Control Policy
 
-所有 Webhook 事件先经过 `orchestrator.AdmissionCheck`（不塞进 Harness 或 Store）：
-1. **事件分类路由**：`EventKind == "ignore"` 直接返回 200；`EventKind == "close"` 调用 `store.SupersedeAll`；`EventKind == "feedback"` 写入 `review_feedback`。
-2. **手动命令鉴权**：若 `ev.TriggerType == "manual_command"` 但 `!ev.IsMaintainer`（非 OWNER / MEMBER / COLLABORATOR），**直接拒绝**，防止外部贡献者在自己的 PR 下评论 `/review` 绕过门禁。
-3. **Draft 与 Bot 过滤**：`ev.IsDraft || ev.IsBotAuthor` 直接跳过不入队。
-4. **外部 Fork 防滥用与限流**：
-   * 基于内存令牌桶 + PG 近期记录做**按仓库/作者滑动窗口限流**（超限丢弃并打指标）。
-   * 若 `ev.IsFork && ev.TriggerType == "auto"`，校验作者是否在仓库协作者/历史已合入白名单内；**首次外部贡献者自动跳过**，仅保留已授权维护者评论 `/review` 触发。
+All webhook events pass through `orchestrator.AdmissionCheck` before hitting the store or sandbox:
+1. **Event routing**: `EventKind == "ignore"` returns 200 OK; `EventKind == "close"` invokes `store.SupersedeAll`; `EventKind == "feedback"` updates `review_feedback`.
+2. **Manual `/review` authorization**: If `ev.TriggerType == "manual_command"` and `!ev.IsMaintainer` (not `OWNER`, `MEMBER`, or `COLLABORATOR`), **reject the event** so external contributors cannot trigger `/review` on their own fork PRs.
+3. **Draft and bot filter**: Skip when `ev.IsDraft || ev.IsBotAuthor`.
+4. **Fork rate limiting and first-time contributor gate**:
+   * Enforce per-repo and per-author sliding-window rate limits via token bucket + recent PG counts (requests over the limit are dropped and counted in a metric).
+   * When `ev.IsFork && ev.TriggerType == "auto"`, check whether `ev.Author` is a collaborator or past contributor; **skip first-time external contributors automatically**, requiring an authorized maintainer `/review` command.
 
-### 4.2 Worker `processRun` 与租约心跳 Go 伪代码
+### 4.2 Worker `processRun` and Lease Heartbeat Pseudo-Code
 
 ```go
 func (o *Orchestrator) keepLeaseAlive(runCtx context.Context, runCancel context.CancelFunc, runID uuid.UUID, workerID string, leaseTTL time.Duration) {
@@ -578,7 +578,7 @@ func (o *Orchestrator) keepLeaseAlive(runCtx context.Context, runCancel context.
 			alive, err := o.store.RenewLease(dbCtx, runID, workerID, leaseTTL)
 			cancel()
 			if err != nil {
-				// 数据库持续不可达超过 leaseTTL 时主动自杀防脑裂
+				// Self-cancel on prolonged DB outage past leaseTTL to prevent split-brain execution
 				if time.Since(lastSuccess) > leaseTTL {
 					runCancel()
 					return
@@ -586,7 +586,7 @@ func (o *Orchestrator) keepLeaseAlive(runCtx context.Context, runCancel context.
 				continue
 			}
 			if !alive {
-				runCancel() // 已被新 Commit 取代为 superseded
+				runCancel() // Superseded by a newer commit
 				return
 			}
 			lastSuccess = time.Now()
@@ -598,10 +598,10 @@ func (o *Orchestrator) processRun(parentCtx context.Context, rec *store.RunRecor
 	runCtx, runCancel := context.WithCancel(parentCtx)
 	defer runCancel()
 
-	// 1. 启动租约心跳协程（覆盖 running 与 publishing 全程）
+	// 1. Start lease heartbeat covering both running and publishing phases
 	go o.keepLeaseAlive(runCtx, runCancel, rec.ID, o.workerID, o.leaseTTL)
 
-	// 2. 拉取三点 Diff、将快照流落盘到受限临时目录（供多分片与重跑只读复用）
+	// 2. Fetch three-dot diff, stream snapshot tarball to size-capped temp file (reused read-only across shards), and fetch base_sha rules
 	tarPath, cleanupTar, diffPatch, baseRules, ciLogs, err := o.fetchInputsToTemp(runCtx, rec)
 	if cleanupTar != nil {
 		defer cleanupTar()
@@ -611,14 +611,14 @@ func (o *Orchestrator) processRun(parentCtx context.Context, rec *store.RunRecor
 		return
 	}
 
-	// 3. 按单次 max_context_tokens 的约 1/3 估算切分分片；全过滤后无分片（如只改 go.sum）则静默标 done
+	// 3. Split diff into shards capped at ~1/3 max_context_tokens; if 0 shards remain after filtering (e.g. go.sum only), mark done silently
 	shards := o.splitDiffIntoShards(diffPatch, o.cfg.MaxContextTokens/3)
 	if len(shards) == 0 {
 		_ = o.store.MarkDoneIfActive(parentCtx, rec.ID, o.workerID)
 		return
 	}
 
-	// errgroup 仅用 SetLimit 限并发，协程内部始终 return nil（错误写入 ShardOutput.Err），避免单片失败连坐取消全部分片
+	// errgroup bounds concurrency with SetLimit; goroutines always return nil and store errors per shard so one failure never cancels siblings
 	results := make([]ShardOutput, len(shards))
 	var eg errgroup.Group
 	eg.SetLimit(o.cfg.MaxConcurrentShards)
@@ -631,15 +631,16 @@ func (o *Orchestrator) processRun(parentCtx context.Context, rec *store.RunRecor
 	}
 	_ = eg.Wait()
 
-	// 4. 汇总去噪、原文对齐与发布（running -> publishing -> done）
+	// 4. Filter, align lines, dedup, and publish (running -> publishing -> done)
 	if err := o.PrepareAndPublish(runCtx, rec, results, diffPatch); err != nil {
 		o.handleRunFailure(parentCtx, runCtx, rec, err)
 	}
 }
 
 func (o *Orchestrator) handleRunFailure(parentCtx, runCtx context.Context, rec *store.RunRecord, runErr error) {
-	// 优雅停机（SIGTERM 导致 parentCtx 取消）：用 WithoutCancel 主动释放租约回 queued，不耗 attempt
-	// 注意：ReleaseLeaseToQueued 与 RecordErrorOrRequeue 的 SQL 均必须带 WHERE id = $1 AND worker_id = $2 AND status IN ('running', 'publishing')，防把已被取代的任务拉回队列
+	// Graceful shutdown (SIGTERM cancelled parentCtx): release lease back to queued via WithoutCancel without burning attempt.
+	// Both ReleaseLeaseToQueued and RecordErrorOrRequeue SQL MUST guard WHERE id = $1 AND worker_id = $2 AND status IN ('running', 'publishing')
+	// so an already-superseded job is never pulled back into queued.
 	if parentCtx.Err() != nil {
 		relCtx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 5*time.Second)
 		defer cancel()
@@ -647,19 +648,18 @@ func (o *Orchestrator) handleRunFailure(parentCtx, runCtx context.Context, rec *
 		return
 	}
 	if runCtx.Err() != nil {
-		return // 因被 superseded 而取消，状态已由 Enqueue/SupersedeAll 更新
+		return // Cancelled because run was superseded; DB state already updated
 	}
-	// RecordErrorOrRequeue 同样严格校验 worker_id 与 status IN ('running', 'publishing')
 	finalFailed, err := o.store.RecordErrorOrRequeue(parentCtx, rec.ID, o.workerID, runErr.Error(), 15*time.Second)
 	if err != nil || !finalFailed {
 		return
 	}
-	// HLD 默认策略：自动触发静默告警；仅人工 /review 显式触发最终失败时回一行简短提示
+	// Auto triggers fail silently; manual /review posts a one-line error note with run_id
 	if rec.TriggerType == "manual_command" {
 		_, _ = o.vcs.PublishReview(parentCtx, contract.PublishRequest{
 			Repo: rec.Repo, PRNumber: rec.PRNumber, CommitID: rec.HeadSHA, RunID: rec.ID.String(),
 			Event:   "COMMENT",
-			Summary: fmt.Sprintf("手动代码审查执行失败（run_id: `%s`），请检查控制面日志。", rec.ID),
+			Summary: fmt.Sprintf("Manual code review failed (run_id: `%s`); check controller logs.", rec.ID),
 		})
 	}
 }
@@ -667,60 +667,60 @@ func (o *Orchestrator) handleRunFailure(parentCtx, runCtx context.Context, rec *
 
 ---
 
-## 5. `K8sSandboxRunner` 与 `client-go` Exec 沙箱实现（`internal/sandbox`）
+## 5. `K8sSandboxRunner` and `client-go` Exec Sandbox (`internal/sandbox`)
 
-### 5.1 命名空间隔离、RBAC 最小权限与 Exec 生命周期
+### 5.1 Namespace Isolation, Least-Privilege RBAC, and Exec Lifecycle
 
-* **推荐双命名空间部署与 NetworkPolicy 选择器**：控制器部署在 `review-system` 命名空间，沙箱 Pod 统一创建在独立的 `review-sandbox` 命名空间（便于整体套用 `NetworkPolicy` 禁 DNS 与内外网）。控制器 ServiceAccount 的 RBAC **仅授予 `review-sandbox` 命名空间的 `pods`（`create`/`get`/`list`/`delete`）与 `pods/exec`（`create`）权限**。沙箱内通过 `OPENAI_BASE_URL` 直连 Adapter ClusterIP，但 `NetworkPolicy` 放行规则**必须使用 `namespaceSelector` + `podSelector` 精准选中 Adapter Pod**（不要用 `ipBlock` 写 Service ClusterIP，Kubernetes 不保证 `ipBlock` 对虚 IP 生效）。
-* **`OwnerReference` 与回收策略**：Kubernetes 禁止跨命名空间的 `OwnerReference`，因此在独立 `review-sandbox` 命名空间下**不设置 `OwnerReference`**，依赖 `ActiveDeadlineSeconds` + `defer` 删除 + 控制面每 5 分钟运行的 **Orphan Pod Reaper** 回收；若测试环境采用同命名空间单命名空间部署，则将 `OwnerReference` 指向控制器的 **Pod**（而非 Deployment），实现控制面重建自动连带清理。
+* **Dual-namespace layout and NetworkPolicy selectors**: Deploy the controller in `review-system` and sandbox Pods in a dedicated `review-sandbox` namespace (so a single namespace-wide `NetworkPolicy` blocks DNS, internet, and cluster traffic). The controller ServiceAccount receives RBAC **strictly scoped to `pods` (`create`/`get`/`list`/`delete`) and `pods/exec` (`create`) inside `review-sandbox`**. Inside the sandbox, `OPENAI_BASE_URL` uses the Adapter ClusterIP, while the `NetworkPolicy` allow rule **must use `namespaceSelector` + `podSelector` targeting the Adapter Pods** (never `ipBlock` on a Service ClusterIP, which is not guaranteed to match across CNIs).
+* **`OwnerReference` and Pod GC**: Kubernetes forbids cross-namespace `OwnerReference`s, so in dual-namespace mode sandbox Pods omit `OwnerReference` and rely on `ActiveDeadlineSeconds` + `defer` deletion + a 5-minute **Orphan Pod Reaper**. In single-namespace dev setups, set `OwnerReference` to the controller's own **Pod** (not Deployment) for automatic cleanup on Pod replacement.
 
-注意 Kubernetes `PodExecOptions` 本身不提供环境变量传递字段；控制面在创建 Pod 之前先注册 `defer` 删除，主容器运行 `/usr/local/bin/harness --wait` 空转守候，再通过 `harness` 的 3 个子命令完成沙箱生命周期：
+Because Kubernetes `PodExecOptions` has no `Env` field, the controller registers `defer` Pod deletion before `Create`, launches PID 1 with `/usr/local/bin/harness --wait`, and executes three bounded Exec steps:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Worker as 调度 Worker
+    participant Worker as Control Plane Worker
     participant K8s as K8s API Server
-    participant Pod as 沙箱 Pod (harness --wait 空转)
-    participant Harn as Exec 子进程 (harness)
+    participant Pod as Sandbox Pod (harness --wait Idle)
+    participant Harn as Exec Subprocess (harness)
 
-    Note over Worker,K8s: 先注册 defer 删除函数 (防 Create 超时但 API 已建出 Pod 泄漏)
-    Worker->>K8s: CreatePod (review-sandbox 命名空间, gVisor, 禁用 SA Token, activeDeadlineSeconds)
-    K8s-->>Worker: Pod 进入 Running 状态
+    Note over Worker,K8s: Register defer DeletePod before Create (prevents leak if Create times out after API creation)
+    Worker->>K8s: CreatePod (review-sandbox ns, gVisor, AutomountSA=false, activeDeadlineSeconds)
+    K8s-->>Worker: Pod Reaches Running State
 
-    Note over Worker,Pod: Exec 1 流式推入源码 Tar 与无凭据 AgentTask
-    Worker->>K8s: Exec /usr/local/bin/harness --unpack (带超时上下文)
-    K8s->>Harn: 校验路径防穿越与越界软链接并解包到 emptyDir
-    Harn-->>Worker: 解包成功退出 Exec 1
+    Note over Worker,Pod: Exec 1 Stream Source Tar and Credential-Free AgentTask
+    Worker->>K8s: Exec /usr/local/bin/harness --unpack (With Timeout Context)
+    K8s->>Harn: Validate Paths & Reject Escaping Symlinks, Extract to emptyDir
+    Harn-->>Worker: Exit Exec 1
 
-    Note over Worker,Pod: Exec 2 经 Stdin 仅在内存中传入 OPENAI_API_KEY 并执行审查
-    Worker->>K8s: Exec /usr/local/bin/harness --run-stdin-env (带超时上下文)
-    K8s->>Harn: 从 Stdin 读入 OPENAI_API_KEY 与 BASE_URL (不落盘)
-    Harn->>Harn: 读取 task.json 执行两阶段审查, 写 /workspace/.review/report.json
-    alt 正常跑完
-        Harn-->>Worker: 写完文件退出 Exec 2
-        Worker->>K8s: Exec /usr/local/bin/harness --read-report (限长 2 MiB)
-        K8s-->>Worker: 返回 ReviewReport JSON
-    else 收到新 Commit 取代 (ctx Cancelled)
-        Worker->>Worker: 取消 Exec 上下文并由管道 CloseWithError 中断推流
+    Note over Worker,Pod: Exec 2 Inject OPENAI_API_KEY via Stdin Into RAM Only & Run Review
+    Worker->>K8s: Exec /usr/local/bin/harness --run-stdin-env (With Timeout Context)
+    K8s->>Harn: Read OPENAI_API_KEY & BASE_URL from Stdin (Never Written to Disk)
+    Harn->>Harn: Read task.json, Run Two-Stage Review, Write /workspace/.review/report.json
+    alt Normal Completion
+        Harn-->>Worker: Exit Exec 2 After Writing Report
+        Worker->>K8s: Exec /usr/local/bin/harness --read-report (2 MiB Cap)
+        K8s-->>Worker: Return ReviewReport JSON
+    else Superseded by Newer Commit (ctx Cancelled)
+        Worker->>Worker: Cancel Exec Context & Abort Pipe via CloseWithError
     end
 
-    Note over Worker,K8s: defer 使用 WithoutCancel 确保一定删掉 Pod
+    Note over Worker,K8s: defer Uses WithoutCancel to Guarantee Pod Deletion
     Worker->>K8s: DeletePod (GracePeriodSeconds=0)
 ```
 
-### 5.2 `K8sSandboxRunner.Run()` Go 伪代码
+### 5.2 `K8sSandboxRunner.Run()` Pseudo-Code
 
 ```go
 func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*contract.ReviewReport, error) {
 	ctx, totalCancel := context.WithTimeout(ctx, spec.Timeout)
 	defer totalCancel()
 
-	// Pod 名包含分片序号与尝试次数，防止多分片并发撞名
+	// Include shard index and attempt so concurrent shards never collide on Pod name
 	podName := fmt.Sprintf("review-sbx-%s-s%d-a%d", spec.ShortRunID, spec.ShardIndex, spec.Attempt)
-	pod := r.buildHardenedPod(podName, spec) // 独立命名空间 review-sandbox, RuntimeClass="gvisor", AutomountSA=false, ActiveDeadlineSeconds
+	pod := r.buildHardenedPod(podName, spec) // review-sandbox ns, RuntimeClass="gvisor", AutomountSA=false, ActiveDeadlineSeconds
 
-	// 必须在 Create 之前注册 defer：即使 Create 因网络超时报错，远端可能已创建出 Pod
+	// Must register defer BEFORE Create so API timeouts after Pod creation still clean up
 	defer func() {
 		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
@@ -742,7 +742,7 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 		return nil, err
 	}
 
-	// Exec 1: 从控制器本地 TarballPath 安全流式构建合成 tar（用 errCh 回收写端错误，避免半截 tar 漏判）
+	// Exec 1: Stream composite tar from local TarballPath (src/ prefix + .review/*)
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	tarErrCh := make(chan error, 1)
@@ -758,13 +758,13 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 		<-tarErrCh
 		return nil, fmt.Errorf("unpack sandbox input: %w", err)
 	}
-	// 先显式关读端，防止 --unpack 未读完 stdin 就以 0 退出导致写协程卡死在 <-tarErrCh
+	// Close read end before reading tarErrCh in case --unpack exited 0 before consuming EOF
 	_ = pr.Close()
 	if tarErr := <-tarErrCh; tarErr != nil {
 		return nil, fmt.Errorf("stream composite tar: %w", tarErr)
 	}
 
-	// Exec 2: 仅通过 Stdin 向 harness 进程内存传入短期令牌，绝不写入 emptyDir
+	// Exec 2: Pass short-lived token via Stdin into Harness RAM only; never write to emptyDir
 	secretJSON := mustMarshal(map[string]string{
 		"openai_base_url": spec.AdapterURL,
 		"openai_api_key":  spec.SignedTaskToken,
@@ -773,10 +773,10 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 		return nil, fmt.Errorf("run harness: %w", err)
 	}
 
-	// Exec 3: 主进程仍在 --wait 空转，限长 2 MiB 读回报告文件（防恶意超大 JSON 撑爆控制面）
+	// Exec 3: PID 1 stays idle in --wait; read report with 2 MiB cap to protect controller memory
 	readCtx, readCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer readCancel()
-	var outBuf cappedBuffer // 内部限制 maxBytes = 2 << 20
+	var outBuf cappedBuffer // maxBytes = 2 << 20
 	if err := r.execStream(readCtx, podName, []string{"/usr/local/bin/harness", "--read-report"}, nil, &outBuf); err != nil {
 		return nil, fmt.Errorf("read report: %w", err)
 	}
@@ -789,27 +789,25 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 }
 ```
 
-> **孤儿 Pod 清理**：`ActiveDeadlineSeconds` 到期后 Pod 只是变成 `Failed` 状态而不会被自动删除对象；因此控制器内必须常驻一个每 5 分钟扫一次 `app=review-sandbox` 标签的 **Orphan Pod Reaper** 清理超时或控制器重启遗留的 Pod。
+> **Orphan Pod Reaper**: `ActiveDeadlineSeconds` transitions expired Pods to `Failed` without deleting Pod objects. The controller therefore runs a background reaper every 5 minutes to delete `app=review-sandbox` Pods exceeding their deadline.
 
 ---
 
-## 6. 沙箱内 Go `harness` 两阶段只读循环与工具层（`cmd/harness` + `internal/harness` + `internal/tools`）
+## 6. In-Sandbox Go `harness` Two-Stage Loop & Tools (`cmd/harness` + `internal/harness` + `internal/tools`)
 
-### 6.1 `CGO_ENABLED=0` 静态构建取舍与安全工具执行
+### 6.1 `CGO_ENABLED=0` Static Build and Tool Safety
 
-* **零 Cgo 工具实现**：主流 `tree-sitter` Go 绑定依赖 Cgo；为了保障 `cmd/harness` 能够 `CGO_ENABLED=0` 静态单文件编译，M1 阶段 Go 语言代码大纲提取直接使用标准库 **`go/parser` + `go/ast`**，多语言支持后续按需引入纯 Go/WASM 解析或独立静态辅助工具。`ripgrep`（`rg`）以静态 musl 二进制形式随 `harness` 一同打入极简镜像。
-* **防软链接/路径逃逸**：使用 Go 标准库 **`os.OpenRoot(workspaceRoot)`**（`*os.Root`）打开工作区根目录，由运行时直接阻止 `..` 与逃出工作区的软链接读取。
-* **防 `rg` 参数注入**：调用外部 `rg` 二进制时，用 `-e` 与 `--` 死锁参数边界，防止模型传入的搜索词被解析为 `--pre` 等危险参数：
+* **Zero-Cgo tooling**: Mainstream `tree-sitter` Go bindings require Cgo. To compile `cmd/harness` as a pure static `CGO_ENABLED=0` binary, M1 uses Go's standard library **`go/parser` + `go/ast`** for Go symbol outlines (adding WASM or auxiliary static tools later for multi-language repos). Static musl `ripgrep` (`rg`) is baked alongside `/usr/local/bin/harness`.
+* **Symlink & traversal defense**: Open the source root via Go's standard library **`os.OpenRoot(workspaceRoot)`** (`*os.Root`), enforcing OS-level rejection of `..` and escaping symlinks.
+* **Preventing `rg` flag injection**: Lock arguments with `--no-config`, `--no-ignore`, `-e`, and `--` so model-controlled inputs can never be parsed as flags like `--pre` or hidden via PR `.gitignore`/`.ignore` files:
 
 ```go
 func (t *ToolBox) SearchCode(ctx context.Context, pattern, relSubDir string) (string, error) {
-	// 校验相对子目录不逃逸（配合 os.Root.Stat 验证存在且在目录内）
 	if _, err := t.wsRoot.Stat(relSubDir); err != nil {
 		return "", fmt.Errorf("invalid search scope: %w", err)
 	}
 	target := filepath.Join(t.wsPath, filepath.Clean("/"+relSubDir))
-	// 必须加 --no-ignore，防止恶意 PR 用 .gitignore / .ignore 隐藏代码
-	// 固定 -e 与 --，绝不允许模型参数被解释为 rg 选项（如 --pre）
+	// --no-ignore prevents PR .gitignore/.ignore files from hiding code; -e and -- block flag injection
 	cmd := exec.CommandContext(ctx, "rg", "--no-config", "--no-ignore", "-n", "--max-count=50", "--color=never", "-e", pattern, "--", target)
 	out, err := cmd.CombinedOutput()
 	if err != nil && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 1 {
@@ -819,13 +817,13 @@ func (t *ToolBox) SearchCode(ctx context.Context, pattern, relSubDir string) (st
 }
 ```
 
-### 6.2 前缀稳定两阶段循环（`internal/harness` Go 伪代码）
+### 6.2 Prefix-Stable Two-Stage Loop (`internal/harness` Pseudo-Code)
 
-为了避免滑动裁剪中间历史破坏 `llm-d` 的 KV Prefix Cache，且防止最后一轮再吐出工具调用导致白跑失败：**`harness` 自己累计跟踪估算 Token 与轮次，一旦到达 `MaxTurns`、上下文逼近 `85% MaxContextTokens` 或剩余总预算不足，直接以 `ToolChoice: "none"` 进入收尾总结轮**：
+To avoid mutating middle messages (which invalidates `llm-d` prefix cache on every turn) and to ensure the final turn never dies on a stray tool call, `harness` proactively tracks budget and switches to a `ToolChoice: "none"` synthesis step:
 
 ```go
 func (e *TwoStageEngine) Execute(ctx context.Context, task contract.AgentTask) (*contract.ReviewReport, error) {
-	// 前 2 条为不可变前缀：System Prompt (含 base 规则) + PR Diff / 截断 CI 日志
+	// Immutable prefix messages: System Prompt (base rules) + PR Diff / truncated CI logs
 	messages := []contract.ChatMessage{
 		{Role: "system", Content: buildSystemPrompt(task.RepoRules)},
 		{Role: "user", Content: buildInitialUserPrompt(task.PRTitle, task.PRBody, task.DiffFile, task.CILogsFile)},
@@ -838,7 +836,7 @@ func (e *TwoStageEngine) Execute(ctx context.Context, task contract.AgentTask) (
 			return nil, err
 		}
 
-		// 若到达最后一轮、上下文超 85%、或剩余总预算逼近上限，强制进入禁工具收尾轮，避免前功尽弃
+		// Force synthesis at last turn, >=85% context window, or >=85% cumulative token budget
 		forceFinalize := turn == task.Budget.MaxTurns ||
 			estimateTokens(messages) >= int(float64(task.Budget.MaxContextTokens)*0.85) ||
 			estTotalUsed >= int64(float64(task.Budget.MaxTotalTokens)*0.85)
@@ -852,7 +850,7 @@ func (e *TwoStageEngine) Execute(ctx context.Context, task contract.AgentTask) (
 		if forceFinalize {
 			req.ToolChoice = "none"
 			req.Messages = append(messages, contract.ChatMessage{
-				Role: "user", Content: "请停止调用工具，立即基于已查证证据按 ReviewReport JSON Schema 输出最终结果。",
+				Role: "user", Content: "Stop calling tools and output the final ReviewReport JSON adhering strictly to the schema.",
 			})
 		}
 
@@ -876,7 +874,7 @@ func (e *TwoStageEngine) Execute(ctx context.Context, task contract.AgentTask) (
 			continue
 		}
 
-		// 独立完成 Schema 校验及 1 次纠错重试（即使在最后一轮也不被 MaxTurns 循环截断）
+		// Validate schema and allow 1 repair retry outside the MaxTurns counter
 		return e.validateOrRetryOnce(ctx, req.Messages, toolSchemas, resp)
 	}
 	return nil, errors.New("exceeded max_turns without valid report")
@@ -887,11 +885,11 @@ func (e *TwoStageEngine) validateOrRetryOnce(ctx context.Context, history []cont
 	if valErr == nil {
 		return report, nil
 	}
-	// 纠错请求必须带上与前缀一致的 Tools（搭配 ToolChoice: "none"），保证 OpenAI 兼容性并复用 Prefix Cache
+	// Keep Tools alongside ToolChoice: "none" for OpenAI API compatibility and prefix cache reuse
 	retryReq := contract.ChatRequest{
 		Messages: append(history, resp.AssistantMessage, contract.ChatMessage{
 			Role:    "user",
-			Content: fmt.Sprintf("JSON 格式校验失败（%v），请严格按 ReviewReport Schema 重新输出纯 JSON。", valErr),
+			Content: fmt.Sprintf("JSON schema validation failed (%v). Re-output valid pure JSON matching ReviewReport.", valErr),
 		}),
 		Tools:            toolSchemas,
 		ToolChoice:       "none",
@@ -907,44 +905,44 @@ func (e *TwoStageEngine) validateOrRetryOnce(ctx context.Context, history []cont
 
 ---
 
-## 7. Go `Inference Adapter` 微代理实现（`cmd/adapter` + `internal/inference`）
+## 7. Go `Inference Adapter` Micro-Proxy (`cmd/adapter` + `internal/inference`)
 
-> **已知限制说明**：首期（M2~M3）`cmd/adapter` **运行单副本**以保证内存原子预算账本绝对一致（后续多副本可接 Redis 共享或按 `run_id` 一致性哈希分片）；且默认**强制 `stream=false`** 同步读取精确 `usage`（若未来对接强制要求 SSE 流式的第三方框架，需改为注入 `stream_options.include_usage=true` 并拦截尾帧结算）。
+> **Known Phase 1-3 Constraints**: `cmd/adapter` runs as a **single replica** so the in-memory atomic budget ledger remains strictly consistent (multi-replica scaling later requires Redis/PG state or `run_id` consistent hashing). It also forces **`stream=false`** for synchronous `usage` accounting (if integrating a third-party framework that mandates SSE streaming, inject `stream_options.include_usage=true` and parse the trailing chunk).
 
-### 7.1 验签、预留结算、插件注入与重试时序图
+### 7.1 Verification, Atomic Budget Reservation, Routing Injection, and Retries
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Harn as 沙箱内 Harness
+    participant Harn as Sandbox Harness
     participant Adapt as cmd/adapter (ClusterIP)
-    participant Ledger as 原子预留账本 (CAS + 过期清扫)
-    participant Prov as UpstreamProvider 插件
-    participant GW as 上游推理端点 (llm-d / vLLM / Ollama)
+    participant Ledger as Atomic Ledger (CAS + Expiry Sweep)
+    participant Prov as UpstreamProvider Plugin
+    participant GW as Upstream Inference (llm-d / vLLM / Ollama)
 
     Harn->>Adapt: POST /v1/chat/completions (Bearer HMAC Token)
-    Adapt->>Adapt: 验签 Bearer Token 与过期时间 exp
-    Adapt->>Adapt: MaxBytesReader 限流读 Body, 白名单归一化字段并覆写 model 与 stream=false
-    Adapt->>Ledger: CAS 原子预留 (估算输入 + max_tokens 上限)
-    alt 预算不足以预留
-        Ledger-->>Adapt: 预留失败
-        Adapt-->>Harn: 返回 HTTP 403 (code budget_exhausted, 防客户端误重试)
-    else 预留成功
-        Adapt->>Prov: BuildUpstreamRequest (全新构造上游请求, 不透传沙箱 Header)
-        Prov-->>Adapt: 返回目标 URL 与权威路由头 (llm-d 注入 x-session-id 等)
-        loop 转发与重试 (遇 429 或 503 带抖动退避, 最多 4 次)
-            Adapt->>GW: 转发请求 (使用缓存的 bodyBytes 重建 Body)
-            GW-->>Adapt: 返回响应 (非 429/503 立即跳出重试循环)
+    Adapt->>Adapt: Verify Bearer Signature & exp
+    Adapt->>Adapt: Read Body via MaxBytesReader, Allowlist Fields, Override model & stream=false
+    Adapt->>Ledger: CAS Reserve (Estimated Input + max_tokens Cap)
+    alt Insufficient Budget
+        Ledger-->>Adapt: Reservation Rejected
+        Adapt-->>Harn: Return HTTP 403 (code budget_exhausted, Stops Client Retries)
+    else Budget Reserved
+        Adapt->>Prov: BuildUpstreamRequest (Fresh Upstream Request, Drops Client Headers)
+        Prov-->>Adapt: Return Target URL & Authoritative Headers (e.g. x-session-id for llm-d)
+        loop Forward & Retry on 429 or 503 with Jitter (Up to 4 Retries)
+            Adapt->>GW: Forward Request (Rebuild Body from Cached bodyBytes)
+            GW-->>Adapt: Return Response (Break Loop on Non-429/503)
         end
-        Adapt->>Ledger: Settle(预留值, 实际 usage.total_tokens) 多退少补
-        Adapt-->>Harn: 透传响应并向 Prometheus 上报真实 Token 与 cached_tokens
+        Adapt->>Ledger: Settle(reserved, actual) Refund Errors or Deduct Conservative Estimate if 2xx Lacks usage
+        Adapt-->>Harn: Relay Response & Report Tokens / cached_tokens to Prometheus
     end
 ```
 
-### 7.2 `cmd/adapter` 原子预留结算与白名单代理 Go 伪代码
+### 7.2 `cmd/adapter` CAS Reservation and Allowlisted Proxy Pseudo-Code
 
 ```go
-// TryReserve 使用 atomic CAS 原子预留预算，杜绝并发请求同时通过预检导致超支
+// TryReserve atomically reserves budget via CAS so concurrent requests cannot overspend.
 func (l *SessionLedger) TryReserve(estimate, maxTotal int64) bool {
 	for {
 		cur := l.reservedOrUsed.Load()
@@ -958,7 +956,7 @@ func (l *SessionLedger) TryReserve(estimate, maxTotal int64) bool {
 }
 
 func (l *SessionLedger) Settle(reserved, actual int64) {
-	l.reservedOrUsed.Add(actual - reserved) // 失败退还预留(actual=0)；2xx 缺失 usage 时按保守预留扣减(actual=estCost)
+	l.reservedOrUsed.Add(actual - reserved) // Refunds on failure (actual=0); deducts estCost if 2xx omits usage
 }
 
 func (p *AdapterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -974,25 +972,25 @@ func (p *AdapterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	// 白名单提取允许字段（messages/tools/tool_choice/response_format/temperature），强制覆写 model、卡住 max_tokens、强设 stream=false
+	// Allowlist fields (messages/tools/tool_choice/response_format/temperature), override model, cap max_tokens, force stream=false
 	bodyBytes, estCost, err := p.sanitizePayload(rawBody, p.configuredModel, claims.MaxContextTokens)
 	if err != nil {
 		http.Error(w, "invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	ledger := p.getOrCreateLedger(claims.JTI, claims.ExpiresAt) // 后台协程定期清理过期条目
+	ledger := p.getOrCreateLedger(claims.JTI, claims.ExpiresAt) // Background goroutine sweeps expired entries
 	if !ledger.TryReserve(estCost, claims.MaxTotalTokens) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden) // 返回 403 而非 429，防止 OpenAI SDK 与限流退避混淆
+		w.WriteHeader(http.StatusForbidden) // 403 prevents OpenAI SDK from retrying budget exhaustion as a 429 rate limit
 		_, _ = w.Write([]byte(`{"error":{"code":"budget_exhausted","message":"task token budget exceeded"}}`))
 		return
 	}
-	// 默认按预留值 estCost 计费：若上游 2xx 但缺失 usage 字段，仍按保守预留扣减，防绕过预算；4xx/5xx 失败时退还预留
+	// Default actualTokens to estCost so a 2xx missing usage cannot bypass the budget; 4xx/5xx resets to 0
 	actualTokens := estCost
 	defer func() { ledger.Settle(estCost, actualTokens) }()
 
-	// 由可插拔 UpstreamProvider 决定目标地址与 Header（llmd-gateway / vllm-direct / ollama）
+	// Pluggable UpstreamProvider builds URL and headers (llmd-gateway / vllm-direct / ollama)
 	upURL, upHeaders, finalBody, err := p.upstream.BuildUpstreamRequest(r.Context(), claims, bodyBytes)
 	if err != nil {
 		actualTokens = 0
@@ -1003,7 +1001,7 @@ func (p *AdapterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var resp *http.Response
 	var respBytes []byte
 	for attempt := 0; attempt <= 4; attempt++ {
-		// 全新构造请求，不复制沙箱侧任何 Header
+		// Construct a fresh request so zero sandbox headers pass through
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(finalBody))
 		if err != nil {
 			actualTokens = 0
@@ -1050,7 +1048,7 @@ func (p *AdapterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			actualTokens = total
 			p.metrics.ObserveTokens(claims.Repo, actualTokens, cached)
 		} else {
-			p.metrics.ObserveTokens(claims.Repo, actualTokens, 0) // 缺 usage 时按保守预留值计费
+			p.metrics.ObserveTokens(claims.Repo, actualTokens, 0)
 		}
 	} else {
 		actualTokens = 0
@@ -1063,32 +1061,32 @@ func (p *AdapterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 8. 控制面去噪流水线与 Publisher 精准对齐清洗（`internal/orchestrator` + `internal/publisher`）
+## 8. Control-Plane Deduplication & Publisher Pipeline (`internal/orchestrator` + `internal/publisher`)
 
-### 8.1 去噪与对齐发布流程图（先合法校验与原文对齐，再算指纹去重）
+### 8.1 Denoise, Hunk Alignment, Sanitization, and Atomic Publish Flow
 
 ```mermaid
 flowchart TD
-    Shards["收集分片结果 (至少 1 片成功)"] --> Validate["Schema 与合法性校验 (限条数, 长度, 枚举, 文件在 Diff 内)"]
-    Validate --> FilterConf["过滤 confidence 小于 0.75 与无 evidence 项"]
-    FilterConf --> DiffParse["解析 diff.patch 提取各文件合法 Hunk 区间"]
-    DiffParse --> Align["按 target_line_text 核对并校正 Hunk 行号 (失配降级文件级或 Summary)"]
-    Align --> FpCalc["对齐条目从 Hunk 取前一行算指纹, 降级条目仅按文件与目标行算指纹"]
-    FpCalc --> Dedup["同文件邻近行合并 + PG finding_fingerprints 跨轮去重"]
-    Dedup --> TopN["按严重度排序并截断至 Top 8 条"]
-    TopN --> AutoZero{"auto 触发且 0 新问题且无失败分片 ?"}
-    AutoZero -->|"是"| SkipPost["静默标 done, 不发空评论刷屏"]
-    AutoZero -->|"否"| Sanitize["清洗行首 Prow 斜杠指令, @mention 与外链图片并附 fp 标记"]
-    Sanitize --> CAS{"GetHeadSHA 仍等于 reviewed_sha ?"}
-    CAS -->|"否"| Drop["标为 superseded 并丢弃"]
-    CAS -->|"是"| Post["幂等检查 run_id 标记，再原子 POST reviews，最后落库全部指纹"]
+    Shards["Collect Shards (At Least 1 Succeeded)"] --> Validate["Validate Schema (Max Count, Field Lengths, Enums, File in Diff)"]
+    Validate --> FilterConf["Drop confidence Below 0.75 or Missing evidence"]
+    FilterConf --> DiffParse["Parse diff.patch into Per-File Hunk Ranges"]
+    DiffParse --> Align["Verify & Relocate Lines Against target_line_text (Fallback File/Summary)"]
+    Align --> FpCalc["Compute Fingerprint: Hunk prev_line for Aligned, File+Target for Fallback"]
+    FpCalc --> Dedup["Cluster Nearby Same-File Findings + PG finding_fingerprints Dedup"]
+    Dedup --> TopN["Sort by Severity & Cap at Top 8"]
+    TopN --> AutoZero{"auto Trigger, 0 New Findings, 0 Failed Shards ?"}
+    AutoZero -->|"Yes"| SkipPost["Mark done Silently Without Comment Spam"]
+    AutoZero -->|"No"| Sanitize["Scrub Leading Prow Commands, @mentions, Images & Embed fp Marker"]
+    Sanitize --> CAS{"GetHeadSHA Still Equals reviewed_sha ?"}
+    CAS -->|"No"| Drop["Mark superseded & Discard"]
+    CAS -->|"Yes"| Post["Check run_id Marker, Atomic POST reviews, Save All Fingerprints"]
 ```
 
-### 8.2 去噪、验证与幂等发布 Go 伪代码
+### 8.2 Denoise, Validation, and Idempotent Publishing Pseudo-Code
 
 ```go
 func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunRecord, shards []ShardOutput, diffPatch []byte) error {
-	hunks := publisher.ParseUnifiedDiff(diffPatch) // 可选复用 reviewdog diff 解析库
+	hunks := publisher.ParseUnifiedDiff(diffPatch) // Can reuse reviewdog's diff parser library
 	diffFiles := hunks.ChangedFileSet()
 
 	var validFindings []contract.ReviewFinding
@@ -1098,7 +1096,7 @@ func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunReco
 			failedShards = append(failedShards, s.ShardName)
 			continue
 		}
-		if err := publisher.ValidateReport(s.Report, diffFiles); err != nil { // 校验条数/字段长度/枚举/文件在 Diff 内
+		if err := publisher.ValidateReport(s.Report, diffFiles); err != nil { // Caps count/lengths, checks enums & changed files
 			failedShards = append(failedShards, s.ShardName)
 			continue
 		}
@@ -1108,14 +1106,14 @@ func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunReco
 		return errors.New("all review shards failed or produced invalid reports")
 	}
 
-	// 1. 状态转 publishing
+	// 1. Transition status to publishing
 	if ok, err := o.store.MarkPublishing(ctx, run.ID, o.workerID); err != nil {
 		return err
 	} else if !ok {
 		return nil
 	}
 
-	// 2. 先过滤再与 Hunk 对齐（对齐项直接从 Hunk 取前一行，覆盖 RIGHT 与 deleted LEFT；未对齐降级项仅按 file+target_line 算指纹）
+	// 2. Filter, align against diff hunks (extracting prev_line for both RIGHT and deleted LEFT; fallback uses file+target), dedup, cap Top 8
 	confident := filterByConfidenceAndEvidence(validFindings, 0.75)
 	aligned := publisher.AlignAndComputeFingerprints(confident, hunks, o.cfg.SupportsFileComments)
 	unseen, err := o.dedupWithPG(ctx, run.Repo, run.PRNumber, aligned)
@@ -1124,12 +1122,12 @@ func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunReco
 	}
 	finalItems := topNAndCluster(unseen, 8)
 
-	// 3. 自动触发且 0 条有效结果、无分片失败时直接静默结束，不刷屏
+	// 3. Auto triggers with 0 new findings and 0 failed shards finish silently
 	if run.TriggerType == "auto" && len(finalItems) == 0 && len(failedShards) == 0 {
 		return o.store.MarkDoneIfActive(ctx, run.ID, o.workerID)
 	}
 
-	// 4. 不可信文本清洗（每条评论内置 <!-- fp:<fingerprint> --> 供崩溃重放解析映射）+ 实时查 HeadSHA CAS
+	// 4. Scrub untrusted text (embedding <!-- fp:<fingerprint> --> per item for crash replay) and verify live HeadSHA
 	summary, inlines, fileCmts := publisher.BuildCleanOutputs(finalItems, failedShards, run.ID, run.HeadSHA)
 	liveSHA, err := o.vcs.GetHeadSHA(ctx, run.Repo, run.PRNumber)
 	if err != nil {
@@ -1139,7 +1137,7 @@ func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunReco
 		return o.store.MarkSuperseded(ctx, run.ID)
 	}
 
-	// 5. PublishReview 内部先扫描 <!-- review-run:<runID> --> 与各 <!-- fp:... --> 防崩溃重发，并返回实际已发评论列表
+	// 5. PublishReview checks existing PR reviews for <!-- review-run:<runID> --> before posting and parses <!-- fp:... --> IDs
 	pubRes, err := o.vcs.PublishReview(ctx, contract.PublishRequest{
 		Repo: run.Repo, PRNumber: run.PRNumber, CommitID: run.HeadSHA, RunID: run.ID.String(),
 		Event: "COMMENT", Summary: summary, Inlines: inlines, FileComments: fileCmts,
@@ -1148,7 +1146,7 @@ func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunReco
 		return err
 	}
 
-	// 6. 评论已发出后，指纹必须使用 WithoutCancel 无条件落库（Summary 降级项 comment_id 存 NULL；仅 comment_id>0 写入 review_feedback）
+	// 6. Save all posted fingerprints unconditionally via WithoutCancel (Summary items store NULL comment_id; comment_id>0 seeds review_feedback)
 	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer saveCancel()
 	if err := o.store.SavePublishedFingerprints(saveCtx, run.Repo, run.PRNumber, run.ID, pubRes); err != nil {
@@ -1160,18 +1158,18 @@ func (o *Orchestrator) PrepareAndPublish(ctx context.Context, run *store.RunReco
 
 ---
 
-## 9. 分阶段开发里程碑与验收标准（M1 ~ M4）
+## 9. Phased Development Milestones and Acceptance Criteria (M1 - M4)
 
 ```mermaid
 flowchart LR
-    M1["M1: 本地 CLI 与 Go Harness 闭环 (2 周)"] --> M2["M2: 控制面, gVisor 沙箱与基础 Adapter (2 周)"]
-    M2 --> M3["M3: 接入 llm-d 集群与反馈效果看板 (2 周)"]
-    M3 --> M4["M4: CI 日志与独立断网测试子沙箱 (按需)"]
+    M1["M1: Local CLI & Go Harness Loop (2 Weeks)"] --> M2["M2: Control Plane, gVisor Sandbox & Basic Adapter (2 Weeks)"]
+    M2 --> M3["M3: llm-d Cluster Integration & Feedback Metrics (2 Weeks)"]
+    M3 --> M4["M4: CI Logs & Air-Gapped Scoped Test Runner (Optional)"]
 ```
 
-| 里程碑 | 交付内容 | 核心验收标准（可测量） |
+| Milestone | Deliverables | Measurable Acceptance Criteria |
 | :--- | :--- | :--- |
-| **M1：本地 CLI 与静态 Harness 闭环** | `pkg/contract`、`internal/llmclient`、`internal/tools`、`internal/harness`、`internal/publisher`、`cmd/harness`、`cmd/reviewctl` | `CGO_ENABLED=0` 静态编译通过；`os.OpenRoot` 与 `rg -e ... --` 防注入单测通过；Schema 校验+纠错重试与 Hunk 原文对齐单测 100% 通过；对 `llm-d-router` 历史 PR 本地回放跑通 |
-| **M2：控制面调度、gVisor 沙箱与基础 Adapter** | `internal/store`（SQL 迁移 + 部分唯一索引 + `SKIP LOCKED`）、`internal/vcs/github`、`internal/sandbox`、`internal/orchestrator`（含准入限流）、`cmd/controller`、基础版 `cmd/adapter`（`internal/token` + `vllm-direct` + 预算原子预留） | 并发连续 Force-Push 集成测试验证旧 Pod 秒级取消、Reaper 与 `defer` 无孤儿 Pod 残留；`NetworkPolicy`（`namespaceSelector + podSelector` 选中 Adapter Pod）验证沙箱禁 DNS、禁其他内外网，仅能访问 Adapter Pod；内部灰度仓库试跑并实测文件级评论兼容性 |
-| **M3：`llm-d` 集群接入与反馈闭环** | `UpstreamProvider` 的 `llmd-gateway` 插件、EPP 配置联动、`429/503` 重试调优、`internal/telemetry`、Reaction 定时轮询 | 对接 `llm-d` Gateway，验证多轮工具调用在 `session-affinity-scorer` 下稳定命中同 Pod 并从 `cmd/adapter` 准确上报 `cached_tokens`；模拟 `429/503` 与预算耗尽返回 `403` 验证通过；Grafana 看板展示采纳率与延迟 |
-| **M4：可选 CI 日志与独立断网单测扩展** | `CheckLogFetcher.FetchCheckLogs`、独立 `Egress: DenyAll` 测试 Runner 子沙箱 Pod 与 `run_scoped_test` 扩展 | 开启扩展后，验证测试 Runner 子沙箱 Pod 完全断网且无法窃取 Harness 容器内存中的 `OPENAI_API_KEY`，控制面可结合截断 CI 日志与局部单测结果完成复核 |
+| **M1: Local CLI & Static Harness** | `pkg/contract`, `internal/llmclient`, `internal/tools`, `internal/harness`, `internal/publisher`, `cmd/harness`, `cmd/reviewctl` | `CGO_ENABLED=0` static build passes; unit tests verify `os.OpenRoot` & `rg --no-ignore -e ... --` safety, Schema repair retry, and verbatim hunk alignment; offline replay passes on historical `llm-d-router` PRs |
+| **M2: Control Plane, gVisor Sandbox & Basic Adapter** | `internal/store` (SQL DDL + partial unique indexes + `SKIP LOCKED`), `internal/vcs/github`, `internal/sandbox`, `internal/orchestrator` (admission & rate limit), `cmd/controller`, minimal `cmd/adapter` (`internal/token` + `vllm-direct` + CAS budget) | Concurrent force-push integration tests confirm rapid Pod cancellation with zero orphan Pods; `NetworkPolicy` (`namespaceSelector + podSelector` selecting Adapter Pods) confirms DNS blocked, cluster/internet blocked, and only Adapter reachable; pilot repo run verifies GitHub file-level comment compatibility |
+| **M3: `llm-d` Integration & Feedback Loop** | `llmd-gateway` `UpstreamProvider`, EPP config alignment, `429/503` backoff tuning, `internal/telemetry`, periodic reaction poller | Multi-turn reviews hit the same vLLM Pod via `session-affinity-scorer` with `cached_tokens` reported from `cmd/adapter`; simulated `429/503` retries and `403 budget_exhausted` cutoff verified; Grafana displays acceptance rate and latency |
+| **M4: Optional CI Logs & Isolated Unit-Test Hook** | `CheckLogFetcher.FetchCheckLogs`, separate `Egress: DenyAll` test runner child Pod, and `run_scoped_test` hook | When enabled, verified that the test runner Pod is 100% air-gapped and cannot access `OPENAI_API_KEY` in Harness memory, while Harness incorporates truncated CI logs and scoped test output |
