@@ -1,0 +1,21 @@
+# Binaries and build outputs
+/bin/
+/dist/
+*.exe
+*.out
+*.test
+
+# Go workspace and coverage
+coverage.out
+coverage.html
+
+# Local environment and secrets
+.env
+*.pem
+*.key
+.review/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
