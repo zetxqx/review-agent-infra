@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -15,14 +16,63 @@ import (
 	"github.com/zetxqx/review-agent-infra/internal/publisher"
 )
 
+type mockFindingScript struct {
+	File           string   `json:"file"`
+	Line           int32    `json:"line"`
+	Side           string   `json:"side"`
+	TargetLineText string   `json:"targetLineText"`
+	Anchor         string   `json:"anchor"`
+	Severity       string   `json:"severity"`
+	Confidence     *float64 `json:"confidence"`
+	Category       string   `json:"category"`
+	Title          string   `json:"title"`
+	Explanation    string   `json:"explanation"`
+	Suggestion     string   `json:"suggestion"`
+	Evidence       string   `json:"evidence"`
+}
+
+type mockUpstreamScript struct {
+	Summary  string              `json:"summary"`
+	Findings []mockFindingScript `json:"findings"`
+}
+
+func loadMockUpstreamScript(path string) (*mockUpstreamScript, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read --mock-script %q: %w", path, err)
+	}
+	var s mockUpstreamScript
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, fmt.Errorf("parse --mock-script %q: %w", path, err)
+	}
+	if s.Findings == nil {
+		s.Findings = []mockFindingScript{}
+	}
+	for i := range s.Findings {
+		if s.Findings[i].Side == "" {
+			s.Findings[i].Side = "DIFF_SIDE_RIGHT"
+		}
+		if s.Findings[i].Anchor == "" {
+			s.Findings[i].Anchor = "ANCHOR_KIND_QUOTED"
+		}
+		if s.Findings[i].Severity == "" {
+			s.Findings[i].Severity = "SEVERITY_MEDIUM"
+		}
+		if s.Findings[i].Category == "" {
+			s.Findings[i].Category = "FINDING_CATEGORY_CORRECTNESS"
+		}
+	}
+	return &s, nil
+}
+
 type mockUpstreamRequestLog struct {
-	SessionID   string
-	FairnessID  string
-	Objective   string
-	Stream      bool
-	IncludeUse  bool
-	JSONSchema  bool
-	PromptText  string
+	SessionID  string
+	FairnessID string
+	Objective  string
+	Stream     bool
+	IncludeUse bool
+	JSONSchema bool
+	PromptText string
 }
 
 type diffAwareMockUpstream struct {
@@ -30,12 +80,18 @@ type diffAwareMockUpstream struct {
 	// key: x-session-id header value; value: number of upstream calls observed in that session
 	sessionTurns map[string]int
 	requests     []mockUpstreamRequestLog
+	script       *mockUpstreamScript
 }
 
 func startMockUpstreamServer() (*httptest.Server, *diffAwareMockUpstream) {
+	return startMockUpstreamServerWithScript(nil)
+}
+
+func startMockUpstreamServerWithScript(script *mockUpstreamScript) (*httptest.Server, *diffAwareMockUpstream) {
 	m := &diffAwareMockUpstream{
 		// key: x-session-id header value; value: number of upstream calls observed in that session
 		sessionTurns: make(map[string]int),
+		script:       script,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", m.handleChatCompletions)
@@ -97,8 +153,13 @@ func (m *diffAwareMockUpstream) handleChatCompletions(w http.ResponseWriter, r *
 	}
 	compToks := int64(110)
 
-	targetFile, targetLine, targetText := pickAnchorFromPrompt(promptText)
-	content := buildMockAssistantContent(isSchema, promptText, targetFile, targetLine, targetText)
+	var content string
+	if m.script != nil {
+		content = buildScriptedAssistantContent(isSchema, turn, m.script)
+	} else {
+		targetFile, targetLine, targetText := pickAnchorFromPrompt(promptText)
+		content = buildMockAssistantContent(isSchema, promptText, targetFile, targetLine, targetText)
+	}
 
 	if !stream {
 		w.Header().Set("Content-Type", "application/json")
@@ -413,4 +474,38 @@ func buildMockAssistantContent(isSchema bool, promptText, file string, line int3
 		"MOCK_ANCHOR|%s|%d|%s\n### Finding in `%s` (approx line %d)\nQuoted line: `%s`\nVerify error and state handling on this path.\n",
 		file, line, targetText, file, shiftedLine, targetText,
 	)
+}
+
+func buildScriptedAssistantContent(isSchema bool, turn int, script *mockUpstreamScript) string {
+	if isSchema {
+		encoded, _ := json.Marshal(script)
+		return string(encoded)
+	}
+	var b strings.Builder
+	if turn <= 1 {
+		b.WriteString("### Initial Diff Inspection\n\n")
+	} else {
+		b.WriteString("### Verified Review Findings\n\n")
+	}
+	if strings.TrimSpace(script.Summary) != "" {
+		b.WriteString(strings.TrimSpace(script.Summary))
+		b.WriteString("\n\n")
+	}
+	if len(script.Findings) == 0 {
+		b.WriteString("No actionable defects identified in the changed files.\n")
+		return b.String()
+	}
+	for i, f := range script.Findings {
+		fmt.Fprintf(&b, "%d. [%s] `%s:%d` - %s\n", i+1, f.Severity, f.File, f.Line, f.Title)
+		if strings.TrimSpace(f.TargetLineText) != "" {
+			fmt.Fprintf(&b, "   Quoted line: `%s`\n", f.TargetLineText)
+		}
+		if strings.TrimSpace(f.Explanation) != "" {
+			fmt.Fprintf(&b, "   %s\n", f.Explanation)
+		}
+		if strings.TrimSpace(f.Suggestion) != "" {
+			fmt.Fprintf(&b, "   Suggestion: %s\n", f.Suggestion)
+		}
+	}
+	return b.String()
 }

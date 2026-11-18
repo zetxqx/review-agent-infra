@@ -11,7 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
@@ -26,55 +28,69 @@ import (
 	"github.com/zetxqx/review-agent-infra/internal/publisher"
 	"github.com/zetxqx/review-agent-infra/internal/sandbox"
 	"github.com/zetxqx/review-agent-infra/internal/token"
+	"github.com/zetxqx/review-agent-infra/internal/vcs/github"
 	"github.com/zetxqx/review-agent-infra/internal/vcs/localgit"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
+const fallbackGHScript = "/usr/local/google/home/bobzetian/.gemini/config/plugins/github/skills/github/scripts/gh"
+
 type commonFlags struct {
-	repoDir       string
-	commitRef     string
-	commitsCSV    string
-	baseRef       string
-	headRef       string
-	runnerKind     string
-	dockerImage    string
-	dockerImageSet bool
-	dockerNetwork  string
-	loaderBin     string
-	upstreamKind    string
-	upstreamURL     string
-	upstreamURLSet  bool
-	upstreamKey     string
-	upstreamModel string
-	modelAlias    string
-	mockUpstream  bool
-	minConfidence float64
-	topN          int
-	format        string
-	outFile       string
-	concurrency   int
+	repoDir              string
+	commitRef            string
+	commitsCSV           string
+	baseRef              string
+	headRef              string
+	runnerKind           string
+	dockerImage          string
+	dockerImageSet       bool
+	dockerNetwork        string
+	loaderBin            string
+	upstreamKind         string
+	upstreamURL          string
+	upstreamURLSet       bool
+	upstreamKey          string
+	upstreamModel        string
+	modelAlias           string
+	mockUpstream         bool
+	mockScript           string
+	minConfidence        float64
+	topN                 int
+	format               string
+	outFile              string
+	concurrency          int
+	runID                string
+	supportsFileComments bool
+}
+
+type PublishedReviewInfo struct {
+	Repo         string `json:"repo"`
+	PRNumber     int    `json:"pr_number"`
+	ReviewID     int64  `json:"review_id"`
+	CommentCount int    `json:"comment_count"`
 }
 
 type ExecutionMetrics struct {
-	Commit            string                      `json:"commit"`
-	Profile           string                      `json:"profile"`
-	Adapter           string                      `json:"adapter"`
-	Status            string                      `json:"status"`
-	NormalizerPath    string                      `json:"normalizer_path"`
-	FindingsRaw       int                         `json:"findings_raw"`
-	FindingsPublished int                         `json:"findings_published"`
-	InlineAligned     int                         `json:"inline_aligned"`
-	FallbackCount     int                         `json:"fallback_count"`
-	DurationMs        int64                       `json:"duration_ms"`
-	Requests          int32                       `json:"requests"`
-	NormalizeRequests int32                       `json:"normalize_requests"`
-	PromptTokens      int64                       `json:"prompt_tokens"`
-	CachedTokens      int64                       `json:"cached_tokens"`
-	CompletionTokens  int64                       `json:"completion_tokens"`
-	CacheHitRatio     float64                     `json:"cache_hit_ratio"`
-	Pipeline          publisher.PipelineResult    `json:"-"`
-	Report            *reviewv1.ReviewReport      `json:"-"`
+	RunID             string                   `json:"run_id,omitempty"`
+	Commit            string                   `json:"commit"`
+	Profile           string                   `json:"profile"`
+	Adapter           string                   `json:"adapter"`
+	Status            string                   `json:"status"`
+	NormalizerPath    string                   `json:"normalizer_path"`
+	FindingsRaw       int                      `json:"findings_raw"`
+	FindingsPublished int                      `json:"findings_published"`
+	InlineAligned     int                      `json:"inline_aligned"`
+	FallbackCount     int                      `json:"fallback_count"`
+	DurationMs        int64                    `json:"duration_ms"`
+	Requests          int32                    `json:"requests"`
+	NormalizeRequests int32                    `json:"normalize_requests"`
+	PromptTokens      int64                    `json:"prompt_tokens"`
+	CachedTokens      int64                    `json:"cached_tokens"`
+	CompletionTokens  int64                    `json:"completion_tokens"`
+	CacheHitRatio     float64                  `json:"cache_hit_ratio"`
+	Pipeline          publisher.PipelineResult `json:"-"`
+	Report            *reviewv1.ReviewReport   `json:"-"`
 }
 
 type ScorecardRow struct {
@@ -95,11 +111,12 @@ type ScorecardRow struct {
 }
 
 type liveAdapterSession struct {
-	sandboxURL  string
-	internalURL string
-	tokenKey    []byte
-	proxy       *inference.ProxyHandler
-	closeFn     func()
+	sandboxURL   string
+	internalURL  string
+	tokenKey     []byte
+	proxy        *inference.ProxyHandler
+	mockUpstream *diffAwareMockUpstream
+	closeFn      func()
 }
 
 func main() {
@@ -142,6 +159,7 @@ func bindCommonFlags(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.upstreamModel, "upstream-model", envOr("REVIEWCTL_UPSTREAM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct"), "")
 	fs.StringVar(&c.modelAlias, "model-alias", envOr("REVIEWCTL_MODEL_ALIAS", "review-coder"), "")
 	fs.BoolVar(&c.mockUpstream, "mock-upstream", false, "")
+	fs.StringVar(&c.mockScript, "mock-script", envOr("REVIEWCTL_MOCK_SCRIPT", ""), "")
 	fs.Float64Var(&c.minConfidence, "min-confidence", publisher.DefaultMinConfidence, "")
 	fs.IntVar(&c.topN, "top-n", publisher.DefaultTopN, "")
 	fs.StringVar(&c.format, "format", "markdown", "")
@@ -153,8 +171,16 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("reviewctl review", flag.ContinueOnError)
 	var cfg commonFlags
 	var harnessName string
+	var publishPR int
+	var githubRepo string
+	var skipHeadCheck bool
 	bindCommonFlags(fs, &cfg)
 	fs.StringVar(&harnessName, "harness", "single-shot", "")
+	fs.IntVar(&publishPR, "publish-pr", 0, "")
+	fs.StringVar(&githubRepo, "github-repo", "", "")
+	fs.StringVar(&cfg.runID, "run-id", "", "")
+	fs.BoolVar(&cfg.supportsFileComments, "supports-file-comments", false, "")
+	fs.BoolVar(&skipHeadCheck, "skip-head-check", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -176,6 +202,27 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
+	var vcs *github.Plugin
+	var ghRepo string
+	if publishPR > 0 {
+		ghRepo, err = resolveGitHubRepo(ctx, githubRepo, commits[0].RepoDir)
+		if err != nil {
+			return err
+		}
+		ghToken, tokErr := resolveGitHubToken(ctx)
+		if tokErr != nil {
+			return tokErr
+		}
+		apiBase := envOr("GITHUB_API_URL", "")
+		if ghToken == "" && apiBase == "" {
+			return errors.New("GitHub token is required for --publish-pr (set GITHUB_TOKEN or authenticate with gh)")
+		}
+		vcs = github.NewPlugin(github.Config{
+			StaticToken: ghToken,
+			APIBaseURL:  apiBase,
+		})
+	}
+
 	adapterSess, err := startEphemeralAdapter(cfg)
 	if err != nil {
 		return err
@@ -193,23 +240,57 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
+	var pubInfo *PublishedReviewInfo
+	if vcs != nil {
+		if !skipHeadCheck {
+			remoteHead, headErr := vcs.GetHeadSHA(ctx, ghRepo, publishPR)
+			if headErr != nil {
+				return fmt.Errorf("verify PR #%d head SHA on %s: %w", publishPR, ghRepo, headErr)
+			}
+			if remoteHead != commits[0].HeadSHA {
+				return fmt.Errorf("PR #%d remote head SHA %s does not match reviewed commit %s (pass --skip-head-check to override)", publishPR, remoteHead, commits[0].HeadSHA)
+			}
+		}
+		pubRes, pubErr := vcs.PublishReview(ctx, contract.PublishRequest{
+			Repo:         ghRepo,
+			PRNumber:     publishPR,
+			CommitID:     commits[0].HeadSHA,
+			RunID:        execRes.RunID,
+			Event:        "COMMENT",
+			Summary:      execRes.Pipeline.Summary,
+			Inlines:      execRes.Pipeline.Inlines,
+			FileComments: execRes.Pipeline.FileComments,
+		})
+		if pubErr != nil {
+			return pubErr
+		}
+		pubInfo = &PublishedReviewInfo{
+			Repo:         ghRepo,
+			PRNumber:     publishPR,
+			ReviewID:     pubRes.ReviewID,
+			CommentCount: len(pubRes.Comments),
+		}
+	}
+
 	var rendered []byte
 	if cfg.format == "json" {
 		rendered, err = json.MarshalIndent(struct {
-			Metrics  ExecutionMetrics         `json:"metrics"`
-			Summary  string                   `json:"summary"`
-			Inlines  []contract.InlineComment `json:"inlines"`
+			Metrics   ExecutionMetrics         `json:"metrics"`
+			Summary   string                   `json:"summary"`
+			Inlines   []contract.InlineComment `json:"inlines"`
+			Published *PublishedReviewInfo     `json:"published,omitempty"`
 		}{
-			Metrics: execRes,
-			Summary: execRes.Pipeline.Summary,
-			Inlines: execRes.Pipeline.Inlines,
+			Metrics:   execRes,
+			Summary:   execRes.Pipeline.Summary,
+			Inlines:   execRes.Pipeline.Inlines,
+			Published: pubInfo,
 		}, "", "  ")
 		if err != nil {
 			return err
 		}
 		rendered = append(rendered, '\n')
 	} else {
-		rendered = []byte(renderSingleReviewMarkdown(commits[0], execRes))
+		rendered = []byte(renderSingleReviewMarkdown(commits[0], execRes, pubInfo))
 	}
 
 	if cfg.outFile != "" {
@@ -396,9 +477,19 @@ func startEphemeralAdapter(cfg commonFlags) (*liveAdapterSession, error) {
 		return nil, err
 	}
 
+	var script *mockUpstreamScript
+	if cfg.mockScript != "" {
+		loaded, scriptErr := loadMockUpstreamScript(cfg.mockScript)
+		if scriptErr != nil {
+			return nil, scriptErr
+		}
+		script = loaded
+	}
+
 	var closers []func()
+	var mockUpstream *diffAwareMockUpstream
 	upstreamURL := cfg.upstreamURL
-	useMock := cfg.mockUpstream || upstreamURL == "mock"
+	useMock := cfg.mockUpstream || cfg.mockScript != "" || upstreamURL == "mock"
 	if !useMock && !cfg.upstreamURLSet && os.Getenv("REVIEWCTL_UPSTREAM_URL") == "" {
 		if conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:8000", 50*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
@@ -408,7 +499,8 @@ func startEphemeralAdapter(cfg commonFlags) (*liveAdapterSession, error) {
 		}
 	}
 	if useMock {
-		mockSrv, _ := startMockUpstreamServer()
+		mockSrv, mockHandler := startMockUpstreamServerWithScript(script)
+		mockUpstream = mockHandler
 		upstreamURL = mockSrv.URL
 		closers = append(closers, mockSrv.Close)
 	}
@@ -467,10 +559,11 @@ func startEphemeralAdapter(cfg commonFlags) (*liveAdapterSession, error) {
 	})
 
 	return &liveAdapterSession{
-		sandboxURL:  "http://" + sbxLn.Addr().String(),
-		internalURL: "http://" + intLn.Addr().String(),
-		tokenKey:    key,
-		proxy:       proxy,
+		sandboxURL:   "http://" + sbxLn.Addr().String(),
+		internalURL:  "http://" + intLn.Addr().String(),
+		tokenKey:     key,
+		proxy:        proxy,
+		mockUpstream: mockUpstream,
 		closeFn: func() {
 			for i := len(closers) - 1; i >= 0; i-- {
 				closers[i]()
@@ -533,7 +626,10 @@ func executeProfileOnCommit(
 		return ExecutionMetrics{}, err
 	}
 
-	runID := fmt.Sprintf("cli-%s-%s-%s-%d", shortSHA(commit.HeadSHA), randomHexID(4), profile.Name, seq)
+	runID := cfg.runID
+	if runID == "" {
+		runID = fmt.Sprintf("cli-%s-%s-%s-%d", shortSHA(commit.HeadSHA), randomHexID(4), profile.Name, seq)
+	}
 	jti := randomHexID(12)
 	claims := &reviewv1.TaskClaims{
 		RunId:                   runID,
@@ -609,6 +705,7 @@ func executeProfileOnCommit(
 	pipeOpts := publisher.DefaultPipelineOptions()
 	pipeOpts.DefaultConfidence = profile.DefaultConfidence
 	pipeOpts.MinConfidence = cfg.minConfidence
+	pipeOpts.SupportsFileComments = cfg.supportsFileComments
 	pipeOpts.TopN = cfg.topN
 	pipeOpts.MintedTokens = []string{rawToken}
 
@@ -630,6 +727,7 @@ func executeProfileOnCommit(
 	}
 
 	return ExecutionMetrics{
+		RunID:             runID,
 		Commit:            shortSHA(commit.HeadSHA),
 		Profile:           profile.Name,
 		Adapter:           profile.Adapter,
@@ -720,7 +818,7 @@ func aggregateScorecard(profiles []ProfileSpec, runs []ExecutionMetrics) []Score
 	return rows
 }
 
-func renderSingleReviewMarkdown(commit localgit.CommitSpec, res ExecutionMetrics) string {
+func renderSingleReviewMarkdown(commit localgit.CommitSpec, res ExecutionMetrics, pub *PublishedReviewInfo) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Code Review: `%s` (%s)\n\n", shortSHA(commit.HeadSHA), commit.Title)
 	fmt.Fprintf(
@@ -728,12 +826,16 @@ func renderSingleReviewMarkdown(commit localgit.CommitSpec, res ExecutionMetrics
 		"- **Profile:** `%s` (`%s`, normalizer: `%s`)\n"+
 			"- **Findings:** %d published (%d inline aligned, %d fallback, %d raw)\n"+
 			"- **Tokens:** prompt=%d, cached=%d (%.1f%%), completion=%d, requests=%d+%d normalize\n"+
-			"- **Latency:** %dms\n\n",
+			"- **Latency:** %dms\n",
 		res.Profile, res.Adapter, res.NormalizerPath,
 		res.FindingsPublished, res.InlineAligned, res.FallbackCount, res.FindingsRaw,
 		res.PromptTokens, res.CachedTokens, res.CacheHitRatio*100, res.CompletionTokens,
 		res.Requests, res.NormalizeRequests, res.DurationMs,
 	)
+	if pub != nil {
+		fmt.Fprintf(&b, "- **Published Review:** repo=%s pr=#%d review_id=%d comments=%d\n", pub.Repo, pub.PRNumber, pub.ReviewID, pub.CommentCount)
+	}
+	b.WriteByte('\n')
 	if strings.TrimSpace(res.Pipeline.Summary) != "" {
 		b.WriteString("## Summary\n\n")
 		b.WriteString(strings.TrimSpace(res.Pipeline.Summary))
@@ -827,4 +929,67 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func resolveGitHubRepo(ctx context.Context, explicit, repoDir string) (string, error) {
+	if strings.TrimSpace(explicit) != "" {
+		return validateOwnerRepo(explicit)
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "remote", "get-url", "origin")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve origin remote for %q (or pass --github-repo): %w", repoDir, err)
+	}
+	return parseGitHubRemoteURL(strings.TrimSpace(string(out)))
+}
+
+func parseGitHubRemoteURL(rawURL string) (string, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return "", errors.New("empty git origin remote URL")
+	}
+	if strings.Contains(trimmed, "://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return "", fmt.Errorf("parse remote URL %q: %w", rawURL, err)
+		}
+		return validateOwnerRepo(u.Path)
+	}
+	if _, after, ok := strings.Cut(trimmed, ":"); ok {
+		return validateOwnerRepo(after)
+	}
+	return validateOwnerRepo(trimmed)
+}
+
+func validateOwnerRepo(raw string) (string, error) {
+	cleaned := strings.Trim(strings.TrimSpace(raw), "/")
+	cleaned = strings.TrimSuffix(cleaned, ".git")
+	owner, name, ok := strings.Cut(cleaned, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("invalid GitHub repository slug %q (expected owner/repo)", raw)
+	}
+	return owner + "/" + name, nil
+}
+
+func resolveGitHubToken(ctx context.Context) (string, error) {
+	if tok := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); tok != "" {
+		return tok, nil
+	}
+	ghBin, err := exec.LookPath("gh")
+	if err != nil {
+		if info, statErr := os.Stat(fallbackGHScript); statErr == nil && !info.IsDir() {
+			ghBin = fallbackGHScript
+		}
+	}
+	if ghBin == "" {
+		return "", nil
+	}
+	cmd := exec.CommandContext(ctx, ghBin, "auth", "token")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(string(out)), nil
 }
