@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+package review.v1;
+
+option go_package = "github.com/zetxqx/review-agent-infra/gen/go/review/v1;reviewv1";
+
+// EventKind classifies an incoming webhook or CLI trigger before queueing.
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_REVIEW = 1;
+  EVENT_KIND_CLOSE = 2;
+  EVENT_KIND_FEEDBACK = 3;
+  EVENT_KIND_IGNORE = 4;
+}
+
+// TriggerSource identifies the code-hosting platform or local CLI origin.
+enum TriggerSource {
+  TRIGGER_SOURCE_UNSPECIFIED = 0;
+  TRIGGER_SOURCE_GITHUB = 1;
+  TRIGGER_SOURCE_GITLAB = 2;
+  TRIGGER_SOURCE_CLI = 3;
+}
+
+// TriggerType distinguishes automatic PR webhooks from maintainer slash commands.
+enum TriggerType {
+  TRIGGER_TYPE_UNSPECIFIED = 0;
+  TRIGGER_TYPE_AUTO = 1;
+  TRIGGER_TYPE_MANUAL_COMMAND = 2;
+}
+
+// DiffSide selects whether an inline comment attaches to the old (LEFT) or new (RIGHT) file version.
+enum DiffSide {
+  DIFF_SIDE_UNSPECIFIED = 0;
+  DIFF_SIDE_RIGHT = 1;
+  DIFF_SIDE_LEFT = 2;
+}
+
+// AnchorKind records whether the flagged line text came from the harness or was resolved from the snapshot.
+enum AnchorKind {
+  ANCHOR_KIND_UNSPECIFIED = 0;
+  ANCHOR_KIND_QUOTED = 1;
+  ANCHOR_KIND_DERIVED = 2;
+}
+
+// Severity ranks finding impact from critical to low.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_CRITICAL = 1;
+  SEVERITY_HIGH = 2;
+  SEVERITY_MEDIUM = 3;
+  SEVERITY_LOW = 4;
+}
+
+// FindingCategory classifies the engineering domain of a finding.
+enum FindingCategory {
+  FINDING_CATEGORY_UNSPECIFIED = 0;
+  FINDING_CATEGORY_CORRECTNESS = 1;
+  FINDING_CATEGORY_CONCURRENCY = 2;
+  FINDING_CATEGORY_SECURITY = 3;
+  FINDING_CATEGORY_K8S = 4;
+  FINDING_CATEGORY_STYLE = 5;
+}
+
+// NormalizerPath records how the in-sandbox Normalizer produced ReviewReport.
+enum NormalizerPath {
+  NORMALIZER_PATH_UNSPECIFIED = 0;
+  NORMALIZER_PATH_DETERMINISTIC = 1;
+  NORMALIZER_PATH_LLM = 2;
+  NORMALIZER_PATH_NONE = 3;
+}
+
+// ReportStatus indicates whether the harness run yielded a valid normalized report.
+enum ReportStatus {
+  REPORT_STATUS_UNSPECIFIED = 0;
+  REPORT_STATUS_OK = 1;
+  REPORT_STATUS_HARNESS_FAILED = 2;
+}
+
+// ReviewEvent is the normalized trigger emitted by VCSPlugin.VerifyAndParseWebhook.
+message ReviewEvent {
+  string event_id = 1;                       // Platform delivery UUID for idempotency
+  EventKind event_kind = 2;
+  TriggerSource source = 3;
+  string repo = 4;                           // e.g. "llm-d/llm-d-router"
+  int32 pr_number = 5;
+  string base_sha = 6;
+  string head_sha = 7;
+  bool is_draft = 8;
+  bool is_bot_author = 9;
+  bool is_fork = 10;
+  string author = 11;                        // PR author login
+  string triggered_by = 12;                  // Actor triggering the event (differs on /review)
+  bool is_maintainer = 13;                   // True when OWNER, MEMBER, or COLLABORATOR
+  TriggerType trigger_type = 14;
+  int64 force_rerun_seq = 15;                // 0 for auto; comment ID for manual /review
+  optional string requested_harness = 16;    // Optional profile name from "/review <profile>"
+}
+
+// TaskBudget bounds requests, context size, cumulative tokens, and runtime for one sandbox Pod.
+message TaskBudget {
+  int32 max_requests = 1;                    // Hard cap enforced by cmd/adapter
+  int32 max_context_tokens = 2;              // Passed to each harness's own context setting
+  int64 max_total_tokens = 3;                // Cumulative token cap enforced by cmd/adapter
+  int64 normalizer_reserve_tokens = 4;       // Budget slice held exclusively for 1-shot Normalizer
+  int32 wall_clock_seconds = 5;              // Subprocess timeout inside the sandbox
+}
+
+// HarnessRef identifies which harness profile and Python HarnessAdapter plugin to execute.
+message HarnessRef {
+  string profile = 1;                        // Config profile key, e.g. "openhands"
+  string adapter = 2;                        // Python entry point under group "review_agent.harness"
+  map<string, string> options = 3;
+}
+
+// GitInfo records the local two-branch repository prepared by cmd/loader inside /workspace/src.
+message GitInfo {
+  optional string base_ref = 1;              // "base", or unset if git apply -R failed
+  string head_ref = 2;                       // Always "pr"
+}
+
+// ToolEndpoints holds optional network endpoints enabled by M4 extensions.
+message ToolEndpoints {
+  optional string scoped_test = 1;           // ClusterIP:port of air-gapped test runner Pod
+}
+
+// AgentTask is serialized via protojson into /workspace/.review/in/task.json.
+// It MUST NEVER contain task tokens, GitHub credentials, or model API keys.
+message AgentTask {
+  string run_id = 1;
+  int32 shard_index = 2;
+  HarnessRef harness = 3;
+  string model_alias = 4;                    // Only model name visible inside the sandbox
+  string pr_title = 5;
+  string pr_body = 6;
+  string base_branch = 7;
+  string src_dir = 8;                        // Default: "/workspace/src" (RO in harness container)
+  string diff_file = 9;                      // Default: "/workspace/.review/in/diff.patch"
+  string rules_dir = 10;                     // Default: "/workspace/.review/in/rules" (from base_sha)
+  optional string ci_logs_file = 11;         // Optional truncated CI logs from CheckLogFetcher
+  string out_dir = 12;                       // Default: "/workspace/.review/out"
+  GitInfo git = 13;                          // Populated by cmd/loader before harness starts
+  repeated string masked_files = 14;         // Untrusted instruction files deleted by cmd/loader
+  ToolEndpoints tool_endpoints = 15;
+  TaskBudget budget = 16;
+}
+
+// ReviewFinding is one candidate defect emitted by a harness and normalized for Go denoising.
+message ReviewFinding {
+  string file = 1;
+  int32 line = 2;                            // 0 denotes a file-level finding
+  DiffSide side = 3;
+  string target_line_text = 4;               // <= 500 chars; verified verbatim by Go Publisher
+  AnchorKind anchor = 5;
+  Severity severity = 6;
+  optional double confidence = 7;            // [0, 1]; unset lets control plane apply profile default
+  FindingCategory category = 8;
+  string title = 9;                          // <= 200 chars
+  string explanation = 10;                   // <= 4000 chars
+  string suggestion = 11;                    // <= 4000 chars
+  string evidence = 12;                      // <= 2000 chars
+}
+
+// Provenance captures self-reported execution metadata; token accounting comes solely from cmd/adapter.
+message Provenance {
+  string profile = 1;
+  string harness_version = 2;
+  optional int32 exit_code = 3;
+  NormalizerPath normalizer = 4;
+  ReportStatus status = 5;
+}
+
+// ReviewReport is the unified sandbox output written via protojson to /workspace/.review/out/report.json.
+// Its summary and findings projection generates gen/schema/llm_review_report.schema.json for LLMs.
+message ReviewReport {
+  string summary = 1;                        // <= 8000 chars
+  repeated ReviewFinding findings = 2;       // <= 100 items per shard
+  Provenance provenance = 3;
+}
+
+// TaskClaims defines the HS256 JWT payload minted by cmd/controller and verified by cmd/adapter.
+message TaskClaims {
+  string run_id = 1;
+  string session_id = 2;                     // "<run_id>-s<shard>" or "<run_id>-s<shard>-<profile>"
+  optional string parent_session_id = 3;     // "<run_id>" when sharded across >1 shard
+  string repo = 4;
+  string harness_profile = 5;
+  int32 max_requests = 6;
+  int64 max_total_tokens = 7;
+  int64 normalizer_reserve_tokens = 8;
+  int32 max_output_tokens = 9;
+  int64 exp = 10;                            // Unix epoch expiration seconds
+  string jti = 11;                           // Unique token ID indexing cmd/adapter's atomic ledger
+}
+
+// SandboxUsage is returned by cmd/adapter /internal/usage/{jti} for the PostgreSQL scorecard.
+message SandboxUsage {
+  string jti = 1;
+  int32 requests = 2;
+  int32 normalize_requests = 3;
+  int64 prompt_tokens = 4;
+  int64 cached_tokens = 5;
+  int64 completion_tokens = 6;
+}

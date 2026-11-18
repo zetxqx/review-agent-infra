@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-harness-kit"
+version = "0.1.0"
+description = "In-sandbox Python kit adapting off-the-shelf coding harnesses to review-agent-infra Protobuf contracts."
+requires-python = ">=3.12"
+dependencies = [
+    "protobuf>=5.27",
+    "openai>=1.40",
+    "pyyaml>=6.0",
+]
+
+# Optional extras added with M4 (review-tools MCP mode) and developer checks.
+# Console scripts and review_agent.harness entry points are added with the package code in milestone M1.
+[project.optional-dependencies]
+tools = [
+    "mcp>=1.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/review_harness_kit"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
