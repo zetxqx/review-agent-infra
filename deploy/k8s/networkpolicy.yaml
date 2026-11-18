@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-egress-adapter-only
+  namespace: review-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      app: review-sandbox
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: review-system
+          podSelector:
+            matchLabels:
+              app: inference-adapter
+      ports:
+        - protocol: TCP
+          port: 8080

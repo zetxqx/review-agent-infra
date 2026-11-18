@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: review-system
+  labels:
+    kubernetes.io/metadata.name: review-system
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: review-sandbox
+  labels:
+    kubernetes.io/metadata.name: review-sandbox
+    pod-security.kubernetes.io/enforce: restricted

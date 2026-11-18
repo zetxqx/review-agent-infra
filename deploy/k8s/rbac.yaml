@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: review-controller
+  namespace: review-system
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: review-sandbox-manager
+  namespace: review-sandbox
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: review-controller-sandbox-manager
+  namespace: review-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: review-controller
+    namespace: review-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: review-sandbox-manager
