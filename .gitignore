@@ -1,19 +1,28 @@
-# Binaries and build outputs
-/bin/
+# Python build outputs and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
 /dist/
-*.exe
-*.out
-*.test
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.import_linter_cache/
 
-# Go workspace and coverage
-coverage.out
-coverage.html
+# Test coverage
+.coverage
+coverage.xml
+htmlcov/
 
 # Local environment and secrets
 .env
 *.pem
 *.key
 .review/
+
+# Local replay and evaluation outputs
+/runs/
 
 # IDE and OS files
 .idea/
