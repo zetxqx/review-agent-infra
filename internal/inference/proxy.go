@@ -16,6 +16,7 @@ import (
 	"time"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
+	"github.com/zetxqx/review-agent-infra/internal/telemetry"
 	"github.com/zetxqx/review-agent-infra/internal/token"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -69,6 +70,7 @@ type Config struct {
 	HTTPClient    *http.Client
 	BaseRetryWait time.Duration
 	MaxRetryWait  time.Duration
+	Telemetry     *telemetry.Registry
 }
 
 type StreamPlan struct {
@@ -88,6 +90,7 @@ type ProxyHandler struct {
 	baseRetryWait time.Duration
 	maxRetryWait  time.Duration
 	ledgers       *LedgerStore
+	telemetry     *telemetry.Registry
 
 	totalRequests    atomic.Int64
 	budgetRejections atomic.Int64
@@ -127,6 +130,7 @@ func NewProxyHandler(cfg Config) *ProxyHandler {
 		baseRetryWait: baseWait,
 		maxRetryWait:  maxWait,
 		ledgers:       NewLedgerStore(),
+		telemetry:     cfg.Telemetry,
 	}
 }
 
@@ -215,6 +219,9 @@ func (p *ProxyHandler) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		p.cachedTokens.Load(),
 		p.completionTokens.Load(),
 	)
+	if p.telemetry != nil {
+		_, _ = w.Write([]byte(p.telemetry.Render()))
+	}
 }
 
 func (p *ProxyHandler) handleProxy(w http.ResponseWriter, r *http.Request, api string) {
@@ -283,7 +290,7 @@ func (p *ProxyHandler) handleProxy(w http.ResponseWriter, r *http.Request, api s
 		}
 		u := parseUsageFromBody(api, fullBody)
 		ledger.Settle(plan.Estimate, u)
-		p.recordTokenMetrics(u)
+		p.recordTokenMetrics(claims, u)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(fullBody)
 		return
@@ -293,16 +300,19 @@ func (p *ProxyHandler) handleProxy(w http.ResponseWriter, r *http.Request, api s
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	u := relaySSE(w, resp.Body, plan, ledger)
-	p.recordTokenMetrics(u)
+	p.recordTokenMetrics(claims, u)
 }
 
-func (p *ProxyHandler) recordTokenMetrics(u *Usage) {
+func (p *ProxyHandler) recordTokenMetrics(claims *reviewv1.TaskClaims, u *Usage) {
 	if u == nil {
 		return
 	}
 	p.promptTokens.Add(u.Prompt)
 	p.cachedTokens.Add(u.Cached)
 	p.completionTokens.Add(u.Completion)
+	if p.telemetry != nil && claims != nil {
+		p.telemetry.AddTokens(claims.Repo, claims.HarnessProfile, u.Prompt, u.Completion, u.Cached)
+	}
 }
 
 // Return map key: allowlisted OpenAI request JSON field name; value: sanitized JSON value.
