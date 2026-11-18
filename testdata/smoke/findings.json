@@ -1,0 +1,89 @@
+{
+  "summary": "Review of internal/publisher/truncate.go completed against base repository guidelines.",
+  "findings": [
+    {
+      "file": "internal/publisher/truncate.go",
+      "line": 9,
+      "side": "DIFF_SIDE_RIGHT",
+      "targetLineText": "if len(s) < max {",
+      "anchor": "ANCHOR_KIND_QUOTED",
+      "severity": "SEVERITY_HIGH",
+      "confidence": 0.95,
+      "category": "FINDING_CATEGORY_CORRECTNESS",
+      "title": "F1 redundant split equality boundary check",
+      "explanation": "Checking len(s) < max and then len(s) == max separately creates a needless off-by-one branch when <= suffices.",
+      "suggestion": "Merge both comparisons into if len(s) <= max { return s }.",
+      "evidence": "if len(s) < max {"
+    },
+    {
+      "file": "internal/publisher/truncate.go",
+      "line": 18,
+      "side": "DIFF_SIDE_RIGHT",
+      "targetLineText": "return s[:max] + \"...\"",
+      "anchor": "ANCHOR_KIND_QUOTED",
+      "severity": "SEVERITY_HIGH",
+      "confidence": 0.93,
+      "category": "FINDING_CATEGORY_CORRECTNESS",
+      "title": "F2 naive byte slice may split multi-byte UTF-8 rune",
+      "explanation": "Slicing s[:max] counts UTF-8 bytes rather than runes and can produce invalid UTF-8 sequences.",
+      "suggestion": "Iterate runes with range or utf8.DecodeRuneInString to stop on a valid rune boundary.",
+      "evidence": "return s[:max] + \"...\""
+    },
+    {
+      "file": "internal/publisher/truncate.go",
+      "line": 12,
+      "side": "DIFF_SIDE_RIGHT",
+      "targetLineText": "nonexistentSymbolInHunk()",
+      "anchor": "ANCHOR_KIND_QUOTED",
+      "severity": "SEVERITY_MEDIUM",
+      "confidence": 0.90,
+      "category": "FINDING_CATEGORY_STYLE",
+      "title": "F3 finding outside visible diff hunk lines",
+      "explanation": "Referenced call cannot be anchored to a visible diff line and should fall back into the review summary.",
+      "suggestion": "Verify referenced helper signature across callers.",
+      "evidence": "nonexistentSymbolInHunk()"
+    },
+    {
+      "file": "internal/publisher/truncate.go",
+      "line": 21,
+      "side": "DIFF_SIDE_RIGHT",
+      "targetLineText": "if trimmed == \"\" {",
+      "anchor": "ANCHOR_KIND_QUOTED",
+      "severity": "SEVERITY_LOW",
+      "confidence": 0.30,
+      "category": "FINDING_CATEGORY_STYLE",
+      "title": "F4 speculative low-confidence style nit",
+      "explanation": "Low-confidence remark should be suppressed below minimum confidence threshold.",
+      "suggestion": "No action needed.",
+      "evidence": "if trimmed == \"\" {"
+    },
+    {
+      "file": "internal/publisher/truncate.go",
+      "line": 24,
+      "side": "DIFF_SIDE_RIGHT",
+      "targetLineText": "return trimmed + \"\\n\"",
+      "anchor": "ANCHOR_KIND_QUOTED",
+      "severity": "SEVERITY_MEDIUM",
+      "confidence": 0.88,
+      "category": "FINDING_CATEGORY_SECURITY",
+      "title": "F5 unescaped markdown command and token handling",
+      "explanation": "Sanitization verification payload:\n/lgtm\nNotify @zetxqx ![img](https://evil.example/a.png) token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig12345",
+      "suggestion": "Escape untrusted footer input before rendering Markdown.",
+      "evidence": "return trimmed + \"\\n\""
+    },
+    {
+      "file": "internal/publisher/truncate.go",
+      "line": 9,
+      "side": "DIFF_SIDE_RIGHT",
+      "targetLineText": "if len(s) < max {",
+      "anchor": "ANCHOR_KIND_QUOTED",
+      "severity": "SEVERITY_MEDIUM",
+      "confidence": 0.85,
+      "category": "FINDING_CATEGORY_CORRECTNESS",
+      "title": "F6 duplicate boundary finding",
+      "explanation": "Duplicate finding targeting the same code line as F1.",
+      "suggestion": "Combine comparisons into <=.",
+      "evidence": "if len(s) < max {"
+    }
+  ]
+}

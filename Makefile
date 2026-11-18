@@ -10,8 +10,10 @@ SANDBOX_IMAGE ?= review-agent-infra/poc-sandbox:local
 CONTROLLER_IMAGE ?= ghcr.io/zetxqx/review-controller:0.1.0
 ADAPTER_IMAGE ?= ghcr.io/zetxqx/review-adapter:0.1.0
 SMOKE_REPO ?= .
+SMOKE_SCRIPT ?= testdata/smoke/findings.json
+HARNESS ?= mock-llm
 
-.PHONY: all build proto schema test test-go test-py docker-build docker-build-control-plane k8s-apply smoke clean
+.PHONY: all build proto schema test test-go test-py docker-build docker-build-control-plane k8s-apply smoke smoke-pr clean
 
 all: build
 
@@ -56,6 +58,10 @@ k8s-apply:
 
 smoke: build
 	./$(BIN_DIR)/reviewctl compare --repo $(SMOKE_REPO) --commit HEAD --harnesses single-shot,mock-llm --mock-upstream
+
+smoke-pr: build
+	@test -n "$(PR)" || (echo "usage: make smoke-pr PR=<number>" >&2; exit 2)
+	./$(BIN_DIR)/reviewctl review --repo . --base origin/main --head pr-$(PR) --harness $(HARNESS) --mock-upstream --mock-script $(SMOKE_SCRIPT)
 
 clean:
 	rm -rf $(BIN_DIR)
