@@ -13,8 +13,6 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
-# Optional extras added with M4 (review-tools MCP mode) and developer checks.
-# Console scripts and review_agent.harness entry points are added with the package code in milestone M1.
 [project.optional-dependencies]
 tools = [
     "mcp>=1.0",
@@ -24,12 +22,35 @@ dev = [
     "ruff>=0.6",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+review-kit = "review_harness_kit.entrypoint:main"
+
+[project.entry-points."review_agent.harness"]
+pr-agent = "review_harness_kit.adapters.pr_agent:PRAgentAdapter"
+pr_agent = "review_harness_kit.adapters.pr_agent:PRAgentAdapter"
+openhands = "review_harness_kit.adapters.openhands:OpenHandsAdapter"
+codex = "review_harness_kit.adapters.codex:CodexAdapter"
+command = "review_harness_kit.adapters.command:CommandAdapter"
+external-cmd = "review_harness_kit.adapters.command:CommandAdapter"
+external_cmd = "review_harness_kit.adapters.command:CommandAdapter"
+mock-llm = "review_harness_kit.adapters.command:MockLLMAdapter"
+mock_llm = "review_harness_kit.adapters.command:MockLLMAdapter"
+single-shot = "review_harness_kit.adapters.command:SingleShotAdapter"
+single_shot = "review_harness_kit.adapters.command:SingleShotAdapter"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/review_harness_kit"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+extend-exclude = ["src/review_harness_kit/gen"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

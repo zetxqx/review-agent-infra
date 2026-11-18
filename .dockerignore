@@ -1,0 +1,10 @@
+.git
+bin
+runs
+python/.venv
+python/build
+python/dist
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
