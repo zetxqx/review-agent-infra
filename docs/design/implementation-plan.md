@@ -185,13 +185,20 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-func buildLLMReportSchema() map[string]any {
+// key: JSON Schema keyword or object property name; value: schema definition
+type JSONSchema map[string]any
+
+func buildLLMReportSchema() JSONSchema {
 	md := (&reviewv1.ReviewReport{}).ProtoReflect().Descriptor()
-	return objectSchemaFromMessage(md, map[string]bool{"provenance": true})
+	// key: proto field name to omit from LLM output schema; value: true when omitted
+	skip := map[string]bool{"provenance": true}
+	return objectSchemaFromMessage(md, skip)
 }
 
-func objectSchemaFromMessage(md protoreflect.MessageDescriptor, skip map[string]bool) map[string]any {
-	props := map[string]any{}
+// skip key: proto field name to omit from generated schema; value: true when omitted.
+func objectSchemaFromMessage(md protoreflect.MessageDescriptor, skip map[string]bool) JSONSchema {
+	// key: JSON property name; value: JSON Schema for that field
+	props := JSONSchema{}
 	req := make([]string, 0, md.Fields().Len())
 	fields := md.Fields()
 	for i := 0; i < fields.Len(); i++ {
@@ -203,7 +210,7 @@ func objectSchemaFromMessage(md protoreflect.MessageDescriptor, skip map[string]
 		req = append(req, name)
 		props[name] = schemaForField(fd)
 	}
-	return map[string]any{
+	return JSONSchema{
 		"type":                 "object",
 		"additionalProperties": false,
 		"required":             req,
@@ -211,10 +218,10 @@ func objectSchemaFromMessage(md protoreflect.MessageDescriptor, skip map[string]
 	}
 }
 
-func schemaForField(fd protoreflect.FieldDescriptor) map[string]any {
+func schemaForField(fd protoreflect.FieldDescriptor) JSONSchema {
 	if fd.IsList() {
 		itemFD := schemaForSingularField(fd)
-		s := map[string]any{"type": "array", "items": itemFD}
+		s := JSONSchema{"type": "array", "items": itemFD}
 		if fd.Name() == "findings" {
 			s["maxItems"] = 100
 		}
@@ -229,36 +236,36 @@ func schemaForField(fd protoreflect.FieldDescriptor) map[string]any {
 	return s
 }
 
-func schemaForSingularField(fd protoreflect.FieldDescriptor) map[string]any {
+func schemaForSingularField(fd protoreflect.FieldDescriptor) JSONSchema {
 	switch fd.Kind() {
 	case protoreflect.StringKind:
-		return map[string]any{"type": "string"}
+		return JSONSchema{"type": "string"}
 	case protoreflect.Int32Kind:
-		return map[string]any{"type": "integer"}
+		return JSONSchema{"type": "integer"}
 	case protoreflect.Int64Kind:
 		panic(fmt.Errorf("int64 field %q is incompatible with JSON Schema integer (protojson encodes int64 as string)", fd.FullName()))
 	case protoreflect.DoubleKind, protoreflect.FloatKind:
-		s := map[string]any{"type": "number"}
+		s := JSONSchema{"type": "number"}
 		if fd.Name() == "confidence" {
 			s["minimum"] = 0.0
 			s["maximum"] = 1.0
 		}
 		return s
 	case protoreflect.BoolKind:
-		return map[string]any{"type": "boolean"}
+		return JSONSchema{"type": "boolean"}
 	case protoreflect.EnumKind:
 		vals := fd.Enum().Values()
 		choices := make([]string, 0, vals.Len())
 		for i := 0; i < vals.Len(); i++ {
-			if vals.Get(i).Number() != 0 { // Skip *_UNSPECIFIED
+			if vals.Get(i).Number() != 0 {
 				choices = append(choices, string(vals.Get(i).Name()))
 			}
 		}
-		return map[string]any{"type": "string", "enum": choices}
+		return JSONSchema{"type": "string", "enum": choices}
 	case protoreflect.MessageKind:
 		return objectSchemaFromMessage(fd.Message(), nil)
 	default:
-		return map[string]any{}
+		return JSONSchema{}
 	}
 }
 
@@ -299,10 +306,11 @@ type SandboxSpec struct {
 	Role           string // "primary" | "shadow"
 	HarnessProfile string // Also encoded on shadow Pod names so concurrent profiles never collide
 	HarnessImage   string
-	TarballPath    string            // Size-capped snapshot archive path reused across shards
-	Inputs         map[string][]byte // Relative path under /workspace/.review/in -> payload
-	AdapterURL     string            // Passed via Exec stdin only
-	TaskToken      string            // Passed via Exec stdin only
+	TarballPath    string // Size-capped snapshot archive path reused across shards
+	// key: path relative to /workspace/.review/in; value: raw file bytes
+	Inputs         map[string][]byte
+	AdapterURL     string // Passed via Exec stdin only
+	TaskToken      string // Passed via Exec stdin only
 	TimeoutSeconds int
 }
 
@@ -317,6 +325,7 @@ type VCSPlugin interface {
 	VerifyAndParseWebhook(ctx context.Context, headers http.Header, body []byte) (*reviewv1.ReviewEvent, error)
 	GetHeadSHA(ctx context.Context, repo string, prNumber int) (string, error)
 	FetchDiffAndTarball(ctx context.Context, repo string, prNumber int, baseSHA, headSHA string) (diffPatch []byte, tarball io.ReadCloser, err error)
+	// Return map key: rule file path relative to repository root; value: raw UTF-8 rule bytes.
 	FetchBaseRules(ctx context.Context, repo, baseSHA string, changedFiles []string) (map[string][]byte, error)
 	PublishReview(ctx context.Context, req PublishRequest) (*PublishResult, error)
 	PollFeedback(ctx context.Context, repo string, prNumber int, commentIDs []int64) ([]FeedbackSample, error)
@@ -334,11 +343,13 @@ type SandboxRunner interface {
 
 // 4. Context Provider Plugin (Go control-plane side: populates /workspace/.review/in)
 type ContextProvider interface {
+	// inputs key: file path relative to /workspace/.review/in; value: raw file bytes.
 	Contribute(ctx context.Context, run *RunRecord, inputs map[string][]byte) error
 }
 
 // 5. Inference Upstream Plugin (Go cmd/adapter: llmd-gateway / vllm-direct / ollama)
 type UpstreamProvider interface {
+	// payload key: allowlisted OpenAI request JSON field name; value: sanitized JSON value.
 	Build(claims *reviewv1.TaskClaims, api string, payload map[string]any) (UpstreamRequest, error)
 }
 ```
@@ -1118,6 +1129,7 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 	}
 
 	// Exec 2: pass task token in stdin into harness RAM only
+	// key: stdin credential JSON field ("base_url" | "api_key"); value: adapter URL or signed task token
 	secret, _ := json.Marshal(map[string]string{"base_url": spec.AdapterURL, "api_key": spec.TaskToken})
 	if err := r.exec(ctx, podName, "harness", []string{"review-kit", "run"}, time.Duration(spec.TimeoutSeconds)*time.Second, bytes.NewReader(secret), nil); err != nil {
 		return nil, fmt.Errorf("run harness kit: %w", err)
@@ -1199,12 +1211,14 @@ const (
 	maxFileSize = 64 << 20
 )
 
+// key: basename of untrusted repository instruction file; value: true when deleted from /workspace/src
 var maskedNames = map[string]bool{
 	"AGENTS.md": true, "AGENTS.override.md": true, "CLAUDE.md": true, "GEMINI.md": true,
 	".cursorrules": true, ".goosehints": true, ".pr_agent.toml": true,
 	"opencode.json": true, "opencode.jsonc": true, ".mcp.json": true, ".aider.conf.yml": true,
 }
 
+// key: directory name of untrusted agent config dir; value: true when deleted recursively from /workspace/src
 var maskedDirs = map[string]bool{
 	".agents": true, ".codex": true, ".opencode": true, ".openhands": true,
 	".claude": true, ".cursor": true, ".goose": true,
@@ -2286,12 +2300,14 @@ type StreamPlan struct {
 }
 
 var (
+	// key: allowlisted Chat Completions JSON field name; value: true when permitted
 	chatAllowedFields = map[string]bool{
 		"messages": true, "tools": true, "tool_choice": true, "parallel_tool_calls": true,
 		"response_format": true, "temperature": true, "top_p": true, "stop": true,
 		"seed": true, "max_tokens": true, "max_completion_tokens": true,
 		"stream": true, "stream_options": true,
 	}
+	// key: allowlisted Responses API JSON field name; value: true when permitted
 	responsesAllowedFields = map[string]bool{
 		"input": true, "instructions": true, "tools": true, "tool_choice": true,
 		"parallel_tool_calls": true, "text": true, "reasoning": true,
@@ -2299,7 +2315,9 @@ var (
 	}
 )
 
+// Return map key: allowlisted request JSON field name; value: sanitized JSON value.
 func (p *ProxyHandler) sanitizePayload(api string, raw []byte, claims *reviewv1.TaskClaims) (map[string]any, StreamPlan, error) {
+	// key: raw request JSON field name; value: decoded JSON value
 	var body map[string]any
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, StreamPlan{}, err
@@ -2308,6 +2326,7 @@ func (p *ProxyHandler) sanitizePayload(api string, raw []byte, claims *reviewv1.
 	if api == "chat" {
 		allowed = chatAllowedFields
 	}
+	// key: allowlisted JSON field name; value: sanitized JSON value
 	out := make(map[string]any, len(allowed))
 	for k, v := range body {
 		if allowed[k] {
@@ -2335,6 +2354,7 @@ func (p *ProxyHandler) sanitizePayload(api string, raw []byte, claims *reviewv1.
 			} else {
 				clientWantsUsage = false
 			}
+			// key: stream_options field name; value: option value forcing final usage chunk
 			out["stream_options"] = map[string]any{"include_usage": true}
 		} else {
 			delete(out, "stream_options")
@@ -2362,6 +2382,7 @@ type LlmdGatewayUpstream struct {
 	Objective string
 }
 
+// payload key: allowlisted OpenAI JSON field name; value: sanitized JSON value.
 func (u *LlmdGatewayUpstream) Build(claims *reviewv1.TaskClaims, api string, payload map[string]any) (contract.UpstreamRequest, error) {
 	path := "/v1/chat/completions"
 	if api == "responses" {
