@@ -110,13 +110,43 @@ def test_openhands_prepare_collect_and_fallback(tmp_path: Path) -> None:
     inv = adapter.prepare(task, ctx)
     assert inv.argv[0] == "openhands"
     assert "--headless" in inv.argv
+    assert "--always-approve" in inv.argv
+    assert "--json" in inv.argv
     assert (ctx.home / "review_task.md").is_file()
+    assert (ctx.home / ".hirc").is_file()
     assert inv.env["SANDBOX_TYPE"] == "local"
+    assert inv.env["OPENHANDS_WORK_DIR"] == str(tmp_path / "src")
+    assert inv.env["OPENHANDS_SUPPRESS_BANNER"] == "1"
+    assert inv.env["__hi_imported"] == "true"
 
     raw = adapter.collect(task, ctx, ProcessResult(exit_code=0, timed_out=False, log_path=log_path))
     assert raw.kind == "markdown"
     assert "nil pointer dereference" in raw.text
     assert adapter.extract(raw, task) is None
+
+    jsonl_log = out_dir / "jsonl.log"
+    jsonl_log.write_text(
+        "\n".join(
+            [
+                "Initializing agent...",
+                json.dumps({"kind": "ActionEvent", "source": "agent", "tool_name": "file_editor"}),
+                json.dumps(
+                    {
+                        "kind": "MessageEvent",
+                        "source": "agent",
+                        "llm_message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Bug in truncate.go line 9."}],
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    jsonl_raw = adapter.collect(task, ctx, ProcessResult(exit_code=0, timed_out=False, log_path=jsonl_log))
+    assert jsonl_raw.kind == "markdown"
+    assert jsonl_raw.text == "Bug in truncate.go line 9."
 
 
 def test_codex_prepare_writes_secretless_config_and_extracts_json(tmp_path: Path) -> None:
