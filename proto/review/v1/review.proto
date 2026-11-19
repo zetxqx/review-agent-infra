@@ -96,12 +96,12 @@ message ReviewEvent {
   optional string requested_harness = 16;    // Optional profile name from "/review <profile>"
 }
 
-// TaskBudget bounds requests, context size, cumulative tokens, and runtime for one sandbox Pod.
+// TaskBudget bounds requests, context size, cumulative uncached tokens, and runtime for one sandbox Pod.
 message TaskBudget {
   int32 max_requests = 1;                    // Hard cap enforced by cmd/adapter
   int32 max_context_tokens = 2;              // Passed to each harness's own context setting
-  int64 max_total_tokens = 3;                // Cumulative token cap enforced by cmd/adapter
-  int64 normalizer_reserve_tokens = 4;       // Budget slice held exclusively for 1-shot Normalizer
+  int64 max_total_tokens = 3;                // Cumulative cap on uncached input + output tokens enforced by cmd/adapter
+  int64 normalizer_reserve_tokens = 4;       // Uncached token slice held exclusively for 1-shot Normalizer
   int32 wall_clock_seconds = 5;              // Subprocess timeout inside the sandbox
 }
 
@@ -185,8 +185,8 @@ message TaskClaims {
   string repo = 4;
   string harness_profile = 5;
   int32 max_requests = 6;
-  int64 max_total_tokens = 7;
-  int64 normalizer_reserve_tokens = 8;
+  int64 max_total_tokens = 7;                // Cumulative cap on uncached input + output tokens (excludes cached_tokens)
+  int64 normalizer_reserve_tokens = 8;       // Uncached token slice reserved for 1-shot Normalizer
   int32 max_output_tokens = 9;
   int64 exp = 10;                            // Unix epoch expiration seconds
   string jti = 11;                           // Unique token ID indexing cmd/adapter's atomic ledger

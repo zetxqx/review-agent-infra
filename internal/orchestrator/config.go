@@ -67,11 +67,15 @@ type Config struct {
 
 func DefaultHarnessConfig() HarnessConfig {
 	stdBudget := func(maxReq int32, maxTotal int64, wallSec int32) *reviewv1.TaskBudget {
+		reserve := int64(20000)
+		if maxTotal >= 5000000 {
+			reserve = 50000
+		}
 		return &reviewv1.TaskBudget{
 			MaxRequests:             maxReq,
 			MaxContextTokens:        32768,
 			MaxTotalTokens:          maxTotal,
-			NormalizerReserveTokens: 20000,
+			NormalizerReserveTokens: reserve,
 			WallClockSeconds:        wallSec,
 		}
 	}
@@ -81,7 +85,7 @@ func DefaultHarnessConfig() HarnessConfig {
 		Profiles: map[string]ProfileConfig{
 			"openhands": {
 				Name: "openhands", Adapter: "openhands", Image: sandbox.DefaultSandboxImage,
-				DefaultConfidence: 0.80, Budget: stdBudget(60, 1500000, 900),
+				DefaultConfidence: 0.80, Budget: stdBudget(60, 5000000, 900),
 			},
 			"pr-agent": {
 				Name: "pr-agent", Adapter: "pr-agent", Image: sandbox.DefaultSandboxImage,
@@ -89,19 +93,19 @@ func DefaultHarnessConfig() HarnessConfig {
 			},
 			"codex": {
 				Name: "codex", Adapter: "codex", Image: sandbox.DefaultSandboxImage,
-				DefaultConfidence: 0.80, Budget: stdBudget(60, 1500000, 900),
+				DefaultConfidence: 0.80, Budget: stdBudget(60, 5000000, 900),
 			},
 			"mini-swe-agent": {
 				Name: "mini-swe-agent", Adapter: "mini-swe-agent", Image: sandbox.DefaultSandboxImage,
-				DefaultConfidence: 0.80, Budget: stdBudget(60, 1500000, 900),
+				DefaultConfidence: 0.80, Budget: stdBudget(60, 5000000, 900),
 			},
 			"opencode": {
 				Name: "opencode", Adapter: "opencode", Image: sandbox.DefaultSandboxImage,
-				DefaultConfidence: 0.80, Budget: stdBudget(60, 1500000, 900),
+				DefaultConfidence: 0.80, Budget: stdBudget(60, 5000000, 900),
 			},
 			"goose": {
 				Name: "goose", Adapter: "goose", Image: sandbox.DefaultSandboxImage,
-				DefaultConfidence: 0.80, Budget: stdBudget(60, 1500000, 900),
+				DefaultConfidence: 0.80, Budget: stdBudget(60, 5000000, 900),
 			},
 			"aider": {
 				Name: "aider", Adapter: "aider", Image: sandbox.DefaultSandboxImage,
