@@ -167,7 +167,7 @@ CMD ["review-kit", "wait"]
 The checked-in contract `proto/review/v1/review.proto` contains zero third-party imports so stock `protoc`, `buf`, Go `google.golang.org/protobuf`, and Python `protobuf` work offline out of the box:
 
 * **Presence where zero differs from absent**: `ReviewFinding.confidence` (`optional double`), `Provenance.exit_code` (`optional int32`), `GitInfo.base_ref` (`optional string`), `AgentTask.ci_logs_file` (`optional string`), `ReviewEvent.requested_harness` (`optional string`), `ToolEndpoints.scoped_test` (`optional string`), and `TaskClaims.parent_session_id` (`optional string`) preserve explicit presence across JSON round-trips. In Go, `f.Confidence == nil` signals that the harness omitted confidence so `profile.DefaultConfidence` applies.
-* **Canonical JSON encoding & `int64` string rule**: Go (`protojson`) and Python (`google.protobuf.json_format`) emit and parse `lowerCamelCase` keys (`targetLineText`, `harnessVersion`) and string enum names (`SEVERITY_HIGH`, `DIFF_SIDE_RIGHT`). Per Proto3 JSON specification, **`int64` fields (`maxTotalTokens`, `normalizerReserveTokens`, `forceRerunSeq`) serialize as JSON strings** (`"1500000"`). Consequently: (1) `task.json` MUST be parsed with `protojson` / `json_format`, never plain `encoding/json`; (2) `TaskClaims` JWT payloads MUST NOT use `protojson` because `golang-jwt` expects numeric `exp` (Section 7.3 defines the explicit `jwt.RegisteredClaims` mapping); and (3) `cmd/schemagen` explicitly rejects `int64` inside LLM JSON Schemas.
+* **Canonical JSON encoding & `int64` string rule**: Go (`protojson`) and Python (`google.protobuf.json_format`) emit and parse `lowerCamelCase` keys (`targetLineText`, `harnessVersion`) and string enum names (`SEVERITY_HIGH`, `DIFF_SIDE_RIGHT`). Per Proto3 JSON specification, **`int64` fields (`maxTotalTokens`, `normalizerReserveTokens`, `forceRerunSeq`) serialize as JSON strings** (`"5000000"`). Consequently: (1) `task.json` MUST be parsed with `protojson` / `json_format`, never plain `encoding/json`; (2) `TaskClaims` JWT payloads MUST NOT use `protojson` because `golang-jwt` expects numeric `exp` (Section 7.3 defines the explicit `jwt.RegisteredClaims` mapping); and (3) `cmd/schemagen` explicitly rejects `int64` inside LLM JSON Schemas.
 
 ### 2.2 Deriving `llm_review_report.schema.json` Directly from Protobuf (`cmd/schemagen`)
 
@@ -2138,7 +2138,7 @@ func (l *SessionLedger) TryReserve(estimate int64, phase string) string {
 	}
 }
 
-// Settle reconciles reserved estimate against actual usage (nil charges full estimate on dropped 2xx streams).
+// Settle reconciles reserved estimate against uncached usage (max(0, prompt-cached)+completion); nil charges estimate on dropped 2xx streams.
 func (l *SessionLedger) Settle(estimate int64, actual *Usage) {
 	charge := estimate
 	if actual != nil {

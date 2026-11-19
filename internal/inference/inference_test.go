@@ -393,3 +393,143 @@ func TestProxySSEIncludeUsageCutStreamSweepAndMetrics(t *testing.T) {
 		t.Fatalf("expected 1 swept ledger, got %d", swept)
 	}
 }
+
+func TestSessionLedgerCachedTokensExcludedFromBudgetAndNonNegative(t *testing.T) {
+	ledger := NewSessionLedger(testClaims("jti-cached", 10, 1000, 200))
+
+	if code := ledger.TryReserve(300, "harness"); code != "" {
+		t.Fatalf("first reserve failed: %q", code)
+	}
+	ledger.Settle(300, &Usage{Prompt: 1000, Cached: 900, Completion: 50})
+	if got := ledger.committed.Load(); got != 150 {
+		t.Fatalf("expected uncached charge 150 ((1000-900)+50), got %d", got)
+	}
+
+	if code := ledger.TryReserve(100, "harness"); code != "" {
+		t.Fatalf("second reserve failed: %q", code)
+	}
+	ledger.Settle(100, &Usage{Prompt: 100, Cached: 250, Completion: 20})
+	if got := ledger.committed.Load(); got != 170 {
+		t.Fatalf("expected clamped uncached charge 20 (total 170), got %d", got)
+	}
+
+	if code := ledger.TryReserve(50, "harness"); code != "" {
+		t.Fatalf("third reserve failed: %q", code)
+	}
+	ledger.Settle(50, &Usage{Prompt: -10, Cached: -5, Completion: -3})
+	if got := ledger.committed.Load(); got != 170 {
+		t.Fatalf("expected negative usage clamped to 0 charge (total 170), got %d", got)
+	}
+
+	snap := ledger.Snapshot()
+	if snap.PromptTokens != 1090 || snap.CachedTokens != 1145 || snap.CompletionTokens != 67 {
+		t.Fatalf("expected raw usage counters preserved in snapshot, got %+v", snap)
+	}
+}
+
+func TestProxyUncachedBudgetForChatAndResponses(t *testing.T) {
+	key := []byte("uncached-secret")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		isStream := bytes.Contains(raw, []byte(`"stream":true`))
+		if r.URL.Path == "/v1/responses" {
+			if isStream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+				fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":500,\"output_tokens\":50,\"input_tokens_details\":{\"cached_tokens\":450}}}}\n\n")
+				fmt.Fprint(w, "data: [DONE]\n\n")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":"resp-1","usage":{"input_tokens":500,"output_tokens":50,"input_tokens_details":{"cached_tokens":450}}}`)
+			return
+		}
+		if isStream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+			fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":450}}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"cmpl-1","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":500,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":450}}}`)
+	}))
+	defer upstream.Close()
+
+	handler := NewProxyHandler(Config{
+		TokenKey:      key,
+		Upstream:      &VllmDirectUpstream{BaseURL: upstream.URL},
+		UpstreamModel: "m",
+	})
+	sandboxSrv := httptest.NewServer(handler.SandboxMux())
+	defer sandboxSrv.Close()
+	internalSrv := httptest.NewServer(handler.InternalMux())
+	defer internalSrv.Close()
+
+	claims := testClaims("jti-mixed-cache", 20, 1000, 200)
+	claims.MaxOutputTokens = 100
+	tok, err := token.Mint(key, claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := []struct {
+		path   string
+		stream bool
+	}{
+		{"/v1/chat/completions", false},
+		{"/v1/chat/completions", true},
+		{"/v1/responses", false},
+		{"/v1/responses", true},
+		{"/v1/chat/completions", false},
+		{"/v1/responses", true},
+	}
+	for i, c := range calls {
+		payload := fmt.Sprintf(`{"stream":%t,"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`, c.stream)
+		if c.path == "/v1/responses" {
+			payload = fmt.Sprintf(`{"stream":%t,"max_output_tokens":100,"input":"hi"}`, c.stream)
+		}
+		req, _ := http.NewRequest(http.MethodPost, sandboxSrv.URL+c.path, strings.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d (%s stream=%v) expected 200 with cached usage excluded from budget, got %d: %s", i+1, c.path, c.stream, resp.StatusCode, body)
+		}
+	}
+
+	for i := range 2 {
+		req, _ := http.NewRequest(http.MethodPost, sandboxSrv.URL+"/v1/chat/completions", strings.NewReader(`{"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if i == 0 && resp.StatusCode != http.StatusOK {
+			t.Fatalf("7th request expected 200 at 600+130<=800, got %d: %s", resp.StatusCode, body)
+		}
+		if i == 1 && (resp.StatusCode != http.StatusForbidden || !bytes.Contains(body, []byte(`"budget_exhausted"`))) {
+			t.Fatalf("8th request expected 403 budget_exhausted at 700+130>800, got %d: %s", resp.StatusCode, body)
+		}
+	}
+
+	usageResp, err := http.Get(internalSrv.URL + "/internal/usage/" + claims.Jti)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer usageResp.Body.Close()
+	usageBytes, _ := io.ReadAll(usageResp.Body)
+	var usagePB reviewv1.SandboxUsage
+	if err := protojson.Unmarshal(usageBytes, &usagePB); err != nil {
+		t.Fatal(err)
+	}
+	if usagePB.PromptTokens != 3500 || usagePB.CachedTokens != 3150 || usagePB.CompletionTokens != 350 {
+		t.Fatalf("expected raw prompt/cached/completion totals (3500/3150/350), got %+v", &usagePB)
+	}
+}

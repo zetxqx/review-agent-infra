@@ -16,7 +16,11 @@ type Usage struct {
 }
 
 func (u Usage) Total() int64 {
-	return u.Prompt + u.Completion
+	prompt := max(0, u.Prompt)
+	cached := max(0, u.Cached)
+	uncachedPrompt := max(0, prompt-cached)
+	completion := max(0, u.Completion)
+	return uncachedPrompt + completion
 }
 
 type SessionLedger struct {
