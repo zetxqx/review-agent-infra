@@ -639,7 +639,7 @@ func executeProfileOnCommit(
 		MaxRequests:             profile.Budget.MaxRequests,
 		MaxTotalTokens:          profile.Budget.MaxTotalTokens,
 		NormalizerReserveTokens: profile.Budget.NormalizerReserveTokens,
-		MaxOutputTokens:         4096,
+		MaxOutputTokens:         32768,
 		Exp:                     time.Now().Add(time.Duration(profile.Budget.WallClockSeconds+300) * time.Second).Unix(),
 		Jti:                     jti,
 	}

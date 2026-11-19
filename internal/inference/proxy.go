@@ -24,7 +24,7 @@ import (
 
 const (
 	defaultMaxBodyBytes    int64 = 16 << 20
-	defaultMaxOutputTokens int64 = 4096
+	defaultMaxOutputTokens int64 = 32768
 	maxRetries                   = 4
 	maxSSELineBytes              = 4 << 20
 )
