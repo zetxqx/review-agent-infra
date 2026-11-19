@@ -16,7 +16,9 @@ import (
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/internal/store"
 	"github.com/zetxqx/review-agent-infra/internal/telemetry"
+	"github.com/zetxqx/review-agent-infra/internal/token"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 type fakeVCS struct {
@@ -566,4 +568,121 @@ func TestCancelInFlightIgnoresDuplicateDeliveryAndCancelsSameSHARerun(t *testing
 	case <-time.After(3 * time.Second):
 		t.Fatal("expected same-SHA manual /review rerun to immediately cancel superseded auto run")
 	}
+}
+
+func TestUntrustedForkBudgetVsTrustedBudget(t *testing.T) {
+	ctx := context.Background()
+	key := []byte("0123456789abcdef0123456789abcdef")
+
+	runCase := func(name string, cfg Config, ev *reviewv1.ReviewEvent, wantMaxReqs int32, wantMaxTokens int64) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			st := store.NewInMemoryStore()
+			vcs := &fakeVCS{
+				liveHeadSHA:  ev.HeadSha,
+				diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\n"),
+				tarballBytes: []byte("t"),
+			}
+
+			var capturedClaims *reviewv1.TaskClaims
+			var capturedTask reviewv1.AgentTask
+			sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+				var err error
+				capturedClaims, err = token.Verify(key, "Bearer "+spec.TaskToken)
+				if err != nil {
+					t.Fatalf("verify task token: %v", err)
+				}
+				if err := protojson.Unmarshal(spec.Inputs["task.json"], &capturedTask); err != nil {
+					t.Fatalf("unmarshal task.json: %v", err)
+				}
+				return &reviewv1.ReviewReport{
+					Provenance: &reviewv1.Provenance{
+						Profile:    spec.HarnessProfile,
+						Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
+						Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
+					},
+				}, nil
+			})
+
+			orch := New(cfg, st, vcs, sbx, nil)
+			res, err := orch.HandleEvent(ctx, ev)
+			if err != nil || !res.Allowed || !res.Enqueued {
+				t.Fatalf("HandleEvent failed: %+v err=%v", res, err)
+			}
+			ran, err := orch.RunOnce(ctx)
+			if err != nil || !ran {
+				t.Fatalf("RunOnce failed: ran=%v err=%v", ran, err)
+			}
+			if capturedClaims == nil || capturedClaims.MaxRequests != wantMaxReqs || capturedClaims.MaxTotalTokens != wantMaxTokens {
+				t.Fatalf("unexpected JWT claims budget: got (%d reqs, %d tokens), want (%d, %d)",
+					capturedClaims.GetMaxRequests(), capturedClaims.GetMaxTotalTokens(), wantMaxReqs, wantMaxTokens)
+			}
+			if capturedTask.Budget == nil || capturedTask.Budget.MaxRequests != wantMaxReqs || capturedTask.Budget.MaxTotalTokens != wantMaxTokens {
+				t.Fatalf("unexpected task.json budget: got %+v, want (%d, %d)", capturedTask.Budget, wantMaxReqs, wantMaxTokens)
+			}
+		})
+	}
+
+	baseCfg := func() Config {
+		return Config{
+			TokenKey:            key,
+			DebounceWindow:      0,
+			TrustedContributors: []string{"ext-contrib"},
+		}
+	}
+
+	runCase("untrusted_fork_gets_strict_defaults", baseCfg(), &reviewv1.ReviewEvent{
+		EventId:      "fork-untrusted",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     1,
+		BaseSha:      "b1",
+		HeadSha:      "h1",
+		IsFork:       true,
+		IsMaintainer: false,
+		Author:       "ext-contrib",
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}, 20, 500000)
+
+	customCfg := baseCfg()
+	customCfg.UntrustedMaxRequests = 12
+	customCfg.UntrustedMaxTotalTokens = 250000
+	runCase("untrusted_fork_respects_custom_strict_caps", customCfg, &reviewv1.ReviewEvent{
+		EventId:      "fork-custom",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     2,
+		BaseSha:      "b2",
+		HeadSha:      "h2",
+		IsFork:       true,
+		IsMaintainer: false,
+		Author:       "ext-contrib",
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}, 12, 250000)
+
+	runCase("trusted_fork_maintainer_gets_loose_budget", baseCfg(), &reviewv1.ReviewEvent{
+		EventId:      "fork-maintainer",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     3,
+		BaseSha:      "b3",
+		HeadSha:      "h3",
+		IsFork:       true,
+		IsMaintainer: true,
+		Author:       "maintainer",
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}, 60, 5000000)
+
+	runCase("trusted_same_repo_non_maintainer_gets_loose_budget", baseCfg(), &reviewv1.ReviewEvent{
+		EventId:      "same-repo-pr",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     4,
+		BaseSha:      "b4",
+		HeadSha:      "h4",
+		IsFork:       false,
+		IsMaintainer: false,
+		Author:       "teammate",
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}, 60, 5000000)
 }

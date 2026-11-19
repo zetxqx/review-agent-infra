@@ -276,7 +276,8 @@ func (o *Orchestrator) executeReview(ctx context.Context, rec *store.RunRecord) 
 		}
 	}
 
-	shards := SplitDiffIntoShards(diffPatch, int(profile.Budget.MaxContextTokens)/3)
+	budget := effectiveBudget(o.cfg, profile.Budget, rec.IsFork, rec.IsMaintainer)
+	shards := SplitDiffIntoShards(diffPatch, int(budget.MaxContextTokens)/3)
 	if len(shards) == 0 {
 		doneOK, doneErr := o.store.MarkDoneIfActive(ctx, rec.ID, o.cfg.WorkerID)
 		if doneErr != nil {
@@ -362,17 +363,18 @@ func (o *Orchestrator) runShard(
 		parentSession = &runIDStr
 	}
 
+	budget := effectiveBudget(o.cfg, profile.Budget, rec.IsFork, rec.IsMaintainer)
 	claims := &reviewv1.TaskClaims{
 		RunId:                   runIDStr,
 		SessionId:               sessionID,
 		ParentSessionId:         parentSession,
 		Repo:                    rec.Repo,
 		HarnessProfile:          profile.Name,
-		MaxRequests:             profile.Budget.MaxRequests,
-		MaxTotalTokens:          profile.Budget.MaxTotalTokens,
-		NormalizerReserveTokens: profile.Budget.NormalizerReserveTokens,
+		MaxRequests:             budget.MaxRequests,
+		MaxTotalTokens:          budget.MaxTotalTokens,
+		NormalizerReserveTokens: budget.NormalizerReserveTokens,
 		MaxOutputTokens:         4096,
-		Exp:                     o.cfg.Now().Add(time.Duration(profile.Budget.WallClockSeconds+300) * time.Second).Unix(),
+		Exp:                     o.cfg.Now().Add(time.Duration(budget.WallClockSeconds+300) * time.Second).Unix(),
 		Jti:                     jti,
 	}
 	rawToken, err := token.Mint(o.cfg.TokenKey, claims)
@@ -391,7 +393,7 @@ func (o *Orchestrator) runShard(
 		ModelAlias: o.cfg.ModelAlias,
 		BaseBranch: shortCommit(rec.BaseSHA),
 		CiLogsFile: ciLogsPath,
-		Budget:     profile.Budget,
+		Budget:     budget,
 	}
 	taskBytes, err := (protojson.MarshalOptions{Indent: "  "}).Marshal(task)
 	if err != nil {
@@ -428,7 +430,7 @@ func (o *Orchestrator) runShard(
 		Inputs:         inputs,
 		AdapterURL:     resolvedAdapterURL,
 		TaskToken:      rawToken,
-		TimeoutSeconds: int(profile.Budget.WallClockSeconds),
+		TimeoutSeconds: int(budget.WallClockSeconds),
 	})
 	elapsed := time.Since(started)
 

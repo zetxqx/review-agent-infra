@@ -101,11 +101,11 @@ func (s *PGStore) EnqueueOrSupersede(ctx context.Context, ev *reviewv1.ReviewEve
 
 	runID := uuid.New()
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO review_runs (id, repo, pr_number, base_sha, head_sha, trigger_type, force_rerun_seq, requested_harness, status, debounce_until)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', now() + make_interval(secs => $9))
+		INSERT INTO review_runs (id, repo, pr_number, base_sha, head_sha, trigger_type, force_rerun_seq, is_fork, is_maintainer, requested_harness, status, debounce_until)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued', now() + make_interval(secs => $11))
 		ON CONFLICT (repo, pr_number, base_sha, head_sha, trigger_type, force_rerun_seq)
 		WHERE status NOT IN ('superseded', 'failed') DO NOTHING
-	`, runID, ev.Repo, ev.PrNumber, ev.BaseSha, ev.HeadSha, trig, ev.ForceRerunSeq, reqHarness, debounce.Seconds())
+	`, runID, ev.Repo, ev.PrNumber, ev.BaseSha, ev.HeadSha, trig, ev.ForceRerunSeq, ev.IsFork, ev.IsMaintainer, reqHarness, debounce.Seconds())
 	if err != nil {
 		return uuid.Nil, false, err
 	}
@@ -128,7 +128,7 @@ func (s *PGStore) ClaimNextRun(ctx context.Context, workerID string, leaseTTL ti
 		var rec RunRecord
 		err = tx.QueryRow(ctx, `
 			SELECT id, repo, pr_number, base_sha, head_sha, trigger_type, force_rerun_seq,
-			       requested_harness, harness_profile, status, debounce_until, attempt, max_retries,
+			       is_fork, is_maintainer, requested_harness, harness_profile, status, debounce_until, attempt, max_retries,
 			       worker_id, lease_expires_at, error_reason, created_at, updated_at
 			FROM review_runs r
 			WHERE (
@@ -145,7 +145,7 @@ func (s *PGStore) ClaimNextRun(ctx context.Context, workerID string, leaseTTL ti
 			FOR UPDATE OF r SKIP LOCKED
 		`).Scan(
 			&rec.ID, &rec.Repo, &rec.PRNumber, &rec.BaseSHA, &rec.HeadSHA, &rec.TriggerType, &rec.ForceRerunSeq,
-			&rec.RequestedHarness, &rec.HarnessProfile, &rec.Status, &rec.DebounceUntil, &rec.Attempt, &rec.MaxRetries,
+			&rec.IsFork, &rec.IsMaintainer, &rec.RequestedHarness, &rec.HarnessProfile, &rec.Status, &rec.DebounceUntil, &rec.Attempt, &rec.MaxRetries,
 			&rec.WorkerID, &rec.LeaseExpiresAt, &rec.ErrorReason, &rec.CreatedAt, &rec.UpdatedAt,
 		)
 		if err != nil {
