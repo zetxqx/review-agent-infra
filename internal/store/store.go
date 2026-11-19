@@ -25,6 +25,8 @@ type RunRecord struct {
 	HeadSHA          string
 	TriggerType      string
 	ForceRerunSeq    int64
+	IsFork           bool
+	IsMaintainer     bool
 	RequestedHarness *string
 	HarnessProfile   *string
 	Status           string

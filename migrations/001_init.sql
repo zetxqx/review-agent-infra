@@ -11,20 +11,26 @@ CREATE TABLE IF NOT EXISTS review_runs (
     pr_number         INT    NOT NULL,
     base_sha          TEXT   NOT NULL,
     head_sha          TEXT   NOT NULL,
-    trigger_type      TEXT   NOT NULL, -- 'auto' | 'manual_command'
-    force_rerun_seq   BIGINT NOT NULL DEFAULT 0, -- 0 for auto; GitHub comment ID for manual /review
+    trigger_type      TEXT    NOT NULL, -- 'auto' | 'manual_command'
+    force_rerun_seq   BIGINT  NOT NULL DEFAULT 0, -- 0 for auto; GitHub comment ID for manual /review
+    is_fork           BOOLEAN NOT NULL DEFAULT FALSE,
+    is_maintainer     BOOLEAN NOT NULL DEFAULT FALSE,
     requested_harness TEXT,            -- Explicit profile from /review <profile>; NULL selects routing policy
     harness_profile   TEXT,            -- Chosen once at claim time and kept across retries
-    status            TEXT   NOT NULL, -- 'queued' | 'running' | 'publishing' | 'done' | 'superseded' | 'failed'
+    status            TEXT    NOT NULL, -- 'queued' | 'running' | 'publishing' | 'done' | 'superseded' | 'failed'
     debounce_until    TIMESTAMPTZ NOT NULL,
-    attempt           INT    NOT NULL DEFAULT 0,
-    max_retries       INT    NOT NULL DEFAULT 2,
+    attempt           INT     NOT NULL DEFAULT 0,
+    max_retries       INT     NOT NULL DEFAULT 2,
     worker_id         TEXT,
     lease_expires_at  TIMESTAMPTZ,
     error_reason      TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Backfill trust-classification columns on existing databases running idempotent Migrate.
+ALTER TABLE review_runs ADD COLUMN IF NOT EXISTS is_fork BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE review_runs ADD COLUMN IF NOT EXISTS is_maintainer BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Partial unique idempotency key: permits re-review on force-push back to prior SHA or reopen without duplicating active/done runs.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_or_done_run_idempotency

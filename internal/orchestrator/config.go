@@ -41,28 +41,30 @@ type HarnessConfig struct {
 }
 
 type Config struct {
-	WorkerID               string
-	LeaseTTL               time.Duration
-	PollInterval           time.Duration
-	DebounceWindow         time.Duration
-	RetryBackoff           time.Duration
-	MaxConcurrentRuns      int
-	MaxConcurrentShards    int
-	MinConfidence          float64
-	AdjacentLineWindow     int32
-	TopN                   int
-	SupportsFileComments   bool
-	MaxCheckLogBytes       int
-	AdapterSandboxURL      string
-	AdapterInternalURL     string
-	TokenKey               []byte
-	ModelAlias             string
-	RateLimitWindow        time.Duration
-	MaxRunsPerRepoWindow   int
-	MaxRunsPerAuthorWindow int
-	TrustedContributors    []string
-	Now                    func() time.Time
-	Harness                HarnessConfig
+	WorkerID                string
+	LeaseTTL                time.Duration
+	PollInterval            time.Duration
+	DebounceWindow          time.Duration
+	RetryBackoff            time.Duration
+	MaxConcurrentRuns       int
+	MaxConcurrentShards     int
+	MinConfidence           float64
+	AdjacentLineWindow      int32
+	TopN                    int
+	SupportsFileComments    bool
+	MaxCheckLogBytes        int
+	AdapterSandboxURL       string
+	AdapterInternalURL      string
+	TokenKey                []byte
+	ModelAlias              string
+	RateLimitWindow         time.Duration
+	MaxRunsPerRepoWindow    int
+	MaxRunsPerAuthorWindow  int
+	UntrustedMaxRequests    int32
+	UntrustedMaxTotalTokens int64
+	TrustedContributors     []string
+	Now                     func() time.Time
+	Harness                 HarnessConfig
 }
 
 func DefaultHarnessConfig() HarnessConfig {
@@ -169,6 +171,12 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.MaxRunsPerAuthorWindow <= 0 {
 		cfg.MaxRunsPerAuthorWindow = 10
 	}
+	if cfg.UntrustedMaxRequests <= 0 {
+		cfg.UntrustedMaxRequests = 20
+	}
+	if cfg.UntrustedMaxTotalTokens <= 0 {
+		cfg.UntrustedMaxTotalTokens = 500000
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -182,6 +190,25 @@ func normalizeConfig(cfg Config) Config {
 		}
 	}
 	return cfg
+}
+
+func effectiveBudget(cfg Config, base *reviewv1.TaskBudget, isFork, isMaintainer bool) *reviewv1.TaskBudget {
+	out := &reviewv1.TaskBudget{}
+	if base != nil {
+		*out = *base
+	}
+	if isFork && !isMaintainer {
+		if cfg.UntrustedMaxRequests > 0 && (out.MaxRequests <= 0 || cfg.UntrustedMaxRequests < out.MaxRequests) {
+			out.MaxRequests = cfg.UntrustedMaxRequests
+		}
+		if cfg.UntrustedMaxTotalTokens > 0 && (out.MaxTotalTokens <= 0 || cfg.UntrustedMaxTotalTokens < out.MaxTotalTokens) {
+			out.MaxTotalTokens = cfg.UntrustedMaxTotalTokens
+		}
+		if out.MaxTotalTokens > 0 && out.NormalizerReserveTokens > out.MaxTotalTokens/2 {
+			out.NormalizerReserveTokens = out.MaxTotalTokens / 2
+		}
+	}
+	return out
 }
 
 func PickProfile(cfg HarnessConfig, repo string, prNumber int, requested *string) string {

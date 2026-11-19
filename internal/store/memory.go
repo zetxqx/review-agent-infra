@@ -176,6 +176,8 @@ func (s *InMemoryStore) EnqueueOrSupersede(_ context.Context, ev *reviewv1.Revie
 		HeadSHA:          ev.HeadSha,
 		TriggerType:      trig,
 		ForceRerunSeq:    ev.ForceRerunSeq,
+		IsFork:           ev.IsFork,
+		IsMaintainer:     ev.IsMaintainer,
 		RequestedHarness: reqHarness,
 		Status:           StatusQueued,
 		DebounceUntil:    ts.Add(debounce),
