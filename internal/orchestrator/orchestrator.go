@@ -371,7 +371,7 @@ func (o *Orchestrator) runShard(
 		MaxRequests:             profile.Budget.MaxRequests,
 		MaxTotalTokens:          profile.Budget.MaxTotalTokens,
 		NormalizerReserveTokens: profile.Budget.NormalizerReserveTokens,
-		MaxOutputTokens:         4096,
+		MaxOutputTokens:         32768,
 		Exp:                     o.cfg.Now().Add(time.Duration(profile.Budget.WallClockSeconds+300) * time.Second).Unix(),
 		Jti:                     jti,
 	}
