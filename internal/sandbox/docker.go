@@ -55,7 +55,8 @@ func (r *DockerRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*rev
 	}
 	userSpec := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
 
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec+90)*time.Second)
+	kitTimeout := kitExecTimeout(timeoutSec)
+	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+90*time.Second)
 	defer cancel()
 
 	workRoot, err := os.MkdirTemp(r.WorkParentDir, "review-docker-sbx-*")
@@ -151,7 +152,7 @@ func (r *DockerRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*rev
 	harnessArgs = append(harnessArgs, r.ExtraRunArgs...)
 	harnessArgs = append(harnessArgs, image, "review-kit", "run", "--scratch-dir", "/scratch/home")
 
-	if err := runExec(runCtx, "", dockerBin, harnessArgs, bytes.NewReader(credsPayload), nil, time.Duration(timeoutSec)*time.Second); err != nil {
+	if err := runExec(runCtx, "", dockerBin, harnessArgs, bytes.NewReader(credsPayload), nil, kitTimeout); err != nil {
 		return nil, fmt.Errorf("docker harness run: %w", err)
 	}
 

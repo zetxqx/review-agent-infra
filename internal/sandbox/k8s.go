@@ -236,7 +236,8 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 	if timeoutSec <= 0 {
 		timeoutSec = 900
 	}
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec+180)*time.Second)
+	kitTimeout := kitExecTimeout(timeoutSec)
+	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+180*time.Second)
 	defer cancel()
 
 	podName := PodNameFor(spec)
@@ -289,7 +290,7 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 	if err != nil {
 		return nil, err
 	}
-	if err := r.execStep(runCtx, podName, "harness", []string{"review-kit", "run", "--scratch-dir", "/scratch/home"}, time.Duration(timeoutSec)*time.Second, bytes.NewReader(secretJSON), nil); err != nil {
+	if err := r.execStep(runCtx, podName, "harness", []string{"review-kit", "run", "--scratch-dir", "/scratch/home"}, kitTimeout, bytes.NewReader(secretJSON), nil); err != nil {
 		return nil, fmt.Errorf("run harness kit: %w", err)
 	}
 
