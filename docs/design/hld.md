@@ -182,7 +182,7 @@ Python stays confined strictly inside the `harness` container behind the Protobu
     "maxContextTokens": 32768,
     "maxTotalTokens": "5000000",
     "normalizerReserveTokens": "50000",
-    "wallClockSeconds": 900
+    "wallClockSeconds": 1800
   }
 }
 ```
@@ -238,7 +238,7 @@ harness:
       adapter: openhands
       image: ghcr.io/zetxqx/review-harness-openhands:1.0.0
       cache_shape: append_only
-      budget: { max_requests: 60, max_context_tokens: 32768, max_total_tokens: 5000000, normalizer_reserve_tokens: 50000, wall_clock_seconds: 900 }
+      budget: { max_requests: 60, max_context_tokens: 32768, max_total_tokens: 5000000, normalizer_reserve_tokens: 50000, wall_clock_seconds: 1800 }
     pr-agent:
       adapter: pr-agent
       image: ghcr.io/zetxqx/review-harness-pr-agent:1.0.0
@@ -304,7 +304,7 @@ harness:
 | **vLLM Engine Flags** | `prompt_tokens_details.cached_tokens` omitted by default | Enable `--enable-prefix-caching` and `--enable-prompt-tokens-details` | Reuses KV cache blocks and reports `cached_tokens` usage back to Adapter |
 | **vLLM Tool Calling** | Native `tool_calls` are off unless a parser is configured | Enable `--enable-auto-tool-choice` and the `--tool-call-parser` that matches the served model | Agentic harnesses depend on native tool calls, including in streamed responses |
 
-* **Timeout & Retry**: Set generous Pod `wall_clock_seconds` (e.g. 900s), upstream HTTP client timeout (400s) >= batch `defaultRequestTTL` (360s), and harness HTTP timeout >= 400s. On `429` / `503` before any SSE byte is relayed, `cmd/adapter` retries up to 4 times with jittered exponential backoff (5s-40s).
+* **Timeout & Retry**: Set generous Pod `wall_clock_seconds` (e.g. 1800s), upstream HTTP client timeout (400s) >= batch `defaultRequestTTL` (360s), and harness HTTP timeout >= 400s. On `429` / `503` before any SSE byte is relayed, `cmd/adapter` retries up to 4 times with jittered exponential backoff (5s-40s).
 * **Swapping Backends**: Switch upstream config from `llmd-gateway` to `vllm-direct` / `sglang` / `ollama` with zero sandbox changes (served model must support tool calling and `max_context_tokens`).
 
 ---
