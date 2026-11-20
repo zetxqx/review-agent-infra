@@ -232,6 +232,76 @@ func TestK8sSandboxRunnerFourStepExecAndCancellationCleanup(t *testing.T) {
 	}
 }
 
+func TestK8sSandboxRunnerGrantsKitFinalizeGraceBeyondWallClock(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
+		p.Status.Phase = corev1.PodRunning
+		_ = cs.Tracker().Add(p)
+		return true, p, nil
+	})
+
+	tarPath := filepath.Join(t.TempDir(), "snap.tar.gz")
+	if err := os.WriteFile(tarPath, []byte("tgz-payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taskBytes, err := protojson.Marshal(&reviewv1.AgentTask{
+		RunId:   "run-grace",
+		Harness: &reviewv1.HarnessRef{Profile: "openhands", Adapter: "openhands"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportOut, err := protojson.Marshal(&reviewv1.ReviewReport{
+		Provenance: &reviewv1.Provenance{Status: reviewv1.ReportStatus_REPORT_STATUS_HARNESS_FAILED},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var kitBudget time.Duration
+	runner := NewK8sSandboxRunner(cs, nil, K8sConfig{
+		Namespace:          "review-sandbox",
+		WaitRunningTimeout: 5 * time.Second,
+		PollInterval:       5 * time.Millisecond,
+		Executor: func(ctx context.Context, _, _ string, cmd []string, _ io.Reader, stdout io.Writer) error {
+			switch cmd[1] {
+			case "run":
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					return errors.New("kit exec context has no deadline")
+				}
+				kitBudget = time.Until(deadline)
+			case "read-report":
+				_, err := stdout.Write(reportOut)
+				return err
+			}
+			return nil
+		},
+	})
+
+	const wallClock = 60 * time.Second
+	if _, err := runner.Run(context.Background(), contract.SandboxSpec{
+		ShortRunID:     "9b2d4f10",
+		Role:           "primary",
+		HarnessProfile: "openhands",
+		TarballPath:    tarPath,
+		// key: file path relative to /workspace/.review/in; value: raw file bytes
+		Inputs: map[string][]byte{
+			"task.json":  taskBytes,
+			"diff.patch": []byte("diff --git a/a.go b/a.go\n"),
+		},
+		AdapterURL:     "http://10.96.0.42:8080/v1",
+		TaskToken:      "jwt-secret-token",
+		TimeoutSeconds: int(wallClock / time.Second),
+	}); err != nil {
+		t.Fatalf("k8s runner run failed: %v", err)
+	}
+	if kitBudget <= wallClock || kitBudget > wallClock+kitFinalizeGrace {
+		t.Fatalf("kit exec budget = %v, want within (%v, %v]", kitBudget, wallClock, wallClock+kitFinalizeGrace)
+	}
+}
+
 func TestOrphanPodReaper(t *testing.T) {
 	now := time.Now().UTC()
 	cs := fake.NewSimpleClientset(

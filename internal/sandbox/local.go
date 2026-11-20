@@ -57,7 +57,8 @@ func (r *LocalProcessRunner) Run(ctx context.Context, spec contract.SandboxSpec)
 	if timeoutSec <= 0 {
 		timeoutSec = 300
 	}
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec+60)*time.Second)
+	kitTimeout := kitExecTimeout(timeoutSec)
+	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+60*time.Second)
 	defer cancel()
 
 	loaderBin, err := r.ensureLoaderBin(runCtx)
@@ -137,7 +138,7 @@ func (r *LocalProcessRunner) Run(ctx context.Context, spec contract.SandboxSpec)
 		"--out-dir", outDir,
 		"--scratch-dir", scratchDir,
 	)
-	if err := runExec(runCtx, workRoot, kitCmd[0], kitArgs, bytes.NewReader(credsPayload), nil, time.Duration(timeoutSec)*time.Second); err != nil {
+	if err := runExec(runCtx, workRoot, kitCmd[0], kitArgs, bytes.NewReader(credsPayload), nil, kitTimeout); err != nil {
 		return nil, fmt.Errorf("review-kit run: %w", err)
 	}
 

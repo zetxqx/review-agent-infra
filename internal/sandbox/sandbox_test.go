@@ -5,9 +5,12 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
@@ -128,6 +131,145 @@ func TestLocalProcessRunnerEnforcesReadOnlySrcMasksInstructionsAndReadsReport(t 
 	}
 	if len(report.Findings) != 1 || report.Findings[0].Title != "Nil return verified" {
 		t.Fatalf("unexpected findings: %+v", report.Findings)
+	}
+}
+
+func TestLocalProcessRunnerReturnsFailedReportWhenHarnessExceedsWallClock(t *testing.T) {
+	ctx := context.Background()
+	tarPath := filepath.Join(t.TempDir(), "snapshot.tar.gz")
+	// key: archive entry path; value: file content
+	writeGzipTar(t, tarPath, map[string]string{
+		"repo/pkg/app.go": "package pkg\n",
+	})
+
+	pidFile := filepath.Join(t.TempDir(), "harness.pid")
+	harnessScript := filepath.Join(t.TempDir(), "outlive_wall_clock.py")
+	scriptBody := strings.Join([]string{
+		"import os, pathlib, time",
+		"pathlib.Path(" + strconv.Quote(pidFile) + ").write_text(str(os.getpid()))",
+		"time.sleep(120)",
+	}, "\n")
+	if err := os.WriteFile(harnessScript, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	argvJSON, _ := json.Marshal([]string{"python3", harnessScript})
+	task := &reviewv1.AgentTask{
+		RunId: "run-local-wall-clock",
+		Harness: &reviewv1.HarnessRef{
+			Profile: "slow-probe",
+			Adapter: "command",
+			// key: harness option key; value: serialized option value
+			Options: map[string]string{
+				"argv": string(argvJSON),
+			},
+		},
+		ModelAlias: "review-coder",
+		PrTitle:    "Test wall clock finalization",
+		Budget: &reviewv1.TaskBudget{
+			MaxRequests:             10,
+			MaxContextTokens:        16384,
+			MaxTotalTokens:          100000,
+			NormalizerReserveTokens: 10000,
+			WallClockSeconds:        3,
+		},
+	}
+	taskBytes, err := protojson.Marshal(task)
+	if err != nil {
+		t.Fatalf("marshal task: %v", err)
+	}
+
+	runner := NewLocalProcessRunner("")
+	defer runner.Close()
+
+	report, err := runner.Run(ctx, contract.SandboxSpec{
+		ShortRunID:     "test02",
+		HarnessProfile: "slow-probe",
+		TarballPath:    tarPath,
+		// key: input file path relative to .review/in; value: raw bytes
+		Inputs: map[string][]byte{
+			"task.json":  taskBytes,
+			"diff.patch": []byte("diff --git a/pkg/app.go b/pkg/app.go\n"),
+		},
+		AdapterURL:     "http://127.0.0.1:65530",
+		TaskToken:      "secret-jwt-token",
+		TimeoutSeconds: 3,
+	})
+	if err != nil {
+		t.Fatalf("LocalProcessRunner.Run must return the kit report after a harness timeout: %v", err)
+	}
+	if report.GetProvenance().GetStatus() != reviewv1.ReportStatus_REPORT_STATUS_HARNESS_FAILED {
+		t.Fatalf("expected HARNESS_FAILED after harness timeout, got %v", report.GetProvenance())
+	}
+	if len(report.GetFindings()) != 0 || report.GetSummary() != "" {
+		t.Fatalf("expected empty failed report, got %+v", report)
+	}
+
+	rawPID, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read harness pid file: %v", err)
+	}
+	harnessPID, err := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	if err != nil {
+		t.Fatalf("parse harness pid %q: %v", string(rawPID), err)
+	}
+	if killErr := syscall.Kill(harnessPID, 0); !errors.Is(killErr, syscall.ESRCH) {
+		t.Fatalf("harness process %d still alive after run: %v", harnessPID, killErr)
+	}
+}
+
+func TestDockerRunnerKeepsKitAliveBeyondHarnessWallClock(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	tarPath := filepath.Join(tmp, "snapshot.tar.gz")
+	// key: archive entry path; value: file content
+	writeGzipTar(t, tarPath, map[string]string{
+		"repo/main.go": "package main\n",
+	})
+
+	fakeDocker := filepath.Join(tmp, "fake-docker.sh")
+	script := strings.Join([]string{
+		"#!/usr/bin/env bash",
+		"set -euo pipefail",
+		"if [[ \"$*\" == *\"read-report\"* ]]; then",
+		"  cat <<'EOF'",
+		"{\"summary\":\"\",\"findings\":[],\"provenance\":{\"profile\":\"openhands\",\"normalizer\":\"NORMALIZER_PATH_NONE\",\"status\":\"REPORT_STATUS_HARNESS_FAILED\"}}",
+		"EOF",
+		"elif [[ \"$*\" == *\"review-kit run\"* ]]; then",
+		"  cat > /dev/null",
+		"  sleep 2",
+		"else",
+		"  cat > /dev/null",
+		"fi",
+	}, "\n")
+	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+
+	taskBytes, _ := protojson.Marshal(&reviewv1.AgentTask{RunId: "docker-run-wall-clock"})
+	runner := &DockerRunner{
+		DockerBin:    fakeDocker,
+		DefaultImage: "test-sandbox:1.0",
+		Network:      "adapter-only-net",
+	}
+
+	rep, err := runner.Run(ctx, contract.SandboxSpec{
+		ShortRunID:  "dkr3",
+		TarballPath: tarPath,
+		// key: input file path relative to .review/in; value: raw bytes
+		Inputs: map[string][]byte{
+			"task.json":  taskBytes,
+			"diff.patch": []byte(""),
+		},
+		AdapterURL:     "http://adapter:8080",
+		TaskToken:      "jwt-docker-456",
+		TimeoutSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("DockerRunner.Run must outlast the harness wall clock: %v", err)
+	}
+	if rep.GetProvenance().GetStatus() != reviewv1.ReportStatus_REPORT_STATUS_HARNESS_FAILED {
+		t.Fatalf("expected the kit failed report to be returned, got %v", rep.GetProvenance())
 	}
 }
 
