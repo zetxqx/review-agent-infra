@@ -33,6 +33,7 @@ type SessionLedger struct {
 	committed         atomic.Int64
 	requests          atomic.Int32
 	normalizeRequests atomic.Int32
+	rejectedRequests  atomic.Int32
 	promptTokens      atomic.Int64
 	cachedTokens      atomic.Int64
 	completionTokens  atomic.Int64
@@ -69,17 +70,25 @@ func (l *SessionLedger) TryReserve(estimate int64, phase string) string {
 		counter, reqLimit = &l.normalizeRequests, MaxNormalizeRequests
 	}
 	if !casReserveCounter(counter, reqLimit) {
+		l.countRejection(normalizing)
 		return "request_limit_exhausted"
 	}
 	for {
 		cur := l.committed.Load()
 		if cur+estimate > capLimit {
 			counter.Add(-1)
+			l.countRejection(normalizing)
 			return "budget_exhausted"
 		}
 		if l.committed.CompareAndSwap(cur, cur+estimate) {
 			return ""
 		}
+	}
+}
+
+func (l *SessionLedger) countRejection(normalizing bool) {
+	if !normalizing {
+		l.rejectedRequests.Add(1)
 	}
 }
 
@@ -102,6 +111,7 @@ func (l *SessionLedger) Snapshot() *reviewv1.SandboxUsage {
 		PromptTokens:      l.promptTokens.Load(),
 		CachedTokens:      l.cachedTokens.Load(),
 		CompletionTokens:  l.completionTokens.Load(),
+		RejectedRequests:  l.rejectedRequests.Load(),
 	}
 }
 
