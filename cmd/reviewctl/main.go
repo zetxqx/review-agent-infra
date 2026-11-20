@@ -240,8 +240,10 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
+	reviewOK := execRes.Report.GetProvenance().GetStatus() == reviewv1.ReportStatus_REPORT_STATUS_OK
+
 	var pubInfo *PublishedReviewInfo
-	if vcs != nil {
+	if vcs != nil && reviewOK {
 		if !skipHeadCheck {
 			remoteHead, headErr := vcs.GetHeadSHA(ctx, ghRepo, publishPR)
 			if headErr != nil {
@@ -298,8 +300,16 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 			return err
 		}
 	}
-	_, err = stdout.Write(rendered)
-	return err
+	if _, err := stdout.Write(rendered); err != nil {
+		return err
+	}
+	if !reviewOK {
+		if vcs != nil {
+			return fmt.Errorf("review finished with status %s; nothing was published to PR #%d", execRes.Status, publishPR)
+		}
+		return fmt.Errorf("review finished with status %s", execRes.Status)
+	}
+	return nil
 }
 
 func runCompareCmd(ctx context.Context, args []string, stdout io.Writer) error {
