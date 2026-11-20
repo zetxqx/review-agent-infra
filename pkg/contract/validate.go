@@ -65,3 +65,19 @@ func ValidateReport(r *reviewv1.ReviewReport) {
 	}
 	r.Findings = kept
 }
+
+// FailReportOnRejectedRequests marks r HARNESS_FAILED and returns true when cmd/adapter rejected
+// harness-phase requests and the harness left no deterministic report file.
+func FailReportOnRejectedRequests(r *reviewv1.ReviewReport, usage *reviewv1.SandboxUsage) bool {
+	if r == nil || usage.GetRejectedRequests() == 0 {
+		return false
+	}
+	if r.GetProvenance().GetNormalizer() == reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC {
+		return false
+	}
+	if r.Provenance == nil {
+		r.Provenance = &reviewv1.Provenance{}
+	}
+	r.Provenance.Status = reviewv1.ReportStatus_REPORT_STATUS_HARNESS_FAILED
+	return true
+}

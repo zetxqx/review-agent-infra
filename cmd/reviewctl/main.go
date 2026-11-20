@@ -85,6 +85,7 @@ type ExecutionMetrics struct {
 	DurationMs        int64                    `json:"duration_ms"`
 	Requests          int32                    `json:"requests"`
 	NormalizeRequests int32                    `json:"normalize_requests"`
+	RejectedRequests  int32                    `json:"rejected_requests"`
 	PromptTokens      int64                    `json:"prompt_tokens"`
 	CachedTokens      int64                    `json:"cached_tokens"`
 	CompletionTokens  int64                    `json:"completion_tokens"`
@@ -711,6 +712,7 @@ func executeProfileOnCommit(
 	}
 
 	usage := fetchSandboxUsage(ctx, adapterSess.internalURL, jti)
+	contract.FailReportOnRejectedRequests(report, usage)
 
 	pipeOpts := publisher.DefaultPipelineOptions()
 	pipeOpts.DefaultConfidence = profile.DefaultConfidence
@@ -723,10 +725,11 @@ func executeProfileOnCommit(
 	pipeRes := publisher.RunPipeline(report, diffPatch, pipeOpts)
 
 	var promptToks, cachedToks, compToks int64
-	var reqCount, normReqCount int32
+	var reqCount, normReqCount, rejectedCount int32
 	if usage != nil {
 		reqCount = usage.Requests
 		normReqCount = usage.NormalizeRequests
+		rejectedCount = usage.RejectedRequests
 		promptToks = usage.PromptTokens
 		cachedToks = usage.CachedTokens
 		compToks = usage.CompletionTokens
@@ -750,6 +753,7 @@ func executeProfileOnCommit(
 		DurationMs:        elapsed.Milliseconds(),
 		Requests:          reqCount,
 		NormalizeRequests: normReqCount,
+		RejectedRequests:  rejectedCount,
 		PromptTokens:      promptToks,
 		CachedTokens:      cachedToks,
 		CompletionTokens:  compToks,
