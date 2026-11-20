@@ -6,6 +6,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Self
 
+import pytest
+
 from review_harness_kit.adapters.openhands import OpenHandsAdapter
 from review_harness_kit.adapters.pr_agent import PRAgentAdapter
 from review_harness_kit.contracts import ProcessResult, RawOutput, RunContext
@@ -236,3 +238,94 @@ def test_normalizer_marks_harness_failed_when_upstream_errors(tmp_path: Path) ->
     assert report.provenance.status == review_pb2.REPORT_STATUS_HARNESS_FAILED
     assert report.provenance.normalizer == review_pb2.NORMALIZER_PATH_NONE
     assert report.provenance.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out"),
+    [(-9, True), (1, False)],
+    ids=["timed_out", "nonzero_exit"],
+)
+def test_unfinished_harness_without_report_file_skips_llm_normalizer(
+    tmp_path: Path, exit_code: int, timed_out: bool
+) -> None:
+    task = review_pb2.AgentTask(
+        src_dir=str(tmp_path / "src"),
+        out_dir=str(tmp_path / "out"),
+        model_alias="qwen-coder",
+    )
+    task.harness.profile = "openhands"
+    (tmp_path / "src").mkdir(parents=True)
+
+    with MockNormalizeServer({"summary": "Partial deliberation only.", "findings": []}) as srv:
+        ctx = RunContext(
+            base_url=srv.base_url,
+            api_key="eyJ.jwt.norm",
+            home=tmp_path / "home",
+            prompt="prompt",
+            rules_text="rules",
+            schema_path=EMBEDDED_SCHEMA_PATH,
+        )
+        raw = RawOutput(kind="markdown", text="Still checking candidate A before finalizing.")
+        res = ProcessResult(exit_code=exit_code, timed_out=timed_out, log_path=tmp_path / "harness.log")
+        report = normalize(OpenHandsAdapter(), raw, task, ctx, res)
+        assert len(srv.requests) == 0
+
+    assert report.provenance.status == review_pb2.REPORT_STATUS_HARNESS_FAILED
+    assert report.provenance.normalizer == review_pb2.NORMALIZER_PATH_NONE
+    assert report.provenance.exit_code == exit_code
+    assert report.summary == ""
+    assert len(report.findings) == 0
+
+
+def test_timed_out_harness_with_report_file_keeps_deterministic_report(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src"
+    (src_dir / "internal").mkdir(parents=True)
+    (src_dir / "internal" / "cache.go").write_text(
+        "package internal\n\nfunc Get(k string) string {\n\treturn store[k]\n}\n",
+        encoding="utf-8",
+    )
+    written_report = {
+        "summary": "Report written before the wall clock expired.",
+        "findings": [
+            {
+                "file": "internal/cache.go",
+                "line": 4,
+                "side": "DIFF_SIDE_RIGHT",
+                "targetLineText": "return store[k]",
+                "anchor": "ANCHOR_KIND_QUOTED",
+                "severity": "SEVERITY_HIGH",
+                "confidence": 0.9,
+                "category": "FINDING_CATEGORY_CONCURRENCY",
+                "title": "Concurrent map read without lock",
+                "explanation": "store is read without holding mu.RLock.",
+                "suggestion": "Guard access with RWMutex.",
+                "evidence": "Line 4 reads store[k].",
+            }
+        ],
+    }
+    task = review_pb2.AgentTask(
+        src_dir=str(src_dir),
+        out_dir=str(tmp_path / "out"),
+        model_alias="qwen-coder",
+    )
+    task.harness.profile = "openhands"
+
+    with MockNormalizeServer({"summary": "unused", "findings": []}) as srv:
+        ctx = RunContext(
+            base_url=srv.base_url,
+            api_key="eyJ.jwt.norm",
+            home=tmp_path / "home",
+            prompt="prompt",
+            rules_text="rules",
+            schema_path=EMBEDDED_SCHEMA_PATH,
+        )
+        raw = RawOutput(kind="json", text=json.dumps(written_report))
+        res = ProcessResult(exit_code=-9, timed_out=True, log_path=tmp_path / "harness.log")
+        report = normalize(OpenHandsAdapter(), raw, task, ctx, res)
+        assert len(srv.requests) == 0
+
+    assert report.provenance.status == review_pb2.REPORT_STATUS_OK
+    assert report.provenance.normalizer == review_pb2.NORMALIZER_PATH_DETERMINISTIC
+    assert report.provenance.exit_code == -9
+    assert len(report.findings) == 1
+    assert report.findings[0].file == "internal/cache.go"

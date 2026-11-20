@@ -103,6 +103,10 @@ def resolve_harness_version(adapter: HarnessAdapter) -> str:
     return "0.1.0"
 
 
+def harness_exited_cleanly(result: ProcessResult) -> bool:
+    return not result.timed_out and result.exit_code == 0
+
+
 def normalize(
     adapter: HarnessAdapter,
     raw: RawOutput,
@@ -120,7 +124,7 @@ def normalize(
     except EXTRACT_ERRORS:
         cand = None
 
-    if cand is None and raw.text.strip():
+    if cand is None and harness_exited_cleanly(result) and raw.text.strip():
         try:
             cand = llm_normalize(raw.text, task, ctx)
             path = review_pb2.NORMALIZER_PATH_LLM
