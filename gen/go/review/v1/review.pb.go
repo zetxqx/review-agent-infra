@@ -1471,6 +1471,7 @@ type SandboxUsage struct {
 	PromptTokens      int64                  `protobuf:"varint,4,opt,name=prompt_tokens,json=promptTokens,proto3" json:"prompt_tokens,omitempty"`
 	CachedTokens      int64                  `protobuf:"varint,5,opt,name=cached_tokens,json=cachedTokens,proto3" json:"cached_tokens,omitempty"`
 	CompletionTokens  int64                  `protobuf:"varint,6,opt,name=completion_tokens,json=completionTokens,proto3" json:"completion_tokens,omitempty"`
+	RejectedRequests  int32                  `protobuf:"varint,7,opt,name=rejected_requests,json=rejectedRequests,proto3" json:"rejected_requests,omitempty"` // Harness-phase requests refused for budget or request cap
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1543,6 +1544,13 @@ func (x *SandboxUsage) GetCachedTokens() int64 {
 func (x *SandboxUsage) GetCompletionTokens() int64 {
 	if x != nil {
 		return x.CompletionTokens
+	}
+	return 0
+}
+
+func (x *SandboxUsage) GetRejectedRequests() int32 {
+	if x != nil {
+		return x.RejectedRequests
 	}
 	return 0
 }
@@ -1669,14 +1677,15 @@ const file_review_v1_review_proto_rawDesc = "" +
 	"\x03exp\x18\n" +
 	" \x01(\x03R\x03exp\x12\x10\n" +
 	"\x03jti\x18\v \x01(\tR\x03jtiB\x14\n" +
-	"\x12_parent_session_id\"\xe2\x01\n" +
+	"\x12_parent_session_id\"\x8f\x02\n" +
 	"\fSandboxUsage\x12\x10\n" +
 	"\x03jti\x18\x01 \x01(\tR\x03jti\x12\x1a\n" +
 	"\brequests\x18\x02 \x01(\x05R\brequests\x12-\n" +
 	"\x12normalize_requests\x18\x03 \x01(\x05R\x11normalizeRequests\x12#\n" +
 	"\rprompt_tokens\x18\x04 \x01(\x03R\fpromptTokens\x12#\n" +
 	"\rcached_tokens\x18\x05 \x01(\x03R\fcachedTokens\x12+\n" +
-	"\x11completion_tokens\x18\x06 \x01(\x03R\x10completionTokens*\x84\x01\n" +
+	"\x11completion_tokens\x18\x06 \x01(\x03R\x10completionTokens\x12+\n" +
+	"\x11rejected_requests\x18\a \x01(\x05R\x10rejectedRequests*\x84\x01\n" +
 	"\tEventKind\x12\x1a\n" +
 	"\x16EVENT_KIND_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11EVENT_KIND_REVIEW\x10\x01\x12\x14\n" +

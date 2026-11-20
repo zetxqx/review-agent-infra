@@ -73,6 +73,95 @@ func TestSessionLedgerCASConcurrencyAndNormalizeCap(t *testing.T) {
 	}
 }
 
+func TestSessionLedgerCountsRejectedHarnessRequests(t *testing.T) {
+	capped := NewSessionLedger(testClaims("jti-rejected-cap", 2, 1000, 200))
+	for i := range 2 {
+		if code := capped.TryReserve(100, "harness"); code != "" {
+			t.Fatalf("harness request %d within cap rejected: %q", i+1, code)
+		}
+	}
+	if got := capped.Snapshot().GetRejectedRequests(); got != 0 {
+		t.Fatalf("expected 0 rejected requests within cap, got %d", got)
+	}
+	if code := capped.TryReserve(100, "harness"); code != "request_limit_exhausted" {
+		t.Fatalf("expected request_limit_exhausted beyond cap, got %q", code)
+	}
+	if code := capped.TryReserve(100, "harness"); code != "request_limit_exhausted" {
+		t.Fatalf("expected request_limit_exhausted beyond cap, got %q", code)
+	}
+	if got := capped.Snapshot().GetRejectedRequests(); got != 2 {
+		t.Fatalf("expected 2 rejected harness requests after request cap, got %d", got)
+	}
+
+	overBudget := NewSessionLedger(testClaims("jti-rejected-budget", 5, 1000, 200))
+	if code := overBudget.TryReserve(801, "harness"); code != "budget_exhausted" {
+		t.Fatalf("expected budget_exhausted above max-reserve, got %q", code)
+	}
+	if got := overBudget.Snapshot().GetRejectedRequests(); got != 1 {
+		t.Fatalf("expected 1 rejected harness request after budget cutoff, got %d", got)
+	}
+	if code := overBudget.TryReserve(1001, "normalize"); code != "budget_exhausted" {
+		t.Fatalf("expected normalize budget_exhausted above max total, got %q", code)
+	}
+	if got := overBudget.Snapshot().GetRejectedRequests(); got != 1 {
+		t.Fatalf("normalize rejections must not count as harness rejections, got %d", got)
+	}
+}
+
+func TestProxyReportsRejectedHarnessRequestsInUsage(t *testing.T) {
+	key := []byte("rejected-usage-secret")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	handler := NewProxyHandler(Config{
+		TokenKey:      key,
+		Upstream:      &VllmDirectUpstream{BaseURL: upstream.URL},
+		UpstreamModel: "m",
+	})
+	sandboxSrv := httptest.NewServer(handler.SandboxMux())
+	defer sandboxSrv.Close()
+	internalSrv := httptest.NewServer(handler.InternalMux())
+	defer internalSrv.Close()
+
+	claims := testClaims("jti-rejected-usage", 1, 100000, 1000)
+	tok, err := token.Mint(key, claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantStatuses := []int{http.StatusOK, http.StatusForbidden, http.StatusForbidden}
+	for i, want := range wantStatuses {
+		req, _ := http.NewRequest(http.MethodPost, sandboxSrv.URL+"/v1/chat/completions", strings.NewReader(`{"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("harness request %d: status=%d want=%d body=%s", i+1, resp.StatusCode, want, body)
+		}
+	}
+
+	usageResp, err := http.Get(internalSrv.URL + "/internal/usage/jti-rejected-usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawUsage, _ := io.ReadAll(usageResp.Body)
+	usageResp.Body.Close()
+	var usage reviewv1.SandboxUsage
+	if err := protojson.Unmarshal(rawUsage, &usage); err != nil {
+		t.Fatalf("decode usage: %v\n%s", err, rawUsage)
+	}
+	if usage.GetRequests() != 1 || usage.GetRejectedRequests() != 2 {
+		t.Fatalf("expected requests=1 rejected_requests=2, got %s", rawUsage)
+	}
+}
+
 func TestProxyChatNonStreamAndStreamHidesUnrequestedUsageChunk(t *testing.T) {
 	key := []byte("proxy-secret")
 	var mu sync.Mutex

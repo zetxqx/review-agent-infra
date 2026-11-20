@@ -200,4 +200,5 @@ message SandboxUsage {
   int64 prompt_tokens = 4;
   int64 cached_tokens = 5;
   int64 completion_tokens = 6;
+  int32 rejected_requests = 7;               // Harness-phase requests refused for budget or request cap
 }
