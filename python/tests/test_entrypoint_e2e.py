@@ -216,6 +216,33 @@ def test_timeout_kills_entire_process_group(tmp_path: Path) -> None:
     assert report.provenance.status == review_pb2.REPORT_STATUS_HARNESS_FAILED
 
 
+def test_timed_out_harness_output_is_not_llm_normalized(tmp_path: Path) -> None:
+    task_path, out_dir = setup_workspace(tmp_path, "command", "slow-cmd", wall_clock=1)
+    child_code = (
+        "import time; "
+        "print('Still checking candidate A before finalizing.', flush=True); "
+        "time.sleep(60)"
+    )
+
+    task = json_format.Parse(task_path.read_text(encoding="utf-8"), review_pb2.AgentTask())
+    task.harness.options["argv"] = json.dumps([sys.executable, "-c", child_code])
+    task_path.write_text(json_format.MessageToJson(task), encoding="utf-8")
+
+    with MockAdapterHTTPServer() as srv:
+        stdin_bytes = io.BytesIO(
+            json.dumps({"openai_base_url": srv.host_url_without_v1, "openai_api_key": "eyJ.secret"}).encode("utf-8")
+        )
+        rc = run_command(stdin_bytes, ["--task", str(task_path), "--scratch-dir", str(tmp_path / "scratch")])
+        assert rc == 0
+        assert srv.calls == []
+
+    report = json_format.Parse((out_dir / "report.json").read_text(encoding="utf-8"), review_pb2.ReviewReport())
+    assert report.provenance.status == review_pb2.REPORT_STATUS_HARNESS_FAILED
+    assert report.provenance.normalizer == review_pb2.NORMALIZER_PATH_NONE
+    assert report.summary == ""
+    assert len(report.findings) == 0
+
+
 def test_review_kit_cli_end_to_end_sse_and_deterministic_profiles(tmp_path: Path) -> None:
     secret_token = "eyJhbGciOiJIUzI1NiJ9.supersecret.signature"
 
