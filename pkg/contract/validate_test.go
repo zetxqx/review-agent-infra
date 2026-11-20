@@ -115,3 +115,46 @@ func TestValidateReportFindingsCap(t *testing.T) {
 		t.Fatalf("expected findings capped at 100, got %d", len(report.Findings))
 	}
 }
+
+func TestFailReportOnRejectedRequests(t *testing.T) {
+	newReport := func(normalizer reviewv1.NormalizerPath) *reviewv1.ReviewReport {
+		return &reviewv1.ReviewReport{
+			Summary: "Partial deliberation",
+			Provenance: &reviewv1.Provenance{
+				Normalizer: normalizer,
+				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
+			},
+		}
+	}
+	rejected := &reviewv1.SandboxUsage{Requests: 3, RejectedRequests: 2}
+	clean := &reviewv1.SandboxUsage{Requests: 3}
+
+	cases := []struct {
+		name       string
+		report     *reviewv1.ReviewReport
+		usage      *reviewv1.SandboxUsage
+		wantFailed bool
+	}{
+		{name: "llm report after rejections", report: newReport(reviewv1.NormalizerPath_NORMALIZER_PATH_LLM), usage: rejected, wantFailed: true},
+		{name: "missing provenance after rejections", report: &reviewv1.ReviewReport{Summary: "no provenance"}, usage: rejected, wantFailed: true},
+		{name: "deterministic report after rejections", report: newReport(reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC), usage: rejected, wantFailed: false},
+		{name: "llm report without rejections", report: newReport(reviewv1.NormalizerPath_NORMALIZER_PATH_LLM), usage: clean, wantFailed: false},
+		{name: "llm report without usage", report: newReport(reviewv1.NormalizerPath_NORMALIZER_PATH_LLM), usage: nil, wantFailed: false},
+	}
+	for _, tc := range cases {
+		wantStatus := tc.report.GetProvenance().GetStatus()
+		if tc.wantFailed {
+			wantStatus = reviewv1.ReportStatus_REPORT_STATUS_HARNESS_FAILED
+		}
+		if got := FailReportOnRejectedRequests(tc.report, tc.usage); got != tc.wantFailed {
+			t.Fatalf("%s: FailReportOnRejectedRequests = %v, want %v", tc.name, got, tc.wantFailed)
+		}
+		if got := tc.report.GetProvenance().GetStatus(); got != wantStatus {
+			t.Fatalf("%s: status = %v, want %v", tc.name, got, wantStatus)
+		}
+	}
+
+	if FailReportOnRejectedRequests(nil, rejected) {
+		t.Fatal("nil report must not be marked failed")
+	}
+}

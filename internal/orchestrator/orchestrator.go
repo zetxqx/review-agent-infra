@@ -433,6 +433,7 @@ func (o *Orchestrator) runShard(
 	elapsed := time.Since(started)
 
 	usage := o.fetchAdapterUsage(ctx, jti)
+	contract.FailReportOnRejectedRequests(report, usage)
 	if usage != nil && o.cfg.AdapterInternalURL != "" {
 		o.telemetry.AddTokens(rec.Repo, profile.Name, usage.PromptTokens, usage.CompletionTokens, usage.CachedTokens)
 	}
