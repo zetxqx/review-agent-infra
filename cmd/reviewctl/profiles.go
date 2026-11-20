@@ -44,7 +44,7 @@ func builtinProfiles() map[string]ProfileSpec {
 				MaxContextTokens:        32768,
 				MaxTotalTokens:          5000000,
 				NormalizerReserveTokens: 50000,
-				WallClockSeconds:        600,
+				WallClockSeconds:        1800,
 			},
 		},
 		"codex": {
