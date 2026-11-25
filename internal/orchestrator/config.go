@@ -85,7 +85,7 @@ func DefaultHarnessConfig() HarnessConfig {
 		Profiles: map[string]ProfileConfig{
 			"openhands": {
 				Name: "openhands", Adapter: "openhands", Image: sandbox.DefaultSandboxImage,
-				DefaultConfidence: 0.80, Budget: stdBudget(60, 5000000, 900),
+				DefaultConfidence: 0.80, Budget: stdBudget(120, 5000000, 900),
 			},
 			"pr-agent": {
 				Name: "pr-agent", Adapter: "pr-agent", Image: sandbox.DefaultSandboxImage,
