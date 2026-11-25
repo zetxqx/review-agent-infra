@@ -71,3 +71,18 @@ func TestParseControllerFlagsReadsGitHubAppIDsFromEnv(t *testing.T) {
 		t.Fatalf("expected an error naming GITHUB_APP_ID, got %v", err)
 	}
 }
+
+func TestParseControllerFlagsStatelessAndEmbeddedProxyDefaults(t *testing.T) {
+	t.Setenv("ADAPTER_UPSTREAM_URL", "http://llmd.internal:8000")
+	t.Setenv("ADAPTER_UPSTREAM_MODEL", "qwen3-coder")
+	f, err := parseControllerFlags(nil)
+	if err != nil {
+		t.Fatalf("parseControllerFlags: %v", err)
+	}
+	if f.sandboxListenAddr != ":8081" || f.feedbackPollSec != 0 {
+		t.Fatalf("unexpected defaults: sandboxListenAddr=%q feedbackPollSec=%d", f.sandboxListenAddr, f.feedbackPollSec)
+	}
+	if f.upstreamURL != "http://llmd.internal:8000" || f.upstreamModel != "qwen3-coder" {
+		t.Fatalf("unexpected upstream env values: url=%q model=%q", f.upstreamURL, f.upstreamModel)
+	}
+}

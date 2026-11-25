@@ -1,50 +1,43 @@
 # Architecture Overview
 
-`review-agent-infra` turns untrusted pull request diffs into aligned, deduplicated review comments on self-hosted infrastructure. One Protobuf file (`proto/review/v1/review.proto`) defines the contracts across the Go control plane, the Go inference proxy, and the in-sandbox Python harness kit.
+`review-agent-infra` turns untrusted pull request diffs into aligned, deduplicated review comments on self-hosted infrastructure. One Protobuf file (`proto/review/v1/review.proto`) defines the contracts across the Go control plane (`bin/controller` / `bin/reviewctl`) and the in-sandbox Python harness kit (`review-kit`).
 
 ## 1. High-Level Pipeline and Component I/O
 
-Four runtime components move a pull request from a webhook trigger to published review comments.
+Two runtime components move a pull request from a webhook trigger to published review comments: the stateless Go **Controller** (with embedded host bundle builder and `:8081` sandbox/inference proxy) and the disposable single-container **Sandbox** running **`review-kit`**.
 
 ```mermaid
 flowchart LR
     GH["GitHub PR or Local CLI"]
-    Ctrl["1. Controller (Go Control Plane + PostgreSQL)"]
-    Loader["2. Loader (Go Sandbox Preparer)"]
-    Kit["3. Harness Kit (Python Wrapper Around OSS Agents)"]
-    Adapter["4. Inference Adapter (Go Budget and Routing Proxy)"]
+    Ctrl["1. Controller (Go :8080 Webhooks + :8081 Bundle/Report/Inference Proxy)"]
+    Kit["2. Sandbox (1-Container gVisor Pod: review-kit + OSS Harness)"]
     LLM["llm-d or vLLM (Model Serving)"]
 
     GH -->|"1. PR event, source archive, diff"| Ctrl
-    Ctrl -->|"2. snapshot.tar.gz + task.json"| Loader
-    Loader -->|"3. Read-only local Git repo"| Kit
-    Kit <-->|"4. OpenAI requests and streamed replies"| Adapter
-    Adapter <-->|"5. Routed inference traffic"| LLM
-    Kit -->|"6. Normalized report.json"| Ctrl
-    Ctrl -->|"7. Aligned, deduplicated PR comments"| GH
+    Ctrl -->|"2. Pod + 0400 Secret (controller_url, task_token)"| Kit
+    Kit -->|"3. GET /v1/sandbox/bundle (one-time)"| Ctrl
+    Kit <-->|"4. OpenAI /v1/chat/completions or /v1/responses"| Ctrl
+    Ctrl <-->|"5. Routed inference traffic"| LLM
+    Kit -->|"6. POST /v1/sandbox/report (2 MiB cap)"| Ctrl
+    Ctrl -->|"7. Aligned, marker-deduped PR comments"| GH
 ```
 
 | Component | Entrypoint | Primary Responsibility | Inputs | Outputs |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Controller** | `cmd/controller` (or `cmd/reviewctl` locally) | Queues runs in PostgreSQL, launches sandboxes, denoises findings, and posts reviews | Signed GitHub webhooks (`ReviewEvent`), source tarball, `diff.patch`, `base_sha` rules, `report.json`, `SandboxUsage` | `task.json` (`AgentTask`), short-lived `TaskClaims` JWT, atomic GitHub PR `COMMENT` review |
-| **2. Loader** | `cmd/loader` | Unpacks untrusted archives safely, masks repo agent instructions, and builds a two-branch Git tree | `snapshot.tar.gz` and `inputs.tar` (`task.json`, `diff.patch`, `rules/*`) over Exec stdin | Local Git repo with `base` and `pr` branches in `/workspace/src`, updated `task.json`, and safe readback of `report.json` |
-| **3. Harness Kit** | `review-kit` (`python/src/review_harness_kit`) | Runs an unmodified open-source coding agent against read-only source and normalizes its output | Read-only `/workspace/src`, `task.json`, and in-memory `{base_url, api_key}` over Exec stdin | Canonical `protojson` `report.json` (`ReviewReport`) in `/workspace/.review/out` |
-| **4. Inference Adapter** | `cmd/adapter` | Verifies task JWTs, enforces atomic request and uncached-token caps, and injects `llm-d` routing headers | OpenAI `/v1/chat/completions`, `/v1/responses`, or `/v1/models` requests with Bearer `TaskClaims` JWT | Streamed SSE or JSON model responses, plus `SandboxUsage` at `/internal/usage/{jti}` |
+| **1. Controller** | `cmd/controller` (or `cmd/reviewctl` locally) | Queues runs in memory, sanitizes & packs `bundle.tar.gz` via `internal/loader`, registers opaque random session tokens, serves `:8081` bundle/report/OpenAI proxy, denoises findings, deduplicates via GitHub PR review markers, and posts reviews | Signed GitHub webhooks (`ReviewEvent`), source tarball, `diff.patch`, `base_sha` rules, existing PR review markers, uploaded `report.json` | Clean `bundle.tar.gz`, in-memory `SessionLedger` usage, atomic GitHub PR `COMMENT` review with embedded fingerprint marker |
+| **2. Harness Kit** | `review-kit` (`python/src/review_harness_kit`) | Bootstraps workspace from `GET /v1/sandbox/bundle`, builds offline `base`/`pr` Git repo, locks `/workspace/src` and `/workspace/.review/in` read-only, runs unmodified OSS coding agent under process-group timeout, normalizes output, and uploads `report.json` | Bootstrap JSON (`controller_url`, `task_token`) via `0400` Secret file or stdin, plus clean `bundle.tar.gz` | Canonical `protojson` `report.json` (`ReviewReport`) uploaded via `POST /v1/sandbox/report` |
 
 ---
 
-## 2. Binaries and Runtime Deployment
+## 2. Three Build Artifacts and Runtime Deployment
 
-The repository builds five standalone Go binaries (`make build`) and one in-sandbox Python CLI (`review-kit`).
+The repository builds two standalone Go binaries (`make build`) and one in-sandbox Python CLI (`review-kit`). `cmd/schemagen` runs at build time via `go run ./cmd/schemagen` during `make schema`.
 
-| Binary or CLI | Language | Execution Context | Role |
+| Artifact | Language | Execution Context | Role |
 | :--- | :--- | :--- | :--- |
-| `bin/controller` | Go (`CGO_ENABLED=0`) | Long-running Kubernetes `Deployment` (`review-system`) | Webhook receiver, PostgreSQL `SKIP LOCKED` worker pool, Kubernetes Pod orchestrator, and review publisher |
-| `bin/adapter` | Go (`CGO_ENABLED=0`) | Long-running Kubernetes `Deployment` (`review-system`) | Streaming OpenAI proxy (`:8080` for sandboxes, `:9090` for internal usage and `/metrics`) with lock-free CAS budgets |
-| `bin/loader` | Go (`CGO_ENABLED=0`) | Ephemeral sandbox Pod (`loader` container, `review-sandbox`) | Trusted filesystem helper using `os.OpenRoot` extraction and `O_NOFOLLOW` report readback with zero credentials |
-| `bin/reviewctl` | Go | Developer workstation or CI job | Standalone CLI for single-commit reviews (`review`) and side-by-side multi-harness evaluation (`compare`) |
-| `bin/schemagen` | Go | Build-time code generator (`make schema`) | Reflects over `review.v1.ReviewReport` to generate `gen/schema/llm_review_report.schema.json` |
-| `review-kit` | Python 3.12 (`uv`) | Ephemeral sandbox Pod (`harness` container, `review-sandbox`) | Thin `prepare` / `collect` / `extract` wrapper around `openhands`, `pr-agent`, `codex`, `mini-swe-agent`, `opencode`, `goose`, and `aider` |
+| `bin/controller` | Go (`CGO_ENABLED=0`) | Sole Kubernetes `Deployment` (`review-system`) | `:8080` public webhook/healthz/metrics server + `:8081` sandbox-only bundle/report/OpenAI proxy with lock-free CAS budgets, `InMemoryStore` queue, Pod orchestrator, orphan reaper, and stateless PR publisher |
+| `review-kit` | Python 3.12 (`uv`) | Ephemeral 1-container gVisor Pod (`sandbox` container, `review-sandbox`) | Self-bootstrapping `CMD ["review-kit", "run"]` wrapper around `openhands`, `pr-agent`, `codex`, `mini-swe-agent`, `opencode`, `goose`, and `aider` |
+| `bin/reviewctl` | Go | Developer workstation or CI job | Standalone CLI for single-commit reviews (`review`) and side-by-side multi-harness evaluation (`compare`) reusing the same `internal/loader` and `internal/inference` proxy on a loopback port |
 
 ---
 
@@ -56,42 +49,47 @@ Every cross-process step uses an explicit Protobuf message from `proto/review/v1
 sequenceDiagram
     autonumber
     participant GH as GitHub PR
-    participant Ctrl as Controller (+PostgreSQL)
-    participant Loader as Sandbox: Loader (Go)
-    participant Kit as Sandbox: Harness Kit (Python)
-    participant LLM as Adapter + llm-d
+    participant Ctrl as bin/controller (:8080 & :8081)
+    participant K8s as Kubernetes API
+    participant Kit as Sandbox Pod (review-kit + Agent CLI)
+    participant LLM as llm-d / vLLM
 
-    GH->>Ctrl: GitHub Webhook JSON (HMAC-SHA256) -> parsed into review.v1.ReviewEvent
-    Ctrl->>Ctrl: SQL insert into review_runs (20s debounce + SKIP LOCKED lease)
-    GH-->>Ctrl: snapshot.tar.gz + unified diff (diff.patch) + base_sha Markdown rules
-    Ctrl->>Loader: Exec stdin: snapshot.tar.gz + inputs.tar [task.json = protojson(review.v1.AgentTask)]
-    Loader-->>Kit: Shared emptyDir: read-only Git repo + updated task.json [protojson(review.v1.AgentTask)]
-    Ctrl->>Kit: Exec stdin JSON: {base_url, api_key: HS256 JWT(review.v1.TaskClaims)}
+    GH->>Ctrl: [Port 8080] Signed Webhook JSON -> review.v1.ReviewEvent
+    Ctrl->>Ctrl: InMemoryStore debounce + claim lease
+    GH-->>Ctrl: snapshot.tar.gz + diff.patch + base_sha rules
+    Ctrl->>Ctrl: internal/loader builds clean bundle.tar.gz + registers 32-byte random task_token
+    Ctrl->>K8s: Create 0400 Secret + 1-container gVisor Pod (RestartPolicy=Never), patch Secret OwnerReference
+    K8s-->>Kit: Start review-kit run --bootstrap /var/run/review-task/bootstrap.json
+    Kit->>Ctrl: [Port 8081] GET /v1/sandbox/bundle (Bearer task_token, one-time -> 410 Gone)
+    Ctrl-->>Kit: Clean bundle.tar.gz (src/* + .review/in/task.json, diff.patch, rules/*)
+    Kit->>Kit: Extract /workspace, git init base+pr, chmod a-w /workspace/src and /workspace/.review/in
     loop Multi-turn tool calls and optional 1-shot normalization
-        Kit->>LLM: OpenAI JSON (/v1/chat/completions or /v1/responses) + Bearer TaskClaims JWT
-        LLM-->>Kit: text/event-stream (SSE) or JSON constrained by llm_review_report.schema.json
+        Kit->>Ctrl: [Port 8081] POST /v1/chat/completions or /v1/responses (Bearer task_token)
+        Ctrl->>LLM: Fresh request + x-session-id + fairness ID + batch objective
+        LLM-->>Ctrl: SSE or JSON response with usage (cached_tokens)
+        Ctrl-->>Kit: Relay response & settle atomic SessionLedger in memory
     end
-    Kit-->>Loader: Write /workspace/.review/out/report.json [protojson(review.v1.ReviewReport)]
-    Loader-->>Ctrl: Exec stdout: report.json [protojson(review.v1.ReviewReport), 2 MiB cap]
-    LLM-->>Ctrl: GET /internal/usage/{jti} -> protojson(review.v1.SandboxUsage)
-    Ctrl->>GH: contract.PublishRequest -> GitHub Pull Request Review REST JSON (sanitized Markdown)
+    Kit->>Ctrl: [Port 8081] POST /v1/sandbox/report (Bearer task_token, 2 MiB cap)
+    Kit-->>K8s: Exit 0 (PodSucceeded)
+    K8s-->>Ctrl: Observe PodSucceeded, call FinishSession in memory, delete Pod & Secret
+    Ctrl->>GH: GET /pulls/{pr}/reviews (extract fps marker) + GetHeadSHA + POST review with embedded fps marker
 ```
 
 ### Protobuf Contract Summary
 
 | Step | Protobuf Message | Serialization and Transport | Security or Validation Invariant |
 | :--- | :--- | :--- | :--- |
-| **1. Trigger** | `review.v1.ReviewEvent` | In-memory Go struct parsed from verified GitHub Webhook JSON or CLI flags | Deduplicated via `webhook_deliveries` and gated for untrusted first-time forks |
-| **4-5. Task Input** | `review.v1.AgentTask` | `protojson` file at `/workspace/.review/in/task.json` (`int64` fields encoded as strings) | Never stores API keys, GitHub tokens, or task JWTs on disk |
-| **6-7. Auth Token** | `review.v1.TaskClaims` | Standard JSON payload signed as an HS256 JWT (`exp` as numeric Unix seconds) | Passed over Exec stdin into process RAM only and accepted solely by `cmd/adapter` |
-| **8-9. Sandbox Output** | `review.v1.ReviewReport` | `protojson` file at `/workspace/.review/out/report.json` (plus `llm_review_report.schema.json` for 1-shot LLM fallback) | Read with `syscall.O_NOFOLLOW` and checked by `contract.ValidateReport` in Go |
-| **9b. Token Ledger** | `review.v1.SandboxUsage` | `protojson` HTTP response from `cmd/adapter` `/internal/usage/{jti}` | Tracks prompt, cached, completion, and rejected requests outside sandbox control |
+| **1. Trigger** | `review.v1.ReviewEvent` | In-memory Go struct parsed from verified GitHub Webhook JSON or CLI flags | Deduplicated per delivery ID and gated for untrusted first-time forks |
+| **4-8. Task Input** | `review.v1.AgentTask` | `protojson` file at `/workspace/.review/in/task.json` (`int64` fields encoded as strings) | Never stores API keys, GitHub tokens, or task tokens on disk |
+| **4-10. Session Policy** | `review.v1.TaskClaims` | Held strictly in controller RAM, indexed by constant-time lookup of 32-byte random `task_token` | Token expires with run and is unregistered when the sandbox finishes; no HS256 JWT signing |
+| **14. Sandbox Output** | `review.v1.ReviewReport` | `protojson` uploaded via `POST /v1/sandbox/report` (plus `llm_review_report.schema.json` for 1-shot LLM fallback) | Enforced `2 MiB` HTTP body cap and validated by `contract.DecodeAndValidateReport` in Go |
+| **16. Token Ledger** | `review.v1.SandboxUsage` | Returned directly in memory by `ProxyHandler.FinishSession` | Tracks prompt, cached, completion, and rejected requests outside sandbox control |
 
 ---
 
 ## 4. Trust Zones and Package Boundaries
 
-Production deployments isolate untrusted PR code inside a disposable gVisor Pod in the `review-sandbox` namespace, separate from credentials and model backends in `review-system`.
+Production deployments isolate untrusted PR code inside a disposable 1-container gVisor Pod in `review-sandbox`, separate from GitHub App credentials and upstream model routing in `review-system`.
 
 ```mermaid
 flowchart TB
@@ -99,32 +97,28 @@ flowchart TB
         Dev["GitHub Webhook or reviewctl CLI"]
     end
 
-    subgraph Z2 ["Zone 2: Trusted Go Control Plane (ns: review-system)"]
+    subgraph Z2 ["Zone 2: Trusted Stateless Go Control Plane (ns: review-system)"]
         VCS["internal/vcs (github, localgit)"]
-        Orch["internal/orchestrator + internal/store (PostgreSQL)"]
-        Pub["internal/publisher (Hunk Alignment, Dedup, Sanitizer)"]
+        Orch["internal/orchestrator + InMemoryStore + internal/loader"]
+        Proxy["internal/inference (:8081 Bundle/Report/OpenAI Proxy + Atomic CAS Ledger)"]
+        Pub["internal/publisher (Hunk Alignment, Marker Dedup, Sanitizer)"]
     end
 
-    subgraph Z3 ["Zone 3: Disposable 2-Container gVisor Pod (ns: review-sandbox, No DNS)"]
-        Ldr["Container A: cmd/loader (RW /workspace/src, Zero Tokens)"]
-        Vol[("Shared emptyDir (/workspace)")]
-        Har["Container B: review-harness-kit + OSS Agent CLI (RO /workspace/src, Token in RAM)"]
+    subgraph Z3 ["Zone 3: Disposable 1-Container gVisor Pod (ns: review-sandbox, No DNS, Zero pods/exec)"]
+        Secret["0400 Secret (/var/run/review-task/bootstrap.json)"]
+        Kit["review-kit + OSS Agent CLI (RO rootfs, chmod a-w /workspace/src)"]
     end
 
-    subgraph Z4 ["Zone 4: Trusted Inference Gateway and Serving"]
-        Adp["cmd/adapter (JWT Check + Atomic CAS Ledger)"]
+    subgraph Z4 ["Zone 4: Self-Hosted Model Serving"]
         Srv["llm-d Gateway (Session Affinity + KV Prefix Cache + Batch Priority)"]
     end
 
-    Dev --> VCS --> Orch
-    Orch -->|"client-go Exec 1a/1b"| Ldr
-    Ldr <-->|"Read-Write"| Vol
-    Vol -->|"Read-Only Source & Rules"| Har
-    Orch -->|"client-go Exec 2 (Stdin Token)"| Har
-    Har -->|"Write report.json"| Vol
-    Ldr -->|"client-go Exec 3 (O_NOFOLLOW)"| Orch
-    Har -->|"Sole Allowed TCP Egress (:8080)"| Adp --> Srv
+    Dev -->|"HTTPS :8080"| VCS --> Orch
+    Orch -->|"Create Secret + Pod (pods + secrets RBAC only)"| Kit
+    Secret --> Kit
+    Kit <-->|"Sole Allowed TCP Egress (:8081)"| Proxy
+    Proxy --> Srv
     Orch --> Pub --> Dev
 ```
 
-For detailed design trade-offs, SQL schemas, and `llm-d` Endpoint Picker configuration, see [High-Level Design](design/hld.md) and [Concrete Implementation Plan](design/implementation-plan.md).
+For detailed design trade-offs and `llm-d` Endpoint Picker configuration, see [High-Level Design](design/hld.md).

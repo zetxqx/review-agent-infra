@@ -1,21 +1,15 @@
 package sandbox
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
-	"os"
-	"path/filepath"
+	"net"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
-	"google.golang.org/protobuf/encoding/protojson"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,18 +39,20 @@ func TestPodNameForShadowDisambiguation(t *testing.T) {
 	}
 }
 
-func TestBuildHardenedPodSecurityAndOwnerReference(t *testing.T) {
+func TestBuildHardenedPodSingleContainerSecurityAndSecretMount(t *testing.T) {
 	spec := contract.SandboxSpec{
 		ShortRunID:     "7f3a9c1e",
 		HarnessProfile: "openhands",
 		HarnessImage:   "ghcr.io/zetxqx/review-harness-openhands:1.0.0",
+		ControllerURL:  "http://10.96.0.42:8081",
+		TaskToken:      "opaque-token",
 		TimeoutSeconds: 900,
 	}
 
 	crossNSOwner := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "ctrl", Namespace: "review-system", UID: types.UID("uid-ctrl")},
 	}
-	pod := BuildHardenedPod("sbx-1", spec, K8sConfig{
+	pod := BuildHardenedPod("sbx-1", "sbx-1", spec, K8sConfig{
 		Namespace:                    "review-sandbox",
 		OwnerPod:                     crossNSOwner,
 		ActiveDeadlinePaddingSeconds: 300,
@@ -64,6 +60,9 @@ func TestBuildHardenedPodSecurityAndOwnerReference(t *testing.T) {
 
 	if pod.Namespace != "review-sandbox" || ptr.Deref(pod.Spec.RuntimeClassName, "") != "gvisor" {
 		t.Fatalf("unexpected namespace/runtimeClass: %s %v", pod.Namespace, pod.Spec.RuntimeClassName)
+	}
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("expected RestartPolicy=Never, got %s", pod.Spec.RestartPolicy)
 	}
 	if ptr.Deref(pod.Spec.AutomountServiceAccountToken, true) || ptr.Deref(pod.Spec.EnableServiceLinks, true) {
 		t.Fatal("expected SA token mount and service links disabled")
@@ -77,114 +76,85 @@ func TestBuildHardenedPodSecurityAndOwnerReference(t *testing.T) {
 	if len(pod.OwnerReferences) != 0 {
 		t.Fatalf("cross-namespace ownerReference must be omitted, got %+v", pod.OwnerReferences)
 	}
+	if len(pod.Spec.Containers) != 1 {
+		t.Fatalf("expected exactly 1 sandbox container, got %d", len(pod.Spec.Containers))
+	}
+	c := pod.Spec.Containers[0]
+	if c.Name != "sandbox" {
+		t.Fatalf("expected container name sandbox, got %q", c.Name)
+	}
+	if c.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+		t.Fatalf("expected FallbackToLogsOnError, got %q", c.TerminationMessagePolicy)
+	}
+	if !ptr.Deref(c.SecurityContext.ReadOnlyRootFilesystem, false) || ptr.Deref(c.SecurityContext.AllowPrivilegeEscalation, true) {
+		t.Fatalf("container %s missing read-only rootfs or escalation lock", c.Name)
+	}
+	wantCmd := "review-kit run --bootstrap /var/run/review-task/bootstrap.json"
+	if strings.Join(c.Command, " ") != wantCmd {
+		t.Fatalf("container command = %q, want %q", strings.Join(c.Command, " "), wantCmd)
+	}
 
-	var loaderC, harnessC *corev1.Container
-	for i := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[i]
-		if c.Name == "loader" {
-			loaderC = c
-		} else if c.Name == "harness" {
-			harnessC = c
-		}
-		if !ptr.Deref(c.SecurityContext.ReadOnlyRootFilesystem, false) || ptr.Deref(c.SecurityContext.AllowPrivilegeEscalation, true) {
-			t.Fatalf("container %s missing read-only rootfs or escalation lock", c.Name)
+	var sawBootstrapMount bool
+	for _, vm := range c.VolumeMounts {
+		if vm.MountPath == "/var/run/review-task" {
+			sawBootstrapMount = vm.ReadOnly && vm.Name == "bootstrap"
 		}
 	}
-	if loaderC == nil || harnessC == nil {
-		t.Fatal("expected both loader and harness containers")
+	if !sawBootstrapMount {
+		t.Fatalf("missing read-only /var/run/review-task mount: %+v", c.VolumeMounts)
 	}
-	for _, vm := range harnessC.VolumeMounts {
-		if (vm.MountPath == "/workspace/src" || vm.MountPath == "/workspace/.review/in") && !vm.ReadOnly {
-			t.Fatalf("harness mount %s must be ReadOnly", vm.MountPath)
+
+	var sawSecretVol bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "bootstrap" && v.Secret != nil && v.Secret.SecretName == "sbx-1" && ptr.Deref(v.Secret.DefaultMode, 0) == 0o400 {
+			sawSecretVol = true
 		}
+	}
+	if !sawSecretVol {
+		t.Fatalf("missing 0400 bootstrap secret volume: %+v", pod.Spec.Volumes)
 	}
 
 	sameNSOwner := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "ctrl", Namespace: "review-sandbox", UID: types.UID("uid-same")},
 	}
-	podSameNS := BuildHardenedPod("sbx-2", spec, K8sConfig{Namespace: "review-sandbox", OwnerPod: sameNSOwner})
+	podSameNS := BuildHardenedPod("sbx-2", "sbx-2", spec, K8sConfig{Namespace: "review-sandbox", OwnerPod: sameNSOwner})
 	if len(podSameNS.OwnerReferences) != 1 || podSameNS.OwnerReferences[0].UID != types.UID("uid-same") {
 		t.Fatalf("expected same-namespace controller Pod ownerReference, got %+v", podSameNS.OwnerReferences)
 	}
 }
 
-func TestK8sSandboxRunnerFourStepExecAndCancellationCleanup(t *testing.T) {
+func TestK8sSandboxRunnerCreatesSecretPatchesOwnerResolvesIPAndCleansUp(t *testing.T) {
 	cs := fake.NewSimpleClientset()
+	var createdSecretData []byte
+	var patchedOwner bool
+
+	cs.PrependReactor("create", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		s := action.(k8stesting.CreateAction).GetObject().(*corev1.Secret).DeepCopy()
+		createdSecretData = append([]byte(nil), s.Data["bootstrap.json"]...)
+		_ = cs.Tracker().Add(s)
+		return true, s, nil
+	})
+	cs.PrependReactor("patch", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pa := action.(k8stesting.PatchAction)
+		if strings.Contains(string(pa.GetPatch()), "pod-uid-123") {
+			patchedOwner = true
+		}
+		return false, nil, nil
+	})
 	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
-		p.Status.Phase = corev1.PodRunning
+		p.UID = types.UID("pod-uid-123")
+		p.Status.Phase = corev1.PodSucceeded
 		_ = cs.Tracker().Add(p)
 		return true, p, nil
 	})
 
-	tarPath := filepath.Join(t.TempDir(), "snap.tar.gz")
-	if err := os.WriteFile(tarPath, []byte("tgz-payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	taskBytes, err := protojson.Marshal(&reviewv1.AgentTask{
-		RunId:   "run-1",
-		Harness: &reviewv1.HarnessRef{Profile: "openhands", Adapter: "openhands"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var calls []string
-	var sawTokenInHarnessStdin bool
-	var leakedTokenInPrepare bool
-	reportOut, err := protojson.Marshal(&reviewv1.ReviewReport{
-		Summary: "checked",
-		Findings: []*reviewv1.ReviewFinding{
-			{File: "a.go", Line: 10, Title: "race", Severity: reviewv1.Severity_SEVERITY_HIGH},
-		},
-		Provenance: &reviewv1.Provenance{Status: reviewv1.ReportStatus_REPORT_STATUS_OK},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	runner := NewK8sSandboxRunner(cs, nil, K8sConfig{
+	runner := NewK8sSandboxRunner(cs, K8sConfig{
 		Namespace:          "review-sandbox",
 		WaitRunningTimeout: 5 * time.Second,
 		PollInterval:       5 * time.Millisecond,
-		Executor: func(_ context.Context, _, container string, cmd []string, stdin io.Reader, stdout io.Writer) error {
-			calls = append(calls, container+":"+strings.Join(cmd, " "))
-			switch cmd[1] {
-			case "unpack-src":
-				b, _ := io.ReadAll(stdin)
-				if string(b) != "tgz-payload" {
-					return errors.New("unexpected snapshot stream")
-				}
-			case "prepare":
-				b, _ := io.ReadAll(stdin)
-				if bytes.Contains(b, []byte("jwt-secret-token")) {
-					leakedTokenInPrepare = true
-				}
-				tr := tar.NewReader(bytes.NewReader(b))
-				if hdr, err := tr.Next(); err != nil || hdr == nil {
-					return errors.New("empty inputs tar")
-				}
-			case "run":
-				b, _ := io.ReadAll(stdin)
-				// key: decoded credential field name; value: decoded value
-				var creds map[string]string
-				if err := json.Unmarshal(b, &creds); err != nil {
-					return err
-				}
-				sawTokenInHarnessStdin = creds["openai_api_key"] == "jwt-secret-token" && creds["openai_base_url"] == "http://10.96.0.42:8080/v1"
-			case "read-report":
-				_, err := stdout.Write(reportOut)
-				return err
-			}
-			return nil
-		},
 	})
 
-	// key: file path relative to /workspace/.review/in; value: raw file bytes
-	inputs := map[string][]byte{
-		"task.json":  taskBytes,
-		"diff.patch": []byte("diff --git a/a.go b/a.go\n"),
-	}
 	spec := contract.SandboxSpec{
 		ShortRunID:     "7f3a9c1e",
 		ShardIndex:     0,
@@ -192,118 +162,108 @@ func TestK8sSandboxRunnerFourStepExecAndCancellationCleanup(t *testing.T) {
 		Role:           "primary",
 		HarnessProfile: "openhands",
 		HarnessImage:   "ghcr.io/zetxqx/review-harness-openhands:1.0.0",
-		TarballPath:    tarPath,
-		Inputs:         inputs,
-		AdapterURL:     "http://10.96.0.42:8080/v1",
-		TaskToken:      "jwt-secret-token",
+		ControllerURL:  "http://localhost:8081",
+		TaskToken:      "opaque-secret-token",
 		TimeoutSeconds: 60,
 	}
 
-	report, err := runner.Run(context.Background(), spec)
-	if err != nil {
+	if err := runner.Run(context.Background(), spec); err != nil {
 		t.Fatalf("k8s runner run failed: %v", err)
 	}
-	if len(calls) != 4 || !sawTokenInHarnessStdin || leakedTokenInPrepare || len(report.Findings) != 1 {
-		t.Fatalf("unexpected execution state: calls=%v token=%v leaked=%v report=%+v", calls, sawTokenInHarnessStdin, leakedTokenInPrepare, report)
-	}
-	if _, err := cs.CoreV1().Pods("review-sandbox").Get(context.Background(), PodNameFor(spec), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected pod deleted after run, got err=%v", err)
+	if !patchedOwner {
+		t.Fatal("expected bootstrap secret OwnerReferences patched with Pod UID")
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancelRunner := NewK8sSandboxRunner(cs, nil, K8sConfig{
-		Namespace:          "review-sandbox",
-		WaitRunningTimeout: 5 * time.Second,
-		PollInterval:       5 * time.Millisecond,
-		Executor: func(ctx context.Context, _, _ string, cmd []string, _ io.Reader, _ io.Writer) error {
-			if cmd[1] == "run" {
-				cancel()
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return nil
-		},
-	})
-	if _, err := cancelRunner.Run(cancelCtx, spec); err == nil {
-		t.Fatal("expected cancellation error")
+	// key: bootstrap JSON field name; value: decoded value
+	var boot map[string]string
+	if err := json.Unmarshal(createdSecretData, &boot); err != nil {
+		t.Fatalf("unmarshal bootstrap secret: %v", err)
 	}
-	if _, err := cs.CoreV1().Pods("review-sandbox").Get(context.Background(), PodNameFor(spec), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected pod deleted via WithoutCancel even after ctx cancellation, got err=%v", err)
+	parsedURL, err := url.Parse(boot["controller_url"])
+	if err != nil || net.ParseIP(parsedURL.Hostname()) == nil || parsedURL.Port() != "8081" {
+		t.Fatalf("expected IP-resolved controller_url with port 8081 in secret, got %q", boot["controller_url"])
+	}
+	if boot["task_token"] != "opaque-secret-token" {
+		t.Fatalf("unexpected task_token in bootstrap secret: %+v", boot)
+	}
+
+	podName := PodNameFor(spec)
+	if _, err := cs.CoreV1().Pods("review-sandbox").Get(context.Background(), podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected pod deleted after run, got err=%v", err)
+	}
+	if _, err := cs.CoreV1().Secrets("review-sandbox").Get(context.Background(), podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected secret deleted after run, got err=%v", err)
 	}
 }
 
-func TestK8sSandboxRunnerGrantsKitFinalizeGraceBeyondWallClock(t *testing.T) {
+func TestK8sSandboxRunnerSurfacesPodFailureAndCleansUpOnCancel(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
-		p.Status.Phase = corev1.PodRunning
+		p.UID = types.UID("pod-uid-oom")
+		p.Status.Phase = corev1.PodFailed
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "sandbox",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 137,
+				Reason:   "OOMKilled",
+				Message:  "killed while carrying opaque-secret-token",
+			}},
+		}}
 		_ = cs.Tracker().Add(p)
 		return true, p, nil
 	})
 
-	tarPath := filepath.Join(t.TempDir(), "snap.tar.gz")
-	if err := os.WriteFile(tarPath, []byte("tgz-payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	taskBytes, err := protojson.Marshal(&reviewv1.AgentTask{
-		RunId:   "run-grace",
-		Harness: &reviewv1.HarnessRef{Profile: "openhands", Adapter: "openhands"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reportOut, err := protojson.Marshal(&reviewv1.ReviewReport{
-		Provenance: &reviewv1.Provenance{Status: reviewv1.ReportStatus_REPORT_STATUS_HARNESS_FAILED},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var kitBudget time.Duration
-	runner := NewK8sSandboxRunner(cs, nil, K8sConfig{
+	runner := NewK8sSandboxRunner(cs, K8sConfig{
 		Namespace:          "review-sandbox",
 		WaitRunningTimeout: 5 * time.Second,
 		PollInterval:       5 * time.Millisecond,
-		Executor: func(ctx context.Context, _, _ string, cmd []string, _ io.Reader, stdout io.Writer) error {
-			switch cmd[1] {
-			case "run":
-				deadline, ok := ctx.Deadline()
-				if !ok {
-					return errors.New("kit exec context has no deadline")
-				}
-				kitBudget = time.Until(deadline)
-			case "read-report":
-				_, err := stdout.Write(reportOut)
-				return err
-			}
-			return nil
-		},
 	})
-
-	const wallClock = 60 * time.Second
-	if _, err := runner.Run(context.Background(), contract.SandboxSpec{
-		ShortRunID:     "9b2d4f10",
+	spec := contract.SandboxSpec{
+		ShortRunID:     "oom001",
 		Role:           "primary",
 		HarnessProfile: "openhands",
-		TarballPath:    tarPath,
-		// key: file path relative to /workspace/.review/in; value: raw file bytes
-		Inputs: map[string][]byte{
-			"task.json":  taskBytes,
-			"diff.patch": []byte("diff --git a/a.go b/a.go\n"),
-		},
-		AdapterURL:     "http://10.96.0.42:8080/v1",
-		TaskToken:      "jwt-secret-token",
-		TimeoutSeconds: int(wallClock / time.Second),
-	}); err != nil {
-		t.Fatalf("k8s runner run failed: %v", err)
+		ControllerURL:  "http://10.96.0.42:8081",
+		TaskToken:      "opaque-secret-token",
+		TimeoutSeconds: 60,
 	}
-	if kitBudget <= wallClock || kitBudget > wallClock+kitFinalizeGrace {
-		t.Fatalf("kit exec budget = %v, want within (%v, %v]", kitBudget, wallClock, wallClock+kitFinalizeGrace)
+	err := runner.Run(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "OOMKilled") || strings.Contains(err.Error(), "opaque-secret-token") {
+		t.Fatalf("expected OOMKilled error with redacted token, got %v", err)
+	}
+
+	csCancel := fake.NewSimpleClientset()
+	csCancel.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
+		p.UID = types.UID("pod-uid-cancel")
+		p.Status.Phase = corev1.PodRunning
+		_ = csCancel.Tracker().Add(p)
+		return true, p, nil
+	})
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		cancel()
+	}()
+	cancelRunner := NewK8sSandboxRunner(csCancel, K8sConfig{
+		Namespace:          "review-sandbox",
+		WaitRunningTimeout: 5 * time.Second,
+		PollInterval:       5 * time.Millisecond,
+	})
+	if err := cancelRunner.Run(cancelCtx, spec); err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	podName := PodNameFor(spec)
+	if _, err := csCancel.CoreV1().Pods("review-sandbox").Get(context.Background(), podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected pod deleted via WithoutCancel after cancellation, got err=%v", err)
+	}
+	if _, err := csCancel.CoreV1().Secrets("review-sandbox").Get(context.Background(), podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected secret deleted via WithoutCancel after cancellation, got err=%v", err)
 	}
 }
 
-func TestBuildHardenedPodDefaultsLeaveRoomForPullPrepareAndFinalize(t *testing.T) {
-	pod := BuildHardenedPod("review-sbx-defaults", contract.SandboxSpec{
+func TestBuildHardenedPodDefaults(t *testing.T) {
+	pod := BuildHardenedPod("review-sbx-defaults", "review-sbx-defaults", contract.SandboxSpec{
 		ShortRunID:     "d3f4u17",
 		Role:           "primary",
 		HarnessProfile: "openhands",
@@ -313,92 +273,23 @@ func TestBuildHardenedPodDefaultsLeaveRoomForPullPrepareAndFinalize(t *testing.T
 	if got := ptr.Deref(pod.Spec.ActiveDeadlineSeconds, 0); got != 2400 {
 		t.Fatalf("expected activeDeadlineSeconds=2400 for an 1800 s wall clock, got %d", got)
 	}
-	// key: container name; value: CPU request, memory request, CPU limit, memory limit
-	want := map[string][4]string{
-		"loader":  {"50m", "128Mi", "1", "1Gi"},
-		"harness": {"500m", "1Gi", "2", "4Gi"},
+	if len(pod.Spec.Containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(pod.Spec.Containers))
 	}
-	for _, c := range pod.Spec.Containers {
-		w, ok := want[c.Name]
-		if !ok {
-			t.Fatalf("unexpected container %q", c.Name)
-		}
-		got := [4]string{
-			c.Resources.Requests.Cpu().String(),
-			c.Resources.Requests.Memory().String(),
-			c.Resources.Limits.Cpu().String(),
-			c.Resources.Limits.Memory().String(),
-		}
-		if got != w {
-			t.Fatalf("container %s resources (cpu req, mem req, cpu lim, mem lim) = %v, want %v", c.Name, got, w)
-		}
+	c := pod.Spec.Containers[0]
+	got := [4]string{
+		c.Resources.Requests.Cpu().String(),
+		c.Resources.Requests.Memory().String(),
+		c.Resources.Limits.Cpu().String(),
+		c.Resources.Limits.Memory().String(),
+	}
+	want := [4]string{"500m", "1Gi", "2", "4Gi"}
+	if got != want {
+		t.Fatalf("container %s resources (cpu req, mem req, cpu lim, mem lim) = %v, want %v", c.Name, got, want)
 	}
 }
 
-func TestK8sSandboxRunnerWaitsLongerForPodStartAndPrepare(t *testing.T) {
-	cs := fake.NewSimpleClientset()
-	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
-		p.Status.Phase = corev1.PodRunning
-		_ = cs.Tracker().Add(p)
-		return true, p, nil
-	})
-	tarPath := filepath.Join(t.TempDir(), "snap.tar.gz")
-	if err := os.WriteFile(tarPath, []byte("tgz-payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	taskBytes, err := protojson.Marshal(&reviewv1.AgentTask{RunId: "run-prepare"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reportOut, err := protojson.Marshal(&reviewv1.ReviewReport{
-		Provenance: &reviewv1.Provenance{Status: reviewv1.ReportStatus_REPORT_STATUS_OK},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var prepareBudget time.Duration
-	runner := NewK8sSandboxRunner(cs, nil, K8sConfig{
-		Namespace:    "review-sandbox",
-		PollInterval: 5 * time.Millisecond,
-		Executor: func(ctx context.Context, _, _ string, cmd []string, _ io.Reader, stdout io.Writer) error {
-			switch cmd[1] {
-			case "prepare":
-				deadline, ok := ctx.Deadline()
-				if !ok {
-					return errors.New("prepare exec context has no deadline")
-				}
-				prepareBudget = time.Until(deadline)
-			case "read-report":
-				_, err := stdout.Write(reportOut)
-				return err
-			}
-			return nil
-		},
-	})
-	if runner.cfg.WaitRunningTimeout != 300*time.Second {
-		t.Fatalf("expected a 300 s default wait for the sandbox pod to start, got %v", runner.cfg.WaitRunningTimeout)
-	}
-	if _, err := runner.Run(context.Background(), contract.SandboxSpec{
-		ShortRunID:     "5c0ffee1",
-		Role:           "primary",
-		HarnessProfile: "openhands",
-		TarballPath:    tarPath,
-		// key: file path relative to /workspace/.review/in; value: raw file bytes
-		Inputs:         map[string][]byte{"task.json": taskBytes, "diff.patch": []byte("diff --git a/a.go b/a.go\n")},
-		AdapterURL:     "http://10.96.0.42:8080/v1",
-		TaskToken:      "jwt-secret-token",
-		TimeoutSeconds: 60,
-	}); err != nil {
-		t.Fatalf("k8s runner run failed: %v", err)
-	}
-	if prepareBudget <= 80*time.Second || prepareBudget > 90*time.Second {
-		t.Fatalf("prepare exec budget = %v, want within (80s, 90s]", prepareBudget)
-	}
-}
-
-func TestOrphanPodReaper(t *testing.T) {
+func TestOrphanPodReaperSweepsPodsAndOrphanSecrets(t *testing.T) {
 	now := time.Now().UTC()
 	cs := fake.NewSimpleClientset(
 		&corev1.Pod{
@@ -433,6 +324,39 @@ func TestOrphanPodReaper(t *testing.T) {
 			Spec:   corev1.PodSpec{ActiveDeadlineSeconds: ptr.To(int64(900))},
 			Status: corev1.PodStatus{Phase: corev1.PodRunning},
 		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "active-running",
+				Namespace:         "review-sandbox",
+				CreationTimestamp: metav1.NewTime(now.Add(-2 * time.Minute)),
+				// key: Kubernetes Secret label name; value: label value
+				Labels: map[string]string{"app": "review-sandbox"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "v1", Kind: "Pod", Name: "active-running", UID: types.UID("u-active")},
+				},
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "orphan-owned-secret",
+				Namespace:         "review-sandbox",
+				CreationTimestamp: metav1.NewTime(now.Add(-1 * time.Minute)),
+				// key: Kubernetes Secret label name; value: label value
+				Labels: map[string]string{"app": "review-sandbox"},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "v1", Kind: "Pod", Name: "failed-expired", UID: types.UID("u-dead")},
+				},
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "orphan-unowned-old",
+				Namespace:         "review-sandbox",
+				CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute)),
+				// key: Kubernetes Secret label name; value: label value
+				Labels: map[string]string{"app": "review-sandbox"},
+			},
+		},
 	)
 
 	reaper := NewOrphanPodReaper(cs, "review-sandbox", 5*time.Minute)
@@ -442,11 +366,15 @@ func TestOrphanPodReaper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reap failed: %v", err)
 	}
-	if deleted != 2 {
-		t.Fatalf("expected 2 reaped pods, got %d", deleted)
+	if deleted != 4 {
+		t.Fatalf("expected 4 reaped resources (2 pods + 2 orphan secrets), got %d", deleted)
 	}
-	remaining, err := cs.CoreV1().Pods("review-sandbox").List(context.Background(), metav1.ListOptions{})
-	if err != nil || len(remaining.Items) != 1 || remaining.Items[0].Name != "active-running" {
-		t.Fatalf("expected only active-running left, got %+v err=%v", remaining.Items, err)
+	remainingPods, err := cs.CoreV1().Pods("review-sandbox").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(remainingPods.Items) != 1 || remainingPods.Items[0].Name != "active-running" {
+		t.Fatalf("expected only active-running pod left, got %+v err=%v", remainingPods.Items, err)
+	}
+	remainingSecrets, err := cs.CoreV1().Secrets("review-sandbox").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(remainingSecrets.Items) != 1 || remainingSecrets.Items[0].Name != "active-running" {
+		t.Fatalf("expected only active-running secret left, got %+v err=%v", remainingSecrets.Items, err)
 	}
 }

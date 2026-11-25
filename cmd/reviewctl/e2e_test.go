@@ -429,11 +429,7 @@ func TestDockerImageFlagOverridesProfileImageInSandboxSpec(t *testing.T) {
 		"#!/usr/bin/env bash",
 		"set -euo pipefail",
 		"echo \"$*\" >> " + seenImgFile,
-		"if [[ \"$*\" == *\"read-report\"* ]]; then",
-		"  echo '{\"summary\":\"ok\",\"findings\":[],\"provenance\":{\"profile\":\"single-shot\",\"normalizer\":\"NORMALIZER_PATH_DETERMINISTIC\",\"status\":\"REPORT_STATUS_OK\"}}'",
-		"else",
-		"  cat > /dev/null",
-		"fi",
+		"python3 -c 'import json, sys, urllib.request; cfg=json.load(sys.stdin); req=urllib.request.Request(cfg[\"controller_url\"]+\"/v1/sandbox/report\", data=b\"{\\\"summary\\\":\\\"ok\\\",\\\"findings\\\":[],\\\"provenance\\\":{\\\"profile\\\":\\\"single-shot\\\",\\\"normalizer\\\":\\\"NORMALIZER_PATH_DETERMINISTIC\\\",\\\"status\\\":\\\"REPORT_STATUS_OK\\\"}}\", headers={\"Authorization\":\"Bearer \"+cfg[\"task_token\"],\"Content-Type\":\"application/json\"}, method=\"POST\"); urllib.request.urlopen(req).read()'",
 	}, "\n")
 	if err := os.WriteFile(fakeDocker, []byte(script), 0o755); err != nil {
 		t.Fatal(err)

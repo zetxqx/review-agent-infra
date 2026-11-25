@@ -20,6 +20,15 @@ from review_harness_kit.adapters.mini_swe_agent import MiniSWEAgentAdapter
 from review_harness_kit.adapters.opencode import OpenCodeAdapter
 from review_harness_kit.adapters.openhands import OpenHandsAdapter
 from review_harness_kit.adapters.pr_agent import PRAgentAdapter
+from review_harness_kit.bootstrap import (
+    DEFAULT_BOOTSTRAP_PATH,
+    DEFAULT_WORKSPACE_DIR,
+    BootstrapConfig,
+    parse_bootstrap_payload,
+    prepare_bootstrapped_workspace,
+    read_bootstrap_file,
+    upload_report,
+)
 from review_harness_kit.contracts import (
     HarnessAdapter,
     HarnessInvocation,
@@ -59,6 +68,7 @@ def resolve_adapter(name: str) -> HarnessAdapter:
             return adapter_cls()
         raise
 
+
 DEFAULT_IN_DIR = Path("/workspace/.review/in")
 DEFAULT_OUT_DIR = Path("/workspace/.review/out")
 DEFAULT_SRC_DIR = Path("/workspace/src")
@@ -94,6 +104,8 @@ def normalize_base_url(raw_url: str) -> str:
 
 
 def parse_stdin_credentials(stdin: BinaryIO) -> dict[str, Any]:
+    if hasattr(stdin, "isatty") and stdin.isatty():
+        return {}
     raw_bytes = stdin.read()
     if not raw_bytes or not raw_bytes.strip():
         return {}
@@ -328,6 +340,8 @@ def run_harness(
 
 def parse_run_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="review-kit run")
+    parser.add_argument("--bootstrap", dest="bootstrap", default=None)
+    parser.add_argument("--workspace", dest="workspace", default=None)
     parser.add_argument("--task", "--task-file", dest="task", default=None)
     parser.add_argument("--in-dir", dest="in_dir", default=None)
     parser.add_argument("--out-dir", dest="out_dir", default=None)
@@ -336,38 +350,64 @@ def parse_run_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_bootstrap_config(
+    args: argparse.Namespace,
+    stdin: BinaryIO,
+) -> tuple[BootstrapConfig | None, dict[str, Any]]:
+    if args.bootstrap:
+        return read_bootstrap_file(Path(args.bootstrap)), {}
+
+    secret = parse_stdin_credentials(stdin)
+    from_stdin = parse_bootstrap_payload(secret)
+    if from_stdin is not None:
+        return from_stdin, secret
+
+    if not args.task and not args.in_dir and not secret and DEFAULT_BOOTSTRAP_PATH.is_file():
+        return read_bootstrap_file(DEFAULT_BOOTSTRAP_PATH), {}
+
+    return None, secret
+
+
 def run_command(stdin: BinaryIO, argv: list[str] | None = None) -> int:
     args = parse_run_args([] if argv is None else argv)
-    secret = parse_stdin_credentials(stdin)
+    bootstrap_cfg, secret = resolve_bootstrap_config(args, stdin)
 
-    raw_base_url = str(
-        secret.get("openai_base_url")
-        or secret.get("base_url")
-        or os.environ.get("OPENAI_BASE_URL")
-        or ""
-    )
-    api_key = str(
-        secret.get("openai_api_key")
-        or secret.get("api_key")
-        or os.environ.get("OPENAI_API_KEY")
-        or ""
-    )
-    base_url = normalize_base_url(raw_base_url)
-
-    task_file = resolve_task_file(args, secret)
-    task = json_format.Parse(
-        task_file.read_text(encoding="utf-8"),
-        review_pb2.AgentTask(),
-        ignore_unknown_fields=True,
-    )
-    apply_task_defaults(task, task_file, args)
+    if bootstrap_cfg is not None:
+        workspace_dir = Path(args.workspace or os.environ.get("REVIEW_WORKSPACE") or DEFAULT_WORKSPACE_DIR)
+        out_dir_hint = workspace_dir / ".review" / "out"
+        scratch_home = resolve_scratch_home(out_dir_hint, args, secret)
+        task_file, task = prepare_bootstrapped_workspace(bootstrap_cfg, workspace_dir, scratch_home)
+        base_url = normalize_base_url(bootstrap_cfg.controller_url)
+        api_key = bootstrap_cfg.task_token
+        out_dir = Path(task.out_dir)
+    else:
+        raw_base_url = str(
+            secret.get("openai_base_url")
+            or secret.get("base_url")
+            or os.environ.get("OPENAI_BASE_URL")
+            or ""
+        )
+        api_key = str(
+            secret.get("openai_api_key")
+            or secret.get("api_key")
+            or os.environ.get("OPENAI_API_KEY")
+            or ""
+        )
+        base_url = normalize_base_url(raw_base_url)
+        task_file = resolve_task_file(args, secret)
+        task = json_format.Parse(
+            task_file.read_text(encoding="utf-8"),
+            review_pb2.AgentTask(),
+            ignore_unknown_fields=True,
+        )
+        apply_task_defaults(task, task_file, args)
+        out_dir = Path(task.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        scratch_home = resolve_scratch_home(out_dir, args, secret)
 
     adapter_name = task.harness.adapter or task.harness.profile
     adapter = resolve_adapter(adapter_name)
 
-    out_dir = Path(task.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    scratch_home = resolve_scratch_home(out_dir, args, secret)
     schema_path = resolve_schema_path(args)
     rules_text = read_rules(Path(task.rules_dir), task_file.parent)
 
@@ -390,18 +430,16 @@ def run_command(stdin: BinaryIO, argv: list[str] | None = None) -> int:
         raw = RawOutput(kind="text", text="")
 
     report = normalize(adapter, raw, task, ctx, result)
-    write_report(report, out_dir / "report.json")
+    report_path = out_dir / "report.json"
+    write_report(report, report_path)
+    if bootstrap_cfg is not None:
+        upload_report(bootstrap_cfg, report_path)
     return 0
 
 
 def main(argv: list[str] | None = None) -> None:
     cli_args = sys.argv[1:] if argv is None else argv
     cmd = cli_args[0] if cli_args else ""
-    if cmd == "wait":
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-        signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-        while True:
-            signal.pause()
     if cmd == "run":
         sys.exit(run_command(sys.stdin.buffer, cli_args[1:]))
     raise SystemExit(f"unknown command: {cmd!r}")

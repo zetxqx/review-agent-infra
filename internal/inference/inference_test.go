@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,8 +16,6 @@ import (
 	"time"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
-	"github.com/zetxqx/review-agent-infra/internal/token"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func testClaims(jti string, maxReqs int32, maxTotal, reserve int64) *reviewv1.TaskClaims {
@@ -108,8 +108,120 @@ func TestSessionLedgerCountsRejectedHarnessRequests(t *testing.T) {
 	}
 }
 
+func TestProxyBundleOneTimeReadReportCapExpiryAndUnregister(t *testing.T) {
+	bundlePath := filepath.Join(t.TempDir(), "bundle.tar.gz")
+	if err := os.WriteFile(bundlePath, []byte("bundle-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	handler := NewProxyHandler(Config{
+		Upstream:       &VllmDirectUpstream{BaseURL: "http://127.0.0.1:1"},
+		MaxReportBytes: 64,
+		Now:            func() time.Time { return now },
+	})
+	srv := httptest.NewServer(handler.SandboxMux())
+	defer srv.Close()
+
+	claims := testClaims("jti-transfer", 5, 10000, 1000)
+	claims.Exp = now.Add(time.Minute).Unix()
+	tok, unregister, err := handler.RegisterSession(claims, bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tok) != 64 {
+		t.Fatalf("expected 64-char hex token, got %d", len(tok))
+	}
+
+	unauthReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/sandbox/bundle", nil)
+	unauthResp, err := http.DefaultClient.Do(unauthReq)
+	if err != nil || unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without bearer token, got %v %v", err, unauthResp)
+	}
+	unauthResp.Body.Close()
+
+	bReq1, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/sandbox/bundle", nil)
+	bReq1.Header.Set("Authorization", "Bearer "+tok)
+	bResp1, err := http.DefaultClient.Do(bReq1)
+	if err != nil || bResp1.StatusCode != http.StatusOK {
+		t.Fatalf("first bundle fetch failed: %v %v", err, bResp1)
+	}
+	gotBundle, _ := io.ReadAll(bResp1.Body)
+	bResp1.Body.Close()
+	if string(gotBundle) != "bundle-bytes" {
+		t.Fatalf("unexpected bundle bytes: %q", gotBundle)
+	}
+
+	bReq2, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/sandbox/bundle", nil)
+	bReq2.Header.Set("Authorization", "Bearer "+tok)
+	bResp2, err := http.DefaultClient.Do(bReq2)
+	if err != nil || bResp2.StatusCode != http.StatusGone {
+		t.Fatalf("second bundle fetch must return 410 Gone, got %v %v", err, bResp2)
+	}
+	bResp2.Body.Close()
+
+	bigReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/sandbox/report", strings.NewReader(strings.Repeat("x", 65)))
+	bigReq.Header.Set("Authorization", "Bearer "+tok)
+	bigResp, err := http.DefaultClient.Do(bigReq)
+	if err != nil || bigResp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize report must return 413, got %v %v", err, bigResp)
+	}
+	bigResp.Body.Close()
+
+	repReq1, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/sandbox/report", strings.NewReader(`{"summary":"first"}`))
+	repReq1.Header.Set("Authorization", "Bearer "+tok)
+	repResp1, err := http.DefaultClient.Do(repReq1)
+	if err != nil || repResp1.StatusCode != http.StatusOK {
+		t.Fatalf("first report upload failed: %v %v", err, repResp1)
+	}
+	repResp1.Body.Close()
+
+	repReq2, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/sandbox/report", strings.NewReader(`{"summary":"latest"}`))
+	repReq2.Header.Set("Authorization", "Bearer "+tok)
+	repResp2, err := http.DefaultClient.Do(repReq2)
+	if err != nil || repResp2.StatusCode != http.StatusOK {
+		t.Fatalf("second report upload failed: %v %v", err, repResp2)
+	}
+	repResp2.Body.Close()
+
+	now = now.Add(2 * time.Minute)
+	expReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/models", nil)
+	expReq.Header.Set("Authorization", "Bearer "+tok)
+	expResp, err := http.DefaultClient.Do(expReq)
+	if err != nil || expResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expired token must return 401, got %v %v", err, expResp)
+	}
+	expResp.Body.Close()
+
+	reportBytes, usage := handler.FinishSession(tok)
+	if string(reportBytes) != `{"summary":"latest"}` || usage == nil || usage.Jti != "jti-transfer" {
+		t.Fatalf("unexpected FinishSession result: report=%q usage=%+v", reportBytes, usage)
+	}
+
+	unregister()
+	if rep, u := handler.FinishSession(tok); rep != nil || u != nil {
+		t.Fatalf("expected nil after unregister, got rep=%q usage=%+v", rep, u)
+	}
+
+	staleClaims := testClaims("jti-stale", 5, 10000, 1000)
+	staleClaims.Exp = now.Add(-time.Second).Unix()
+	staleTok, _, err := handler.RegisterSession(staleClaims, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshClaims := testClaims("jti-fresh", 5, 10000, 1000)
+	freshClaims.Exp = now.Add(time.Minute).Unix()
+	_, freshUnreg, err := handler.RegisterSession(freshClaims, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer freshUnreg()
+	if handler.lookupSession(staleTok) != nil {
+		t.Fatal("expected RegisterSession to opportunistically sweep expired sessions")
+	}
+}
+
 func TestProxyReportsRejectedHarnessRequestsInUsage(t *testing.T) {
-	key := []byte("rejected-usage-secret")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
@@ -117,20 +229,18 @@ func TestProxyReportsRejectedHarnessRequestsInUsage(t *testing.T) {
 	defer upstream.Close()
 
 	handler := NewProxyHandler(Config{
-		TokenKey:      key,
 		Upstream:      &VllmDirectUpstream{BaseURL: upstream.URL},
 		UpstreamModel: "m",
 	})
 	sandboxSrv := httptest.NewServer(handler.SandboxMux())
 	defer sandboxSrv.Close()
-	internalSrv := httptest.NewServer(handler.InternalMux())
-	defer internalSrv.Close()
 
 	claims := testClaims("jti-rejected-usage", 1, 100000, 1000)
-	tok, err := token.Mint(key, claims)
+	tok, unregister, err := handler.RegisterSession(claims, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unregister()
 
 	wantStatuses := []int{http.StatusOK, http.StatusForbidden, http.StatusForbidden}
 	for i, want := range wantStatuses {
@@ -147,23 +257,13 @@ func TestProxyReportsRejectedHarnessRequestsInUsage(t *testing.T) {
 		}
 	}
 
-	usageResp, err := http.Get(internalSrv.URL + "/internal/usage/jti-rejected-usage")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rawUsage, _ := io.ReadAll(usageResp.Body)
-	usageResp.Body.Close()
-	var usage reviewv1.SandboxUsage
-	if err := protojson.Unmarshal(rawUsage, &usage); err != nil {
-		t.Fatalf("decode usage: %v\n%s", err, rawUsage)
-	}
+	_, usage := handler.FinishSession(tok)
 	if usage.GetRequests() != 1 || usage.GetRejectedRequests() != 2 {
-		t.Fatalf("expected requests=1 rejected_requests=2, got %s", rawUsage)
+		t.Fatalf("expected requests=1 rejected_requests=2, got %+v", usage)
 	}
 }
 
 func TestProxyChatNonStreamAndStreamHidesUnrequestedUsageChunk(t *testing.T) {
-	key := []byte("proxy-secret")
 	var mu sync.Mutex
 	var seenHeaders []http.Header
 	// key: parsed upstream request JSON field name; value: decoded JSON value
@@ -202,7 +302,6 @@ func TestProxyChatNonStreamAndStreamHidesUnrequestedUsageChunk(t *testing.T) {
 	defer upstream.Close()
 
 	handler := NewProxyHandler(Config{
-		TokenKey:      key,
 		Upstream:      &LlmdGatewayUpstream{BaseURL: upstream.URL, Objective: "code-review-batch"},
 		UpstreamModel: "qwen3-coder-30b",
 		ModelAlias:    "review-coder",
@@ -211,14 +310,13 @@ func TestProxyChatNonStreamAndStreamHidesUnrequestedUsageChunk(t *testing.T) {
 	})
 	sandboxSrv := httptest.NewServer(handler.SandboxMux())
 	defer sandboxSrv.Close()
-	internalSrv := httptest.NewServer(handler.InternalMux())
-	defer internalSrv.Close()
 
 	claims := testClaims("jti-stream-1", 10, 50000, 5000)
-	tok, err := token.Mint(key, claims)
+	tok, unregister, err := handler.RegisterSession(claims, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unregister()
 
 	modelReq, _ := http.NewRequest(http.MethodGet, sandboxSrv.URL+"/v1/models", nil)
 	modelReq.Header.Set("Authorization", "Bearer "+tok)
@@ -291,23 +389,13 @@ func TestProxyChatNonStreamAndStreamHidesUnrequestedUsageChunk(t *testing.T) {
 		t.Fatalf("responses sanitization failed: %+v", seenBodies[2])
 	}
 
-	uResp, err := http.Get(internalSrv.URL + "/internal/usage/" + claims.Jti)
-	if err != nil || uResp.StatusCode != http.StatusOK {
-		t.Fatalf("usage endpoint failed: %v %v", err, uResp)
-	}
-	uBytes, _ := io.ReadAll(uResp.Body)
-	uResp.Body.Close()
-	var usage reviewv1.SandboxUsage
-	if err := protojson.Unmarshal(uBytes, &usage); err != nil {
-		t.Fatalf("decode SandboxUsage failed: %v", err)
-	}
+	_, usage := handler.FinishSession(tok)
 	if usage.Requests != 3 || usage.PromptTokens != 210 || usage.CachedTokens != 160 || usage.CompletionTokens != 55 {
-		t.Fatalf("unexpected usage summary: %+v", &usage)
+		t.Fatalf("unexpected usage summary: %+v", usage)
 	}
 }
 
 func TestProxyRetries429And503AndEnforces403BudgetCutoff(t *testing.T) {
-	key := []byte("retry-secret")
 	var attempts atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := attempts.Add(1)
@@ -325,7 +413,6 @@ func TestProxyRetries429And503AndEnforces403BudgetCutoff(t *testing.T) {
 	defer upstream.Close()
 
 	handler := NewProxyHandler(Config{
-		TokenKey:      key,
 		Upstream:      &VllmDirectUpstream{BaseURL: upstream.URL},
 		UpstreamModel: "m",
 		BaseRetryWait: time.Millisecond,
@@ -335,10 +422,11 @@ func TestProxyRetries429And503AndEnforces403BudgetCutoff(t *testing.T) {
 	defer srv.Close()
 
 	claims := testClaims("jti-budget", 10, 900, 200)
-	tok, err := token.Mint(key, claims)
+	tok, unregister, err := handler.RegisterSession(claims, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unregister()
 
 	req1, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
 	req1.Header.Set("Authorization", "Bearer "+tok)
@@ -377,7 +465,11 @@ func TestProxyRetries429And503AndEnforces403BudgetCutoff(t *testing.T) {
 	}
 
 	normClaims := testClaims("jti-norm-cap", 50, 50000, 1000)
-	normTok, _ := token.Mint(key, normClaims)
+	normTok, normUnreg, err := handler.RegisterSession(normClaims, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer normUnreg()
 	for i := range 3 {
 		r, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
 		r.Header.Set("Authorization", "Bearer "+normTok)
@@ -397,8 +489,7 @@ func TestProxyRetries429And503AndEnforces403BudgetCutoff(t *testing.T) {
 	}
 }
 
-func TestProxySSEIncludeUsageCutStreamSweepAndMetrics(t *testing.T) {
-	key := []byte("stream-cut-key")
+func TestProxySSEIncludeUsageCutStreamAndSweep(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		if bytes.Contains(raw, []byte("cut_me")) {
@@ -424,17 +515,14 @@ func TestProxySSEIncludeUsageCutStreamSweepAndMetrics(t *testing.T) {
 	defer upstream.Close()
 
 	handler := NewProxyHandler(Config{
-		TokenKey:      key,
 		Upstream:      &VllmDirectUpstream{BaseURL: upstream.URL},
 		UpstreamModel: "m",
 	})
 	sandboxSrv := httptest.NewServer(handler.SandboxMux())
 	defer sandboxSrv.Close()
-	internalSrv := httptest.NewServer(handler.InternalMux())
-	defer internalSrv.Close()
 
 	claims := testClaims("jti-cut", 10, 50000, 1000)
-	tok, err := token.Mint(key, claims)
+	tok, _, err := handler.RegisterSession(claims, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,26 +548,16 @@ func TestProxySSEIncludeUsageCutStreamSweepAndMetrics(t *testing.T) {
 	_, _ = io.ReadAll(respCut.Body)
 	respCut.Body.Close()
 
-	ledger, ok := handler.Ledgers().Get(claims.Jti)
-	if !ok {
-		t.Fatal("expected ledger entry")
+	sess := handler.lookupSession(tok)
+	if sess == nil {
+		t.Fatal("expected active session")
 	}
-	if ledger.committed.Load() <= 80 {
-		t.Fatalf("expected cut stream to retain conservative estimate charge above 80, got %d", ledger.committed.Load())
-	}
-
-	mResp, err := http.Get(internalSrv.URL + "/metrics")
-	if err != nil || mResp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /metrics failed: %v %v", err, mResp)
-	}
-	metricsBody, _ := io.ReadAll(mResp.Body)
-	mResp.Body.Close()
-	if !strings.Contains(string(metricsBody), "review_adapter_requests_total 2") {
-		t.Fatalf("unexpected /metrics output:\n%s", metricsBody)
+	if sess.ledger.committed.Load() <= 80 {
+		t.Fatalf("expected cut stream to retain conservative estimate charge above 80, got %d", sess.ledger.committed.Load())
 	}
 
-	if swept := handler.Ledgers().SweepExpired(claims.Exp + 1); swept != 1 {
-		t.Fatalf("expected 1 swept ledger, got %d", swept)
+	if swept := handler.SweepExpired(claims.Exp + 1); swept != 1 {
+		t.Fatalf("expected 1 swept session, got %d", swept)
 	}
 }
 
@@ -517,7 +595,6 @@ func TestSessionLedgerCachedTokensExcludedFromBudgetAndNonNegative(t *testing.T)
 }
 
 func TestProxyUncachedBudgetForChatAndResponses(t *testing.T) {
-	key := []byte("uncached-secret")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		isStream := bytes.Contains(raw, []byte(`"stream":true`))
@@ -546,21 +623,19 @@ func TestProxyUncachedBudgetForChatAndResponses(t *testing.T) {
 	defer upstream.Close()
 
 	handler := NewProxyHandler(Config{
-		TokenKey:      key,
 		Upstream:      &VllmDirectUpstream{BaseURL: upstream.URL},
 		UpstreamModel: "m",
 	})
 	sandboxSrv := httptest.NewServer(handler.SandboxMux())
 	defer sandboxSrv.Close()
-	internalSrv := httptest.NewServer(handler.InternalMux())
-	defer internalSrv.Close()
 
 	claims := testClaims("jti-mixed-cache", 20, 1000, 200)
 	claims.MaxOutputTokens = 100
-	tok, err := token.Mint(key, claims)
+	tok, unregister, err := handler.RegisterSession(claims, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unregister()
 
 	calls := []struct {
 		path   string
@@ -608,17 +683,8 @@ func TestProxyUncachedBudgetForChatAndResponses(t *testing.T) {
 		}
 	}
 
-	usageResp, err := http.Get(internalSrv.URL + "/internal/usage/" + claims.Jti)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer usageResp.Body.Close()
-	usageBytes, _ := io.ReadAll(usageResp.Body)
-	var usagePB reviewv1.SandboxUsage
-	if err := protojson.Unmarshal(usageBytes, &usagePB); err != nil {
-		t.Fatal(err)
-	}
+	_, usagePB := handler.FinishSession(tok)
 	if usagePB.PromptTokens != 3500 || usagePB.CachedTokens != 3150 || usagePB.CompletionTokens != 350 {
-		t.Fatalf("expected raw prompt/cached/completion totals (3500/3150/350), got %+v", &usagePB)
+		t.Fatalf("expected raw prompt/cached/completion totals (3500/3150/350), got %+v", usagePB)
 	}
 }

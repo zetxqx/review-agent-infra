@@ -5,24 +5,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
 )
 
-const DefaultSandboxImage = "review-agent-infra/poc-sandbox:local"
+const (
+	DefaultSandboxImage = "review-agent-infra/poc-sandbox:local"
+	sandboxContainerUID = 65532
+	sandboxContainerGID = 65532
+)
 
 var _ contract.SandboxRunner = (*DockerRunner)(nil)
 
 type DockerRunner struct {
-	DockerBin     string
-	DefaultImage  string
-	Network       string
-	ExtraRunArgs  []string
-	WorkParentDir string
+	DockerBin    string
+	DefaultImage string
+	Network      string
+	ExtraRunArgs []string
 }
 
 func NewDockerRunner(defaultImage, network string) *DockerRunner {
@@ -33,7 +33,7 @@ func NewDockerRunner(defaultImage, network string) *DockerRunner {
 	}
 }
 
-func (r *DockerRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+func (r *DockerRunner) Run(ctx context.Context, spec contract.SandboxSpec) error {
 	dockerBin := r.DockerBin
 	if dockerBin == "" {
 		dockerBin = "docker"
@@ -53,122 +53,40 @@ func (r *DockerRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*rev
 	if timeoutSec <= 0 {
 		timeoutSec = 300
 	}
-	userSpec := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	userSpec := fmt.Sprintf("%d:%d", sandboxContainerUID, sandboxContainerGID)
 
 	kitTimeout := kitExecTimeout(timeoutSec)
-	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+90*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+60*time.Second)
 	defer cancel()
 
-	workRoot, err := os.MkdirTemp(r.WorkParentDir, "review-docker-sbx-*")
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		restoreWritableRecursive(workRoot)
-		_ = os.RemoveAll(workRoot)
-	}()
-
-	srcDir := filepath.Join(workRoot, "src")
-	inDir := filepath.Join(workRoot, "in")
-	outDir := filepath.Join(workRoot, "out")
-	scratchDir := filepath.Join(workRoot, "scratch")
-	for _, d := range []string{srcDir, inDir, outDir, scratchDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, err
-		}
-	}
-
-	snapFile, err := os.Open(spec.TarballPath)
-	if err != nil {
-		return nil, fmt.Errorf("open snapshot tarball: %w", err)
-	}
-	unpackArgs := []string{
-		"run", "--rm", "-i",
-		"--user", userSpec,
-		"--network=none",
-		"--cap-drop=ALL",
-		"--security-opt=no-new-privileges",
-		"-v", srcDir + ":/workspace/src:rw",
-		"--entrypoint", "/usr/local/bin/loader",
-		image, "unpack-src",
-	}
-	unpackErr := runExec(runCtx, "", dockerBin, unpackArgs, snapFile, nil, 90*time.Second)
-	_ = snapFile.Close()
-	if unpackErr != nil {
-		return nil, fmt.Errorf("docker loader unpack-src: %w", unpackErr)
-	}
-
-	containerInputs, err := rewriteTaskPaths(spec.Inputs, "/workspace/src", "/workspace/.review/in", "/workspace/.review/out")
-	if err != nil {
-		return nil, err
-	}
-	inputsTar, err := buildInputsTar(containerInputs)
-	if err != nil {
-		return nil, err
-	}
-	prepareArgs := []string{
-		"run", "--rm", "-i",
-		"--user", userSpec,
-		"--network=none",
-		"--cap-drop=ALL",
-		"--security-opt=no-new-privileges",
-		"-v", srcDir + ":/workspace/src:rw",
-		"-v", inDir + ":/workspace/.review/in:rw",
-		"--entrypoint", "/usr/local/bin/loader",
-		image, "prepare",
-	}
-	if err := runExec(runCtx, "", dockerBin, prepareArgs, bytes.NewReader(inputsTar), nil, 45*time.Second); err != nil {
-		return nil, fmt.Errorf("docker loader prepare: %w", err)
-	}
-
-	// key: stdin credential JSON field name; value: adapter base URL or ephemeral JWT task token
-	credsPayload, err := json.Marshal(map[string]string{
-		"openai_base_url": spec.AdapterURL,
-		"openai_api_key":  spec.TaskToken,
+	// key: stdin bootstrap JSON field name; value: controller sandbox URL or opaque task token
+	bootstrapPayload, err := json.Marshal(map[string]string{
+		"controller_url": spec.ControllerURL,
+		"task_token":     spec.TaskToken,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	harnessArgs := []string{
+	args := []string{
 		"run", "--rm", "-i",
 		"--user", userSpec,
 		"--read-only",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,mode=1777",
+		"--tmpfs", fmt.Sprintf("/workspace:rw,noexec,nosuid,nodev,size=2g,uid=%d,gid=%d", sandboxContainerUID, sandboxContainerGID),
+		"--tmpfs", fmt.Sprintf("/scratch:rw,exec,nosuid,nodev,size=2g,uid=%d,gid=%d", sandboxContainerUID, sandboxContainerGID),
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=512m,mode=1777",
 		"--cap-drop=ALL",
 		"--security-opt=no-new-privileges",
 		"--network", netMode,
 	}
 	if netMode != "host" {
-		harnessArgs = append(harnessArgs, "--dns", "127.0.0.1")
+		args = append(args, "--dns", "127.0.0.1")
 	}
-	harnessArgs = append(
-		harnessArgs,
-		"-v", srcDir+":/workspace/src:ro",
-		"-v", inDir+":/workspace/.review/in:ro",
-		"-v", outDir+":/workspace/.review/out:rw",
-		"-v", scratchDir+":/scratch/home:rw",
-	)
-	harnessArgs = append(harnessArgs, r.ExtraRunArgs...)
-	harnessArgs = append(harnessArgs, image, "review-kit", "run", "--scratch-dir", "/scratch/home")
+	args = append(args, r.ExtraRunArgs...)
+	args = append(args, image, "review-kit", "run")
 
-	if err := runExec(runCtx, "", dockerBin, harnessArgs, bytes.NewReader(credsPayload), nil, kitTimeout); err != nil {
-		return nil, fmt.Errorf("docker harness run: %w", err)
+	if err := runExec(runCtx, "", dockerBin, args, bytes.NewReader(bootstrapPayload), nil, kitTimeout, spec.TaskToken); err != nil {
+		return fmt.Errorf("docker harness run: %w", err)
 	}
-
-	reportOut := &cappedBuffer{max: maxReportReadBytes}
-	readArgs := []string{
-		"run", "--rm",
-		"--user", userSpec,
-		"--network=none",
-		"--cap-drop=ALL",
-		"--security-opt=no-new-privileges",
-		"-v", outDir + ":/workspace/.review/out:ro",
-		"--entrypoint", "/usr/local/bin/loader",
-		image, "read-report",
-	}
-	if err := runExec(runCtx, "", dockerBin, readArgs, nil, reportOut, 20*time.Second); err != nil {
-		return nil, fmt.Errorf("docker loader read-report: %w", err)
-	}
-	return decodeAndValidateReport(reportOut.Bytes())
+	return nil
 }

@@ -2,24 +2,24 @@
 
 ## 1. Purpose, Core Principles, and Explicit Non-Goals
 
-We are building a **100% self-hosted, end-to-end pluggable** automated code review platform for `llm-d` community and internal repositories (Go, Kubernetes CRDs/Helm, Python). It runs completely on self-managed infrastructure with **zero dependency on closed-source SaaS review services or external model APIs**, and can route its own multi-turn review traffic through a self-hosted `llm-d` cluster (dogfooding KV prefix caching and Flow Control batch priority).
+We are building a **100% self-hosted, stateless, end-to-end pluggable** automated code review platform for `llm-d` community and internal repositories (Go, Kubernetes CRDs/Helm, Python). It runs completely on self-managed infrastructure with **zero dependency on closed-source SaaS review services, external model APIs, or external databases**, and routes its own multi-turn review traffic through a self-hosted `llm-d` cluster (dogfooding KV prefix caching and Flow Control batch priority).
 
-The platform uses a clean split across three technology layers:
+The platform consolidates into **three build artifacts** across three technology layers:
 
 * **Protobuf (`proto/review/v1/review.proto`)** is the single source of truth for every cross-boundary message, generating Go bindings, Python bindings, and the LLM output JSON Schema from one definition.
-* **Go (`cmd/controller`, `cmd/adapter`, `cmd/loader`, `cmd/reviewctl`)** runs all performance-sensitive, concurrent, network-facing, PostgreSQL, Kubernetes `client-go`, and filesystem-hardening infrastructure.
-* **Python (`python/review-harness-kit`)** stays strictly inside the sandbox container to wrap **existing open-source coding harnesses** (`OpenHands`, `PR-Agent`, `Codex CLI`, `mini-SWE-agent`, `OpenCode`, `Goose`, `Aider`) unmodified and turn their output into a unified `ReviewReport`.
+* **Go (`bin/controller` and `bin/reviewctl`)** runs all performance-sensitive, concurrent, network-facing, host-side archive sanitization, embedded `:8081` streaming proxy, Kubernetes `client-go`, and publishing infrastructure.
+* **Python (`review-kit` from `python/review-harness-kit`)** stays strictly inside the disposable sandbox container to bootstrap the workspace, wrap **existing open-source coding harnesses** (`OpenHands`, `PR-Agent`, `Codex CLI`, `mini-SWE-agent`, `OpenCode`, `Goose`, `Aider`) unmodified, normalize output into a unified `ReviewReport`, and upload it back to the controller.
 
 ### Four Core Principles
 
-1. **Strict Security Isolation**: Open-source repositories accept external fork PRs where source files, build scripts, and PR descriptions are untrusted. Harnesses run inside a **secret-less, DNS-disabled, gVisor-isolated disposable Pod** whose source volume is mounted read-only, while GitHub keys, PostgreSQL credentials, and inference credentials never enter the Pod.
+1. **Strict Security Isolation**: Open-source repositories accept external fork PRs where source files, build scripts, and PR descriptions are untrusted. Host-side `internal/loader` sanitizes archives and strips untrusted instruction files before the sandbox ever sees them. Harnesses run inside a **DNS-disabled, gVisor-isolated, 1-container disposable Pod** with `ReadOnlyRootFilesystem: true`, dropped Linux capabilities, zero `pods/exec` RBAC, and `chmod a-w` read-only source trees; GitHub App keys and upstream model credentials never enter the Pod.
 2. **Use Existing Harnesses, Not a Custom Loop**: There is no custom review agent loop in this codebase. Each supported harness sits behind a thin 3-method adapter (`prepare` / `collect` / `extract`) plus a shared Output Normalizer, so comparing or switching harnesses is a config change.
-3. **High-Signal Output Only**: Schema validation, confidence gating, verbatim diff-line alignment, nearby clustering, cross-round PostgreSQL deduplication, and Markdown scrubbing run deterministically in the Go control plane—never inside the harness.
-4. **Native Fit for `llm-d` Serving**: Append-only multi-turn harnesses preserve stable prompt prefixes, while the Go `Inference Adapter` injects `x-session-id`, `x-parent-session-id`, fairness ID, and batch priority headers so `llm-d` EPP pins turns to warm KV-cache replicas and yields queue capacity to live traffic.
+3. **High-Signal Output Only & Stateless Operation**: Schema validation, confidence gating, verbatim diff-line alignment, nearby clustering, cross-commit deduplication via hidden GitHub PR review markers (`<!-- review-run: <id> sha: <sha> fps: <fp1,fp2,...> -->`), and Markdown scrubbing run deterministically in the Go control plane without requiring PostgreSQL.
+4. **Native Fit for `llm-d` Serving**: Append-only multi-turn harnesses preserve stable prompt prefixes, while the controller's embedded `:8081` proxy injects `x-session-id`, `x-parent-session-id`, fairness ID, and batch priority headers so `llm-d` EPP pins turns to warm KV-cache replicas and yields queue capacity to live traffic.
 
 ### Explicit Scope and Non-Goals
 
-* **No full builds or heavy test suites in Phase 1**: Compilation and integration suites stay in CI. Optional plugin interfaces reserve **CI failure log ingestion (`CheckLogFetcher.FetchCheckLogs`)** and **isolated unit test reproduction (`run_scoped_test`)**, which runs in a separate air-gapped (`egress: DenyAll`) child sandbox Pod when enabled.
+* **No full builds or heavy test suites in the review sandbox**: Compilation and integration suites stay in CI. Optional `CheckLogFetcher.FetchCheckLogs` supplies truncated CI failure logs directly into `/workspace/.review/in/ci_failure.log`.
 * **No code edits or commits pushed**: The agent inspects read-only snapshots and never modifies developer branches.
 * **No merge-gate blocking**: Reviews publish strictly as `COMMENT` events, never `APPROVE` or `REQUEST_CHANGES`.
 
@@ -27,7 +27,7 @@ The platform uses a clean split across three technology layers:
 
 ## 2. System Architecture, Trust Boundaries, and Protobuf Contract Spine
 
-The platform divides into four trust zones. Inside the sandbox Pod, **two containers** separate trusted Go workspace preparation (`loader`, read-write) from untrusted third-party harness execution (`harness`, read-only source). The Go `Inference Adapter` sits outside the sandbox as the default sole egress target.
+The platform divides into four trust zones. The single `bin/controller` Deployment hosts both the public webhook endpoint (`:8080`) and the internal sandbox API (`:8081`: one-time bundle download, report upload, and streaming OpenAI proxy). Each review shard launches a single-container gVisor Pod in `review-sandbox` whose sole allowed egress is TCP `:8081` to `review-controller`.
 
 ```mermaid
 flowchart TB
@@ -36,59 +36,55 @@ flowchart TB
         GitHost["Git Hosting Platform (GitHub / GitLab)"]
     end
 
-    subgraph SG_CTRL ["2. Trusted Go Control Plane (Holds GitHub App Key and PG Store)"]
+    subgraph SG_CTRL ["2. Trusted Stateless Go Control Plane (ns: review-system)"]
         VCS["Go VCS Trigger and Publisher Plugin"]
-        Orch["Go Orchestrator, pgx SKIP LOCKED Queue, Denoiser"]
-        Obs["Observability and Scorecard (Prometheus / OTel / PG)"]
+        Orch["Go Orchestrator, InMemoryStore Queue, Host Bundle Builder, Denoiser"]
+        Proxy["Embedded :8081 Proxy (Bundle, Report, Atomic CAS Ledger, SSE Relay)"]
+        Obs["Observability (Prometheus /metrics + Structured Logs)"]
     end
 
-    subgraph SG_SANDBOX ["3. Isolated 2-Container gVisor Pod (No DNS, Default Egress Adapter Only)"]
-        Loader["Go Static cmd/loader (RW Mounts, os.OpenRoot, No Token)"]
-        Workspace["Pod emptyDir (/workspace/src, base+pr Git Repo, Masked Instructions)"]
-        Harness["Python review-harness-kit + Unmodified Harness CLI (RO Source, Token in RAM)"]
+    subgraph SG_SANDBOX ["3. Isolated 1-Container gVisor Pod (ns: review-sandbox, No DNS)"]
+        Secret["Pod-Scoped 0400 Secret (controller_url + opaque task_token)"]
+        Kit["Python review-kit + Unmodified Harness CLI (RO rootfs, chmod a-w /workspace/src)"]
         Norm["Python Normalizer (Deterministic extract or 1-Shot Schema Call)"]
     end
 
-    subgraph SG_INFER ["4. Trusted Go Inference Adapter and Self-Hosted Serving (Holds Model Keys)"]
-        Infer["Go cmd/adapter (JWT, Atomic CAS Ledger, SSE Relay, UpstreamProvider)"]
+    subgraph SG_INFER ["4. Self-Hosted Model Serving"]
         LLMD["Self-Hosted llm-d Cluster (Envoy + EPP + vLLM)"]
         LocalLLM["Fallback Self-Hosted Endpoint (vLLM Direct / SGLang / Ollama)"]
     end
 
     Dev -->|"Open PR / Push Commit"| GitHost
-    GitHost -->|"Signed Webhook Event"| VCS
+    GitHost -->|"Signed Webhook Event (:8080)"| VCS
     Dev -.->|"Local CLI Trigger"| VCS
     VCS -->|"reviewv1.ReviewEvent"| Orch
-    Orch -->|"Exec 1a/1b: Snapshot tar.gz + Inputs tar (Native EOF)"| Loader
-    Loader --- Workspace
-    Orch -->|"Exec 2: Task Token Over Stdin -> Entrypoint -> Unmodified CLI"| Harness
-    Harness --- Workspace
-    Harness -->|"Raw Output (JSON / YAML / Markdown)"| Norm
-    Norm -->|"Write report.json (protojson)"| Workspace
-    Loader -->|"Exec 3: Read report.json (O_NOFOLLOW, 2 MiB Cap)"| Orch
-    Harness -->|"OpenAI /v1/chat or /v1/responses + Bearer Task Token"| Infer
-    Norm -.->|"Optional 1-Shot Schema Call"| Infer
-    Infer -->|"Verify JWT, Atomic Budget, Inject Routing Headers"| LLMD
-    Infer -.->|"Config Switch"| LocalLLM
-    Orch -->|"Align Lines, PG Dedup, Scrub Markdown"| VCS
-    VCS -->|"Atomic Review COMMENT"| GitHost
-    Infer -.->|"Tokens, cached_tokens, TTFB per Harness"| Obs
+    Orch -->|"Create Secret + 1-Container Pod (No pods/exec)"| Kit
+    Secret --> Kit
+    Kit -->|"GET /v1/sandbox/bundle (One-Time, Bearer Token)"| Proxy
+    Kit -->|"POST /v1/chat/completions or /v1/responses"| Proxy
+    Kit -->|"Raw Output"| Norm
+    Norm -.->|"Optional 1-Shot Schema Call"| Proxy
+    Norm -->|"POST /v1/sandbox/report (2 MiB Cap)"| Proxy
+    Proxy -->|"Verify Opaque Token, Atomic Budget, Inject Routing Headers"| LLMD
+    Proxy -.->|"Config Switch"| LocalLLM
+    Orch -->|"Read FinishSession, Align Lines, PR Marker Dedup, Scrub Markdown"| VCS
+    VCS -->|"Atomic Review COMMENT With Hidden fps Marker"| GitHost
+    Proxy -.->|"Tokens, cached_tokens per Harness"| Obs
     Orch -.->|"Latency and Outcome per Harness"| Obs
-    VCS -.->|"Poll Reactions and Follow-up Fixes"| Obs
 ```
 
 ### Protobuf as the Single Source of Truth (`proto/review/v1/review.proto`)
 
-Instead of maintaining duplicate Pydantic classes in Python and Go structs by hand, one `.proto` schema drives every wire, file, token, and LLM output contract across languages:
+Instead of maintaining duplicate Pydantic classes in Python and Go structs by hand, one `.proto` schema drives every wire, file, session-policy, and LLM output contract across languages:
 
 ```mermaid
 flowchart LR
-    Proto["proto/review/v1/review.proto"] -->|"buf generate"| GoGen["gen/go/review/v1 (Go Structs + protojson)"]
-    Proto -->|"buf generate"| PyGen["python/.../gen/review/v1 (Python Classes + .pyi + json_format)"]
-    Proto -->|"cmd/schemagen (protoreflect)"| Schema["gen/schema/llm_review_report.schema.json"]
+    Proto["proto/review/v1/review.proto"] -->|"make proto"| GoGen["gen/go/review/v1 (Go Structs + protojson)"]
+    Proto -->|"make proto"| PyGen["python/.../gen/review/v1 (Python Classes + json_format)"]
+    Proto -->|"make schema (go run ./cmd/schemagen)"| Schema["gen/schema/llm_review_report.schema.json"]
 
-    GoGen --> GoBins["Go cmd/controller, cmd/adapter, cmd/loader, cmd/reviewctl"]
-    PyGen --> PyKit["Python review-harness-kit (Entrypoint, Adapters, Normalizer)"]
+    GoGen --> GoBins["Go bin/controller and bin/reviewctl"]
+    PyGen --> PyKit["Python review-kit (Bootstrap, Entrypoint, Adapters, Normalizer)"]
     Schema -->|"1-Shot response_format & codex --output-schema"| PyKit
 
     GoBins <-->|"Canonical protojson (task.json, report.json)"| PyKit
@@ -99,25 +95,24 @@ flowchart LR
 
 ### Why Split Go Infrastructure vs. Python In-Sandbox Harness Kit?
 
-1. **Off-the-shelf harnesses live in Python/CLI land, while core infrastructure shines in Go**: Orchestrating Kubernetes Exec streams, PostgreSQL connection pools, concurrent PR sharding, and streaming HTTP proxies with strict memory bounds is simpler, faster, and smaller in Go. Meanwhile `PR-Agent`, `OpenHands`, `mini-SWE-agent`, and `Aider` are native Python packages or Node/Rust CLIs best wrapped by a small Python kit inside their own container image.
-2. **Native Kubernetes `client-go` Exec EOF without custom stdin framing**: Python's official `kubernetes` WebSocket client fails to close Exec stdin on `v4.channel.k8s.io`, requiring custom length-prefixed framing. Go's `k8s.io/client-go` closes Exec stdin cleanly on EOF, so the controller simply pipes raw `snapshot.tar.gz`, `inputs.tar`, and stdin credentials directly into `cmd/loader` and `review-kit`.
-3. **Static trusted `cmd/loader` (`CGO_ENABLED=0`) separate from untrusted harness images**: Even inside the Pod, container images carrying Node/Python/CLI agent ecosystems never mount `/workspace/src` read-write. Only the minimal static Go `loader` image mounts `/workspace/src` read-write, unpacks safely via `os.OpenRoot`, masks untrusted repo instruction files, builds the local `base` and `pr` git branches, and reads back `/workspace/.review/out/report.json` with `O_NOFOLLOW`.
-4. **Kernel-enforced read-only source, zero secrets, fail-fast DNS (`NetworkPolicy` CNI required)**: `harness` mounts `/workspace/src` and `/workspace/.review/in` with `readOnly: true`, sets `automountServiceAccountToken: false` and `enableServiceLinks: false`, and sets `dnsPolicy: None` targeting `127.0.0.1` so stray DNS calls fail in `<1ms`. A dual-namespace `NetworkPolicy` drops all ingress and blocks cluster/internet/port-53 egress, allowing TCP egress by **default** only to `review-system/inference-adapter:8080`.
-5. **Honest Security Boundaries**: Sandbox and output sanitization block **credential theft** and **privileged write actions**. Prompt injection in a malicious PR can still mislead an LLM into missing bugs or generating false positives; we mitigate that by locking review rules to `base_sha`, masking untrusted instruction files in the working tree, enforcing `confidence` thresholds, and leaving merge decisions to humans. Passing the short-lived HS256 JWT Task Token into `harness` process RAM is necessary because unmodified harnesses require `OPENAI_API_KEY`; that risk stays bounded because the token works only at `cmd/adapter`, encodes strict per-run token/request limits, expires with the Pod, and cannot be routed elsewhere under `NetworkPolicy`.
+1. **Off-the-shelf harnesses live in Python/CLI land, while core infrastructure shines in Go**: Orchestrating Kubernetes Pods, host-side archive sanitization, concurrent PR sharding, and streaming HTTP proxies with strict memory bounds is simpler, faster, and smaller in Go. Meanwhile `PR-Agent`, `OpenHands`, `mini-SWE-agent`, and `Aider` are native Python packages or Node/Rust CLIs best wrapped by a small Python kit inside their own container image.
+2. **Zero `pods/exec`, zero separate loader binary, zero JWT signing**: Host-side `internal/loader` sanitizes untrusted GitHub tarballs and packs a clean `bundle.tar.gz` before creating the sandbox Pod. The controller embeds the `:8081` proxy directly in-process and issues 32-byte random opaque session tokens looked up in constant time, removing `cmd/loader`, `cmd/adapter`, `internal/token`, HS256 JWTs, and `pods/exec` RBAC entirely.
+3. **Defense-in-depth sandbox isolation (`NetworkPolicy` CNI required)**: Each Pod runs a single `sandbox` container under gVisor (`RestartPolicy: Never`, `ReadOnlyRootFilesystem: true`, `Capabilities: Drop ALL`, `automountServiceAccountToken: false`, `enableServiceLinks: false`, `dnsPolicy: None` targeting `127.0.0.1`). `review-kit` extracts the clean bundle with `tarfile.extractall(..., filter="data")`, creates the offline `base`/`pr` git repo, and locks `/workspace/src` and `/workspace/.review/in` read-only (`0444`/`0555`) before spawning any harness subprocess. A dual-namespace `NetworkPolicy` blocks all ingress and restricts egress solely to `review-system/app=review-controller` TCP `:8081`.
+4. **Honest Security Boundaries**: Sandbox and output sanitization block **credential theft** and **privileged write actions**. Prompt injection in a malicious PR can still mislead an LLM into missing bugs or generating false positives; we mitigate that by locking review rules to `base_sha`, stripping untrusted instruction files on the host before bundling, enforcing `confidence` thresholds, and leaving merge decisions to humans. The opaque `task_token` is scoped strictly to one session on `:8081` (one-time bundle read, 2 MiB report upload, bounded inference budget) and is unregistered as soon as the Pod exits.
 
 ---
 
 ## 3. Five Plugin Boundaries and Control Plane Design
 
-The Go scheduler (`Orchestrator` + PostgreSQL), Go Denoiser, and Prometheus/Scorecard tables form the fixed backbone. Five boundaries swap cleanly via configuration and entry points:
+The Go `Orchestrator` (with `InMemoryStore`), host-side `internal/loader`, embedded `internal/inference.ProxyHandler`, Go Denoiser, and Prometheus `/metrics` form the fixed backbone. Five boundaries swap cleanly via configuration and entry points:
 
 | Plugin Boundary | Host Layer | Contract Interface | Default Lightweight Implementation | Swappable Alternatives |
 | :--- | :--- | :--- | :--- | :--- |
 | **1. VCS Trigger & Publisher** | Go (`cmd/controller`) | `VCSPlugin` (+ optional `CheckLogFetcher`) | `github-app` + `local-cli` | `gitlab` / `gitea` |
-| **2. Sandbox Runner** | Go (`cmd/controller`) | `SandboxRunner` (`Run(ctx, SandboxSpec) -> *ReviewReport`) | `k8s-gvisor-pod` (2-container Pod) | `k8s-kata` / local `docker` |
+| **2. Sandbox Runner** | Go (`cmd/controller`) | `SandboxRunner` (`Run(ctx, SandboxSpec) error`) | `k8s-gvisor-pod` (1-container Pod + Secret) | `k8s-kata` / local `docker` / `local` |
 | **3. Agent Harness Adapter** | Python (`review-harness-kit`) | `HarnessAdapter` (`prepare` / `collect` / `extract` + Normalizer) | `openhands` + `pr-agent` | `codex` / `mini-swe-agent` / `opencode` / `goose` / `aider` |
-| **4. Context & Tooling** | Go + Sandbox `PATH` | `ContextProvider` + `rg` / `git` / `ast-grep` / `ctags` | `diff.patch` + `base_sha` rules + offline binaries | `FetchCheckLogs` / pre-warmed `golangci-lint` / air-gapped `run_scoped_test` Pod |
-| **5. Inference Endpoint Adapter** | Go (`cmd/adapter`) | `UpstreamProvider` (`Build(claims, api, body) -> UpstreamRequest`) | `llmd-gateway` | `vllm-direct` / `sglang` / `ollama` |
+| **4. Context & Tooling** | Go + Sandbox `PATH` | `ContextProvider` + `rg` / `git` / `ast-grep` / `ctags` | `diff.patch` + `base_sha` rules + offline binaries | `FetchCheckLogs` / pre-warmed `golangci-lint` |
+| **5. Inference Endpoint Adapter** | Go (`internal/inference`) | `UpstreamProvider` (`Build(claims, api, body) -> UpstreamRequest`) | `llmd-gateway` | `vllm-direct` / `sglang` / `ollama` |
 
 ---
 
@@ -128,64 +123,47 @@ The Go scheduler (`Orchestrator` + PostgreSQL), Go Denoiser, and Prometheus/Scor
   * Triggers on `opened`, `synchronize`, `reopened`, `ready_for_review`, and maintainer `/review` comments; ignores `draft` PRs and bots; cancels active work on `closed`.
   * Enforces per-repo and per-author sliding-window rate limits. **Fork PRs from first-time external contributors never run automatically**—they wait for a maintainer `/review` command.
   * `/review <profile>` checks `requested_harness` against configured profile allowlists (never passed to a shell).
-* **Diff Fetching, Line Alignment, and Sanitization**:
-  1. Downloads the `head_sha` source tarball via platform API (free of `.git` hooks, submodules, and LFS) and three-dot `diff.patch` (stripping binary file sections before shipping to the sandbox).
+* **Diff Fetching, Line Alignment, Stateless Marker Dedup, and Sanitization**:
+  1. Downloads the `head_sha` source tarball via platform API (free of `.git` hooks, submodules, and LFS) and three-dot `diff.patch` (stripping binary file sections before bundling).
   2. Verifies every finding's `targetLineText` against parsed diff hunks (`LEFT`/`RIGHT`). If lines shifted slightly, locates a unique verbatim hunk match; otherwise falls back to file-level comment (when supported) or the summary body so GitHub `422` errors never drop an entire review.
-  3. **Sanitizes all untrusted text** before posting: strips minted Task Tokens, escapes line-leading Prow commands (`/lgtm`, `/approve`, `/hold`, etc.) both inside and outside fenced code blocks, breaks `@mentions` with zero-width spaces, and strips raw HTML tags/comments, images, and external links. Posts atomically via `POST /pulls/{pr}/reviews` (`event=COMMENT`) with a hidden `<!-- review-run: <run_id> sha: <head_sha> -->` marker. Default GitHub App scopes stay minimal (`pull_requests: write`, `contents: read`; Checks/Actions read-only added only if `CheckLogFetcher` is enabled).
+  3. **Stateless cross-commit deduplication**: Reads prior PR reviews via `VCSPlugin.ListPublishedFingerprints` (`GET /repos/{owner}/{repo}/pulls/{pr}/reviews`) to extract fingerprints embedded in hidden markers (`<!-- review-run: <run_id> sha: <head_sha> fps: <fp1,fp2,...> -->`), preventing duplicate comments even after controller restarts with zero database state.
+  4. **Sanitizes all untrusted text** before posting: strips minted Task Tokens, escapes line-leading Prow commands (`/lgtm`, `/approve`, `/hold`, etc.) both inside and outside fenced code blocks, breaks `@mentions` with zero-width spaces, and strips raw HTML tags/comments, images, and external links. Posts atomically via `POST /pulls/{pr}/reviews` (`event=COMMENT`).
 
 ---
 
-### 3.2 Orchestrator State Machine, Deduplication, and Sandbox Layer (Go + PostgreSQL)
+### 3.2 Stateless Orchestrator, Host Bundle Builder, and Sandbox Layer (Go)
 
-* **PostgreSQL State Machine (`pgx/v5`)**:
+* **In-Memory State Machine (`InMemoryStore`)**:
 
 | State | Entry & Action | Concurrency & Failure Handling |
 | :--- | :--- | :--- |
-| `queued` | Inserted when `(repo, pr, base_sha, head_sha, trigger_type, force_rerun_seq)` is not active/done | Waits in 15-30s debounce window; newer commits mark queued runs `superseded` under `pg_advisory_xact_lock` |
-| `running` | Claimed via `FOR UPDATE OF r SKIP LOCKED`; picks sticky harness profile and spawns sandbox Pod(s) | Heartbeat renews lease; stale leases reclaimed up to `max_retries=2`; newer commits mark `superseded` and delete Pods |
-| `publishing` | Aggregates primary shards, deduplicates, checks `GetHeadSHA` CAS | If live remote `head_sha` changed, marks `superseded` and discards output |
-| `done` | Atomic GitHub review posted and fingerprints committed | Auto 0-finding runs finish silently; manual `/review` posts a concise clean summary |
-| `superseded` | Replaced by newer push or closed PR | Deletes sandbox Pods immediately (`GracePeriodSeconds=0`), backed by `activeDeadlineSeconds` and 5-minute Reaper |
-| `failed` | Retries exhausted or all shards failed | Auto runs fail silently (alerts only); manual `/review` posts a 1-line error note with `run_id` |
+| `queued` | Inserted when `(repo, pr, base_sha, head_sha, trigger_type, force_rerun_seq)` is not active/done | Waits in configurable debounce window; newer commits mark queued runs `superseded` |
+| `running` | Claimed by worker pool; picks sticky harness profile, builds `bundle.tar.gz`, registers session, and spawns disposable sandbox | Heartbeat renews lease; newer commits cancel context and delete Pod & Secret (`GracePeriodSeconds=0`) |
+| `publishing` | Aggregates primary shards, deduplicates against in-memory store and live GitHub PR markers, checks `GetHeadSHA` CAS | If live remote `head_sha` changed, marks `superseded` and discards output |
+| `done` | Atomic GitHub review posted with embedded `fps` marker | Auto 0-finding runs finish silently; manual `/review` posts a concise clean summary |
+| `superseded` | Replaced by newer push or closed PR | Deletes sandbox Pod and Secret immediately (`GracePeriodSeconds=0`), backed by `activeDeadlineSeconds` and 5-minute `OrphanPodReaper` (sweeping both Pods and orphan Secrets) |
+| `failed` | Retries exhausted or all shards failed | Auto runs fail silently (metrics/logs only); manual `/review` posts a 1-line error note with `run_id` |
 
-* **Trusted Workspace Preparation (`cmd/loader`)**:
-  * **Unpack safety via Go `os.OpenRoot`**: Strips single leading directory wrapper, skips PAX global headers, rejects device/FIFO nodes and traversal, confines hardlinks (`root.Link`) and validates relative symlinks strictly inside `/workspace/src` and `/workspace/.review/in`.
-  * **Rule source lock**: Review rules (`AGENTS.md`, `docs/review/` path-routed rules) come exclusively from `base_sha`, fetched by `cmd/controller`.
-  * **Instruction-file masking**: Before building the local git repo, `cmd/loader` deletes `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.goosehints`, `.pr_agent.toml`, `opencode.json`, `opencode.jsonc`, `.mcp.json`, `.aider.conf.yml`, and directories `.agents`, `.codex`, `.opencode`, `.openhands`, `.claude`, `.cursor`, `.goose` from `/workspace/src`. Their changes remain inspectable as plain text inside `diff.patch`.
-  * **Local 2-branch git repo**: Runs `git init -b pr`, reverse-applies `diff.patch` excluding masked files (`git apply -R --exclude=...`) to create commit `base`, and resets working tree to `pr`. Harnesses needing `git diff base...pr` or local git providers work completely offline.
+* **Host-Side Safe Bundle Builder (`internal/loader`)**:
+  * **Archive safety**: Streams GitHub's `snapshot.tar.gz`, strips single leading directory wrapper, skips PAX headers, rejects traversal, absolute paths, escaping symlinks, chained symlink escapes, symlink parent writes, escaping/unresolved hardlinks, device nodes, and size caps (`64 MiB` per file, `2 GiB` total).
+  * **Rule source lock**: Review rules (`AGENTS.md`, `docs/review/` path-routed rules) come exclusively from `base_sha`, fetched by the controller.
+  * **Instruction-file masking**: Strips `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.goosehints`, `.pr_agent.toml`, `opencode.json`, `opencode.jsonc`, `.mcp.json`, `.aider.conf.yml`, and directories `.agents`, `.codex`, `.opencode`, `.openhands`, `.claude`, `.cursor`, `.goose` while recording `masked_files` in `.review/in/task.json`. Their changes remain inspectable as plain text inside `diff.patch`.
 * **Large PR Sharding & Centralized Denoiser**:
-  * Strips `go.sum`, `vendor/`, `zz_generated.*`; splits remaining diff into shards sized under ~1/3 of `max_context_tokens`. Runs primary shards plus any configured `shadow` profiles concurrently with unique Pod names (`shadow-<profile>` disambiguated!).
-  * Publishes partial results if at least one primary shard succeeds (listing failed shards in summary); runs **Schema & range validation -> confidence filter (`>= 0.75`, using profile default when unset) -> verbatim hunk alignment -> nearby same-file clustering -> PG `finding_fingerprints` dedup -> Top 8 cap**. Fingerprints hash `file + prev_line + target_line` (harness-agnostic and category-agnostic; never auto-resolves old threads).
+  * Strips `go.sum`, `vendor/`, `zz_generated.*`; splits remaining diff into shards sized under ~1/3 of `max_context_tokens`. Runs primary shards plus any configured `shadow` profiles concurrently with unique Pod names (`shadow-<profile>` disambiguated).
+  * Publishes partial results if at least one primary shard succeeds (listing failed shards in summary); runs **Schema & range validation -> confidence filter (`>= 0.75`, using profile default when unset) -> verbatim hunk alignment -> nearby same-file clustering -> in-memory + PR marker dedup -> Top 8 cap**.
 
 ---
 
 ### 3.3 Agent Harness Adapter Plugin (`python/review-harness-kit`)
 
-Python stays confined strictly inside the `harness` container behind the Protobuf `AgentTask` / `ReviewReport` file contract (`protojson`—note `int64` fields encode as JSON strings per Proto3 JSON mapping, so both languages decode via `protojson` / `json_format`, never plain `json`):
+Python stays confined strictly inside the disposable sandbox container (`CMD ["review-kit", "run"]`) behind the Protobuf `AgentTask` / `ReviewReport` contract (`protojson`—note `int64` fields encode as JSON strings per Proto3 JSON mapping, so both languages decode via `protojson` / `json_format`, never plain `json`).
 
-```json
-// /workspace/.review/in/task.json (credential-free protojson written by controller + updated by cmd/loader)
-{
-  "runId": "7f3a9c1e-...",
-  "shardIndex": 0,
-  "harness": { "profile": "openhands", "adapter": "openhands" },
-  "modelAlias": "review-coder",
-  "prTitle": "Fix scorer cache race on eviction",
-  "srcDir": "/workspace/src",
-  "diffFile": "/workspace/.review/in/diff.patch",
-  "rulesDir": "/workspace/.review/in/rules",
-  "outDir": "/workspace/.review/out",
-  "git": { "baseRef": "base", "headRef": "pr" },
-  "maskedFiles": ["AGENTS.md", ".codex/*"],
-  "budget": {
-    "maxRequests": 60,
-    "maxContextTokens": 32768,
-    "maxTotalTokens": "5000000",
-    "normalizerReserveTokens": "50000",
-    "wallClockSeconds": 1800
-  }
-}
-```
+During bootstrap, `review-kit`:
+1. Reads `{"controller_url": ..., "task_token": ...}` from `--bootstrap /var/run/review-task/bootstrap.json` (K8s `0400` Secret) or stdin (Docker / local).
+2. Downloads `GET {controller_url}/v1/sandbox/bundle` (one-time read) and extracts into `/workspace` using `tarfile.extractall(..., filter="data")`.
+3. Initializes the offline 2-branch Git repo (`base` + `pr` via `git apply -R --index --exclude=...`, `core.hooksPath=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`).
+4. Recursively locks `/workspace/src` and `/workspace/.review/in` read-only (`0444` files, `0555` executables and directories).
+5. Runs the configured `HarnessAdapter` (`OPENAI_BASE_URL={controller_url}/v1`, `OPENAI_API_KEY={task_token}`) under `wall_clock_seconds` process-group timeout, normalizes output into `report.json`, and uploads via `POST {controller_url}/v1/sandbox/report` (3x short retry).
 
 #### 3.3.1 Supported Harnesses and Adapter Behavior
 
@@ -201,18 +179,7 @@ Python stays confined strictly inside the `harness` container behind the Protobu
 
 All prompt-driven harnesses receive the identical `prompts/review_task.md` (`base_sha` rules first, workspace paths, embedded Proto-derived JSON Schema, PR title/description marked untrusted, diff last), so A/B experiments compare harness loops rather than divergent prompts. `PR-Agent` keeps its own prompt pipeline and receives `base_sha` rules via `PR_REVIEWER__EXTRA_INSTRUCTIONS`.
 
-#### 3.3.2 Credential & Sandbox Isolation for Unmodified Harnesses
-
-| Harness Assumption | How `cmd/loader` + `review-harness-kit` Satisfy It Offline |
-| :--- | :--- |
-| GitHub API / token to fetch diff & post comments | `cmd/loader` creates local git branches `base` and `pr`; PR-Agent uses `CONFIG__GIT_PROVIDER=local` and writes `LOCAL__REVIEW_PATH` under writable `out_dir`. |
-| `.git` history (`git diff`, `git log`) | Same local repo; `GIT_OPTIONAL_LOCKS=0` stops git from attempting index writes on the read-only mount. |
-| Docker daemon or nested Landlock/seccomp | Disabled in adapter config (`sandbox_mode = "danger-full-access"` / local process mode); the gVisor Pod provides outer containment. |
-| Internet for price maps, telemetry, plugin downloads | Dependencies pre-baked in image; offline env vars (`LITELLM_LOCAL_MODEL_COST_MAP=True`, `DO_NOT_TRACK=1`, `PIP_NO_INDEX=1`) + `127.0.0.1` DNS fail-fast. |
-| Writable home/caches | `HOME`, `XDG_*`, `TMPDIR` point to size-capped `/scratch` and `/tmp`; source edits fail immediately with `EROFS`. |
-| `stream=true` SSE, `/v1/models`, or `/v1/responses` | All three served by Go `cmd/adapter`. |
-
-#### 3.3.3 Output Normalization
+#### 3.3.2 Output Normalization
 
 ```mermaid
 flowchart TD
@@ -222,58 +189,34 @@ flowchart TD
     OneShot -->|"json_format.Parse"| Cand
     Cand --> Anchor["Deterministic Anchor: Verify Path Inside /workspace/src, Fill targetLineText if Empty (ANCHOR_KIND_DERIVED)"]
     Anchor --> Valid{"Valid Report Within Bounds ?"}
-    Valid -->|"Yes"| Write["Write /workspace/.review/out/report.json (protojson)"]
-    Valid -->|"No"| Fail["Write Empty Report With REPORT_STATUS_HARNESS_FAILED"]
-    Write --> GoCP["Go Control Plane: Unmarshal, Validate, Align Hunks, Dedup, Publish"]
+    Valid -->|"Yes"| Write["Write report.json & POST /v1/sandbox/report"]
+    Valid -->|"No"| Fail["Write HARNESS_FAILED report.json & POST /v1/sandbox/report"]
+    Write --> GoCP["Go Control Plane: Decode, Validate, Align Hunks, Marker Dedup, Publish"]
     Fail --> GoCP
-```
-
-#### 3.3.4 Harness Config, Sticky Routing, and Shadow Runs
-
-```yaml
-harness:
-  default: openhands
-  profiles:
-    openhands:
-      adapter: openhands
-      image: ghcr.io/zetxqx/review-harness-openhands:1.0.0
-      cache_shape: append_only
-      budget: { max_requests: 60, max_context_tokens: 32768, max_total_tokens: 5000000, normalizer_reserve_tokens: 50000, wall_clock_seconds: 1800 }
-    pr-agent:
-      adapter: pr-agent
-      image: ghcr.io/zetxqx/review-harness-pr-agent:1.0.0
-      cache_shape: single_shot
-      default_confidence: 0.8
-      budget: { max_requests: 8, max_context_tokens: 32768, max_total_tokens: 150000, normalizer_reserve_tokens: 20000, wall_clock_seconds: 300 }
-  routing:
-    - repos: ["llm-d/llm-d-router"]
-      split: { openhands: 80, pr-agent: 20 }    # Sticky SHA-256 bucket(repo#pr) mod 100
-      shadow: ["codex"]                         # Runs in parallel Pod (report stored to PG only)
 ```
 
 ---
 
 ### 3.4 Context & Tooling Plugin
 
-* **Control-plane context providers (`ContextProvider` in Go)**: Assemble `/workspace/.review/in/` (three-dot `diff.patch`, root `AGENTS.md` + 0-2 path-matched `base_sha` rules from `docs/review/`, PR metadata, and optional truncated CI failure logs from `CheckLogFetcher`).
+* **Control-plane context providers (`ContextProvider` in Go)**: Contribute files into `.review/in/` before bundling (three-dot `diff.patch`, root `AGENTS.md` + 0-2 path-matched `base_sha` rules from `docs/review/`, PR metadata, and optional truncated CI failure logs from `CheckLogFetcher`).
 * **In-sandbox static toolbox**: Harness images bake static `ripgrep`, `git`, `ast-grep`, and `universal-ctags`. Shell-driven harnesses invoke them directly against read-only `/workspace/src`.
-* **Optional Phase 2 / M4 Extensions**:
-  * Per-repo read-only `GOMODCACHE` layer for `golangci-lint` / `gopls`.
-  * **`review-tools` (`python/pyproject.toml` `[tools]` extra)**: CLI + stdio MCP wrapper reserved for **`run_scoped_test(target, filter)`**. When enabled, tests execute in a **separate secret-less gVisor child Pod** whose `NetworkPolicy` enforces **`egress: DenyAll` (cannot reach `cmd/adapter` or DNS)** and `ingress` only from the paired `harness` Pod.
 
 ---
 
-### 3.5 Inference Endpoint Plugin & Self-Hosted `llm-d` Integration (Go `cmd/adapter`)
+### 3.5 Embedded Inference & Task Transfer Proxy (`internal/inference` on `:8081`)
 
-`cmd/adapter` runs outside the sandbox (single replica in Phase 1-3 so the in-memory `atomic` ledger is exact; `:8080` for sandbox `/v1/*`, `:9090` for controller `/internal/usage/{jti}` and Prometheus `/metrics`):
+`ProxyHandler` runs directly inside `bin/controller` (and `bin/reviewctl` on an ephemeral loopback port), serving all 5 sandbox endpoints under constant-time opaque Bearer token authentication:
 
 | Endpoint | Purpose | Enforcement |
 | :--- | :--- | :--- |
+| `GET /v1/sandbox/bundle` | Streams clean `bundle.tar.gz` to `review-kit` | Atomic one-time `CompareAndSwap`; replays return HTTP `410 Gone`. |
+| `POST /v1/sandbox/report` | Receives normalized `ReviewReport` protojson | `http.MaxBytesReader` `2 MiB` cap; stores latest bytes while session is active. |
 | `POST /v1/chat/completions` | Chat Completions (OpenHands, PR-Agent, Goose, OpenCode, mini-SWE-agent, Aider) | Field allowlist, force configured `upstream_model`, cap `max_tokens`/`max_completion_tokens`, support `stream=false` & `stream=true` (forcing `stream_options.include_usage=true`, hiding usage-only tail chunk unless client requested it). |
 | `POST /v1/responses` | Responses API (Codex CLI) | Stateless pass-through: forces `store=false`, strips `previous_response_id` and `conversation`, extracts usage from `response.completed`. |
 | `GET /v1/models` | Harness startup probe | Verifies Bearer token and returns single configured `model_alias`. |
 
-* **Atomic Budget & Request Enforcement (`SessionLedger`)**: Reserves `estimated_input + max_output_tokens` atomically before forwarding and settles to uncached work `(prompt - cached) + completion` afterward (charging estimate if a `2xx` stream drops without usage, while continuing to track raw prompt, cached, and completion totals separately). Enforces separate `max_requests` (60) and `max_normalize_requests` (2) counters plus `normalizer_reserve_tokens` (50,000 for multi-turn profiles; 20,000 for single-shot), so spoofing `x-review-phase: normalize` cannot bypass request caps or exceed `max_total_tokens`. Returns HTTP `403` (`budget_exhausted` / `request_limit_exhausted`) so SDKs do not auto-retry. Counts rejected harness-phase requests in `SandboxUsage.rejected_requests`. The control plane marks a report from a session with rejected requests `HARNESS_FAILED` unless the harness wrote a deterministic report file, so a review cut off by a cap is never published.
+* **Atomic Budget & Request Enforcement (`SessionLedger`)**: Reserves `estimated_input + max_output_tokens` atomically before forwarding and settles to uncached work `(prompt - cached) + completion` afterward (charging estimate if a `2xx` stream drops without usage, while continuing to track raw prompt, cached, and completion totals separately). Enforces separate `max_requests` (60) and `max_normalize_requests` (2) counters plus `normalizer_reserve_tokens` (50,000 for multi-turn profiles; 20,000 for single-shot). Returns HTTP `403` (`budget_exhausted` / `request_limit_exhausted`) so SDKs do not auto-retry. Counts rejected harness-phase requests in `SandboxUsage.rejected_requests`. The control plane marks a report from a session with rejected requests `HARNESS_FAILED` unless the harness wrote a deterministic report file.
 
 #### 3.5.1 Prefix-Cache Compatibility Matrix
 
@@ -297,175 +240,54 @@ harness:
 
 | `llm-d` Component / Plugin | Default Behavior (Gotcha) | Required Configuration for Review Agent | Effect |
 | :--- | :--- | :--- | :--- |
-| **`session-affinity-scorer`** | Defaults to `encoded_endpoint_header` (`x-session-token`) | Set `strategy: session_id` and `sources: [{ header: x-session-id }]` | Pins all turns of a review session to the same pod via Adapter-injected `x-session-id` |
+| **`session-affinity-scorer`** | Defaults to `encoded_endpoint_header` (`x-session-token`) | Set `strategy: session_id` and `sources: [{ header: x-session-id }]` | Pins all turns of a review session to the same pod via proxy-injected `x-session-id` |
 | **`agent-identity` / `agent-lineage`** | Disabled by default; built-in defaults omit `x-session-id` | Enable both plugins and add `x-session-id` to `additionalSessionHeaders` | Tracks per-session identity and `x-parent-session-id` (merging sharded sub-tasks into one fairness queue) |
 | **`requestHandler` Fairness** | `x-llm-d-inference-fairness-id: <repo>` queues all repo PRs together | Enable `composeFairnessIDs: true` | Composes `<repo>/<root_session_id>` (or `<repo>/<parent_session_id>` for sharded trees) for per-repo metrics and per-tree queues |
 | **`flowControl` & `InferenceObjective`** | Feature gate off by default; `x-llm-d-inference-ttl` can only shorten finite TTLs | Enable `featureGates: ["flowControl"]`, create `code-review-batch` Objective, set long `defaultRequestTTL` on batch band | Allows review traffic to wait in queue during live traffic peaks without premature TTL shedding (match gateway timeout) |
-| **vLLM Engine Flags** | `prompt_tokens_details.cached_tokens` omitted by default | Enable `--enable-prefix-caching` and `--enable-prompt-tokens-details` | Reuses KV cache blocks and reports `cached_tokens` usage back to Adapter |
+| **vLLM Engine Flags** | `prompt_tokens_details.cached_tokens` omitted by default | Enable `--enable-prefix-caching` and `--enable-prompt-tokens-details` | Reuses KV cache blocks and reports `cached_tokens` usage back to the proxy |
 | **vLLM Tool Calling** | Native `tool_calls` are off unless a parser is configured | Enable `--enable-auto-tool-choice` and the `--tool-call-parser` that matches the served model | Agentic harnesses depend on native tool calls, including in streamed responses |
 
-* **Timeout & Retry**: Set generous Pod `wall_clock_seconds` (e.g. 1800s), upstream HTTP client timeout (400s) >= batch `defaultRequestTTL` (360s), and harness HTTP timeout >= 400s. On `429` / `503` before any SSE byte is relayed, `cmd/adapter` retries up to 4 times with jittered exponential backoff (5s-40s).
+* **Timeout & Retry**: Set generous Pod `wall_clock_seconds` (e.g. 1800s), upstream HTTP client timeout (420s) >= batch `defaultRequestTTL` (360s), and harness HTTP timeout >= 400s. On `429` / `503` before any SSE byte is relayed, `ProxyHandler` retries up to 4 times with jittered exponential backoff (5s-40s).
 * **Swapping Backends**: Switch upstream config from `llmd-gateway` to `vllm-direct` / `sglang` / `ollama` with zero sandbox changes (served model must support tool calling and `max_context_tokens`).
 
 ---
 
-### 3.6 Observability & Feedback Loop
-
-* **Prometheus + OTel + Grafana**: Per-harness latency, requests, prompt/completion/`cached_tokens`, KV cache hit ratio, and `x-llm-d-flow-queue-duration-ms`.
-* **PostgreSQL Quality Scorecard**: Tracks reactions (`+1`/`-1` polled periodically via `VCSPlugin.PollFeedback`) and follow-up commit fixes alongside `harness_executions` metrics to rank harnesses by accepted findings per million tokens.
-
----
-
-## 4. Core Interaction Sequence Diagrams
-
-### 4.1 End-to-End PR Review Lifecycle (Debounce, Cancel, Exec Sandbox, and Line Verification)
+## 4. Core Interaction Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Dev as Developer
     participant GH as GitHub Platform
-    participant VCS as Go VCS Trigger & Publisher
-    participant Orch as Go Control Plane & PG
-    participant Pod as 2-Container gVisor Pod
-    participant Adapter as Go cmd/adapter Proxy
+    participant Ctrl as bin/controller (:8080 & :8081)
+    participant K8s as Kubernetes API
+    participant Pod as 1-Container gVisor Pod (review-kit)
+    participant LLM as llm-d Gateway & EPP
 
-    Dev->>GH: Open PR or Push Commit A
-    GH->>VCS: Send Webhook Event
-    VCS->>Orch: Verify Signature & Parse reviewv1.ReviewEvent A
-    Orch->>Orch: Idempotency Check & Enqueue (queued)
-    Orch->>Orch: Start 20s Debounce Window
-
-    Dev->>GH: Force-Push Commit B
-    GH->>VCS: Send Commit B Event
-    VCS->>Orch: Parse reviewv1.ReviewEvent B
-
-    alt Case 1 Commit A Still in Debounce Window
-        Orch->>Orch: Mark A superseded & Enqueue B
-    else Case 2 Commit A Already Running
-        Orch->>Orch: Mark A superseded & Delete Pod A
-        Orch->>Orch: Enqueue B into Debounce Window
+    Dev->>GH: Open PR or Push Commit
+    GH->>Ctrl: [Port 8080] Signed Webhook Event -> ReviewEvent
+    Ctrl->>Ctrl: InMemoryStore Debounce & Lease Claim
+    Ctrl->>GH: Download head_sha Tarball, Three-Dot Diff & base_sha Rules
+    Ctrl->>Ctrl: Host internal/loader Builds Clean bundle.tar.gz & Registers Opaque task_token
+    Ctrl->>K8s: Create 0400 Secret (ClusterIP URL + token) + 1-Container Pod (RestartPolicy=Never)
+    K8s-->>Pod: Launch review-kit run --bootstrap /var/run/review-task/bootstrap.json
+    Pod->>Ctrl: [Port 8081] GET /v1/sandbox/bundle (One-Time -> 410 Gone)
+    Ctrl-->>Pod: Clean bundle.tar.gz
+    Pod->>Pod: Extract, git init base+pr, chmod a-w /workspace/src and /workspace/.review/in
+    loop Multi-Turn Harness & Optional 1-Shot Normalizer
+        Pod->>Ctrl: [Port 8081] POST /v1/chat/completions or /v1/responses
+        Ctrl->>LLM: Fresh Request + x-session-id + Fairness ID + Batch Objective
+        LLM-->>Ctrl: SSE Chunks + Usage (cached_tokens)
+        Ctrl-->>Pod: Relay Stream & Settle Atomic SessionLedger
     end
-
-    Orch->>Orch: Claim B Lease (running) & Pick Sticky Harness Profile
-    Orch->>VCS: FetchDiffAndTarball & FetchBaseRules
-    VCS->>GH: Download Tarball, Three-Dot Diff & base_sha Rules
-    GH-->>VCS: Return Source Archive, diff.patch & Rules
-    VCS-->>Orch: Return Snapshot, diff.patch & Rules
-    Orch->>Pod: Create Pod, Stream Inputs via Go Exec (Native EOF)
-    Note over Pod,Adapter: Unmodified Harness Runs Under RO Mount, No DNS, Default Egress Adapter Only
-    Pod->>Adapter: Chat or Responses API (Stream or Non-Stream, Fig 4.3)
-    Adapter-->>Pod: Return Model Responses
-    Pod->>Pod: Normalize to report.json (Fig 4.2)
-    Pod-->>Orch: Go loader Reads report.json (O_NOFOLLOW) & Deletes Pod
-
-    Orch->>Orch: Set publishing, Validate, Align Hunks, Dedup & Scrub Markdown
-    Orch->>VCS: Call GetHeadSHA
-    VCS->>GH: Query Live Remote head.sha
-    GH-->>VCS: Return Live SHA
-    VCS-->>Orch: Return Live SHA
-    alt Remote SHA Changed Beyond Commit B
-        Orch->>Orch: Mark superseded & Drop Stale Result B
-    else Remote SHA Matches Commit B
-        Orch->>VCS: Call PublishReview
-        VCS->>GH: Atomic POST reviews (event=COMMENT)
-        GH-->>VCS: Publish Succeeded
-        VCS-->>Orch: Save Fingerprints & Mark done
-    end
-```
-
-### 4.2 Two-Container Sandbox Execution (Go Loader + Python Harness Kit + Normalizer)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Orch as Go Control Plane Worker
-    participant Loader as Go cmd/loader Container (RW)
-    participant Kit as Python review-harness-kit (harness Container, RO)
-    participant H as Unmodified Harness CLI
-    participant Norm as Python Normalizer
-    participant Adapter as Go cmd/adapter
-
-    Note over Orch,Loader: Exec 1a & 1b - Trusted Static Go Loader (Zero Tokens Present)
-    Orch->>Loader: Exec 1a: Stream Raw snapshot.tar.gz -> Close Stdin EOF
-    Loader->>Loader: Unpack via os.OpenRoot (Reject Traversal & Escaping Links)
-    Orch->>Loader: Exec 1b: Stream inputs.tar (task.json, diff.patch, base rules) -> Close Stdin EOF
-    Loader->>Loader: Delete Masked Instruction Files, Build Local Git Repo (base + pr), Update task.json
-    Loader-->>Orch: Exit 0
-
-    Note over Orch,Kit: Exec 2 - Source Tree & Inputs Mounted Read-Only Here
-    Orch->>Kit: Exec 2: Send Adapter URL & JWT Task Token on Stdin -> Close EOF
-    Kit->>Kit: json_format.Parse task.json into review_pb2.AgentTask
-    Kit->>Kit: Adapter prepare() Writes Config Under /scratch/home
-    Kit->>H: Spawn Unmodified CLI (Token in RAM, Offline Env, Timeout)
-    loop Until Harness Exits or Budget Ends
-        H->>Adapter: OpenAI Request (Stream or Non-Stream)
-        Adapter-->>H: Model Response
-        H->>H: Run Static Tools (rg, git diff, ctags) on Read-Only Source
-    end
-    H-->>Kit: Exit Code & Raw Output
-    Kit->>Norm: Adapter collect() Raw Output
-    alt Adapter extract() Succeeds
-        Norm->>Norm: Deterministic Map to review_pb2.ReviewReport
-    else Free-Form Output
-        Norm->>Adapter: 1-Shot Call (llm_review_report.schema.json, x-review-phase normalize)
-        Adapter-->>Norm: Structured JSON
-    end
-    Norm->>Norm: Anchor Missing Line Texts Against Snapshot & Serialize protojson
-    Norm->>Kit: Write /workspace/.review/out/report.json
-    Kit-->>Orch: Exit 0
-
-    Note over Orch,Loader: Exec 3 - Safe Readback Back on Trusted Go Loader
-    Orch->>Loader: Exec 3: loader read-report (O_NOFOLLOW, Regular File, 2 MiB Cap)
-    Loader-->>Orch: Return report.json (Re-Validated in Go)
-```
-
-### 4.3 Streaming Inference Through Go `cmd/adapter` to `llm-d`
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant H as Harness or Normalizer in Sandbox
-    participant Adapter as Go cmd/adapter Proxy
-    participant EPP as llm-d Gateway & EPP
-    participant PodA as vLLM Pod A
-    participant Local as Standalone vLLM or Ollama
-
-    alt Default Backend Self-Hosted llm-d Cluster
-        Note over H,PodA: Turn 1 (Cold Start & Populate Prefix KV Cache)
-        H->>Adapter: POST /v1/chat/completions stream=true (Bearer Task Token)
-        Adapter->>Adapter: Verify HS256 JWT, Allowlist Body, Force include_usage, Atomic CAS Reserve
-        Adapter->>EPP: Fresh Request + x-session-id + Fairness ID + Batch Objective
-        EPP->>EPP: Batch Queue, Score Load & Prefix, Bind Pod A
-        EPP->>PodA: Forward Request
-        PodA-->>EPP: SSE Chunks (tool_calls Deltas)
-        EPP-->>Adapter: SSE Chunks
-        Adapter-->>H: Flush SSE Chunks Live
-        PodA-->>EPP: Usage Chunk Then DONE
-        EPP-->>Adapter: Usage Chunk Then DONE
-        Adapter->>Adapter: Atomic CAS Settle From usage, Record cached_tokens
-        Adapter-->>H: DONE (Usage Chunk Stripped Unless Requested)
-
-        Note over H,PodA: Turns 2..N (Append-Only Harness Reuses Prefix KV Cache)
-        H->>Adapter: Same Prefix + Appended Tool Output
-        Adapter->>EPP: Forward With Same x-session-id
-        EPP->>EPP: Session Affinity & Prefix Scorer Hit Pod A
-        EPP->>PodA: Forward Request
-        PodA-->>EPP: Reuse Warm KV Cache + Report cached_tokens
-        EPP-->>Adapter: Stream Response & Queue Duration Header
-        Adapter-->>H: Relay & Settle Atomic Budget
-
-        opt EPP Returns 429 or 503 Before Any Byte Sent
-            Adapter->>Adapter: Jittered Backoff, Retry up to 4 Times
-        end
-        opt Token or Request Limit Reached
-            Adapter-->>H: HTTP 403 budget_exhausted / request_limit_exhausted
-        end
-    else Fallback Backend Standalone vLLM or Ollama
-        H->>Adapter: Identical OpenAI Request
-        Adapter->>Local: Forward Request (No llm-d Headers)
-        Local-->>Adapter: JSON or SSE Stream
-        Adapter-->>H: Relay Response
+    Pod->>Ctrl: [Port 8081] POST /v1/sandbox/report (2 MiB Cap)
+    Pod-->>K8s: Exit 0 (PodSucceeded)
+    K8s-->>Ctrl: Observe PodSucceeded, Read FinishSession, Delete Pod & Secret
+    Ctrl->>GH: ListPublishedFingerprints (PR Reviews) + Verify Live GetHeadSHA
+    alt Remote SHA Matches
+        Ctrl->>GH: Atomic POST Review (event=COMMENT) With Embedded fps Marker
+    else Remote SHA Changed
+        Ctrl->>Ctrl: Mark Superseded & Discard Stale Output
     end
 ```
 
@@ -475,22 +297,10 @@ sequenceDiagram
 
 | Layer | Choice | Why This Combination Wins | Considered and Rejected |
 | :--- | :--- | :--- | :--- |
-| **Shared Contracts** | **Protobuf (`proto3`) + `buf`** | One schema generates Go types, Python types, and `llm_review_report.schema.json`; `protojson` guarantees identical JSON and `optional` presence across Go and Python | Hand-duplicated Go structs + Pydantic models (drift risk); JSON-only schema without typed codegen |
-| **Control Plane & VCS** | **Go (`cmd/controller`, `net/http`, `pgx/v5`, `k8s.io/client-go`)** | Low memory footprint, clean goroutine/`errgroup` concurrency, native Kubernetes Exec stdin EOF closing without framing hacks, battle-tested `llm-d` stack | Python control plane (higher memory, broken Exec stdin EOF in official client); Celery/Temporal (second scheduler beside PG) |
-| **State & Queue** | **PostgreSQL (`pgx/v5`, plain SQL)** | `SKIP LOCKED`, `pg_advisory_xact_lock`, partial unique indexes, fingerprints, and A/B scorecard in one transactional store | Redis/Valkey queue; ORM |
-| **Sandbox Prep (`loader`)** | **Go static binary (`cmd/loader`, `CGO_ENABLED=0`)** | Minimal trusted container (`distroless`/scratch + `git`), OS-enforced `os.OpenRoot` tar extraction, `O_NOFOLLOW` report readback | Sharing the large Python harness container with RW source mounts |
-| **Isolated Sandbox** | **Disposable 2-container Pod + gVisor + `NetworkPolicy`** | Hardware/syscall isolation for untrusted fork code; kernel-enforced RO source mount for `harness`; `127.0.0.1` fail-fast DNS | Kata Containers (kept as `SandboxRunner` alternative); nested Docker/Landlock inside harness |
-| **Harness Layer** | **Python 3.12 (`uv`) + `review-harness-kit` wrapping existing harnesses** | Almost every off-the-shelf coding harness (`PR-Agent`, `OpenHands`, `mini-SWE-agent`, `Aider`) is Python or CLI-native; thin adapters avoid writing or maintaining a custom loop | Custom two-stage Go agent loop (redundant); bundling controller dependencies into sandbox images |
-| **Inference Proxy** | **Go `cmd/adapter` (`net/http`, `atomic` CAS, `golang-jwt`)** | Zero-overhead SSE line relay, race-free lock-free CAS budget/request limits, strict field allowlisting, Prometheus metrics | Python proxy; LiteLLM Proxy (heavy DB/key state and dependencies inside trust boundary) |
-| **CLI & Offline Eval** | **Go `cmd/reviewctl`** | Single static developer binary orchestrating local Docker harness containers and printing A/B scorecards using exact production Denoiser code | Maintaining a separate Python Denoiser implementation for CLI mode |
-| **Serving & Telemetry** | **Self-hosted `llm-d` + OTel + Prometheus + Grafana** | KV prefix caching + `flowControl` batch prioritization; direct correlation of acceptance rate, tokens, and cache hit ratio per harness | SaaS code review services or external proprietary APIs |
-
-**Accepted Trade-offs**: Using two languages means running `buf generate` (plus `cmd/schemagen`) when editing `proto/review/v1/review.proto`, and shipping separate Go (`controller`, `adapter`, `loader`, `reviewctl`) and Python-enabled (`harness-*`) container images. Because all cross-language communication crosses only Protobuf-serialized `task.json`, `report.json`, and `TaskClaims` JWTs, developers rarely touch both stacks in the same change.
-
----
-
-## 6. Three-Phase Rollout Plan
-
-1. **Phase 1 (Protobuf Contracts + Local `reviewctl` + Two Harnesses + Single-Node vLLM)**: Generate Go/Python bindings and `llm_review_report.schema.json` from `proto/review/v1/review.proto`; build Go `cmd/loader`, Go `cmd/adapter` (`vllm-direct` stream + non-stream), Go Denoiser, Go `cmd/reviewctl` with Docker runner, and Python `review-harness-kit` (`pr-agent` and `openhands`). Run offline replay against historical `llm-d-router` PRs to measure finding quality, tokens, and cache hit ratio.
-2. **Phase 2 (Go Control Plane + PG `SKIP LOCKED` + Air-Gapped gVisor Pods)**: Deploy Go `cmd/controller` with GitHub App webhooks, PG state machine, cross-round fingerprints, Markdown scrubbing, and 2-container gVisor Pods; verify GitHub file-level review comment compatibility; enable first-time external contributor `/review` gating on an internal pilot repo; add `codex` and `mini-swe-agent` adapters.
-3. **Phase 3 (`llm-d` Cluster Integration + Harness A/B + Feedback Flywheel)**: Configure `session-affinity-scorer`, `agent-identity`, `composeFairnessIDs`, `flowControl`, and long-TTL `code-review-batch` Objective per Section 3.5; point Go `cmd/adapter` at `llm-d` gateway; turn on sticky traffic splits, shadow runs, and periodic reaction polling (`harness_executions` + `review_feedback` scorecard).
+| **Shared Contracts** | **Protobuf (`proto3`)** | One schema generates Go types, Python types, and `llm_review_report.schema.json`; `protojson` guarantees identical JSON and `optional` presence across Go and Python | Hand-duplicated Go structs + Pydantic models (drift risk) |
+| **Control Plane & Proxy** | **Single Go binary (`bin/controller`, `net/http`, `k8s.io/client-go`)** | Single Deployment serving `:8080` webhooks and `:8081` sandbox bundle/report/OpenAI proxy, lock-free CAS budgets, opaque random session tokens, zero external database | Separate `cmd/adapter` Deployment, HS256 JWT signing, PostgreSQL StatefulSet |
+| **Archive Sanitization** | **Host-side Go (`internal/loader`)** | Validates paths, symlink chains, hardlinks, and size caps and strips untrusted repo instructions into a clean `bundle.tar.gz` before any Pod starts | In-Pod `cmd/loader` binary + 2-container Pod + 4x `pods/exec` streams |
+| **Isolated Sandbox** | **Disposable 1-container gVisor Pod + `NetworkPolicy`** | Syscall isolation, `ReadOnlyRootFilesystem: true`, `127.0.0.1` fail-fast DNS, `0400` Pod-owned Secret, zero `pods/exec` RBAC | 2-container `wait` Pods; nested Docker/Landlock inside harness |
+| **Harness Layer** | **Python 3.12 (`uv`) + `review-kit` wrapping existing harnesses** | Off-the-shelf coding harnesses (`PR-Agent`, `OpenHands`, `mini-SWE-agent`, `Aider`) are Python or CLI-native; thin adapters avoid writing or maintaining a custom loop | Custom Go agent loop; bundling controller dependencies into sandbox images |
+| **CLI & Offline Eval** | **Go `bin/reviewctl`** | Single developer binary reusing the exact same `internal/loader`, `internal/inference`, `internal/sandbox`, and `internal/publisher` packages for local evaluation and A/B scorecards | Maintaining a separate Python Denoiser or separate adapter process for CLI mode |
+| **Serving & Telemetry** | **Self-hosted `llm-d` + Prometheus `/metrics`** | KV prefix caching + `flowControl` batch prioritization; direct correlation of tokens, cache hit ratio, and latency per harness | SaaS code review services or external proprietary APIs |

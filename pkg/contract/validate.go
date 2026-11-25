@@ -1,10 +1,12 @@
 package contract
 
 import (
+	"fmt"
 	"math"
 	"strings"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func clipRunes(s string, max int) string {
@@ -15,6 +17,20 @@ func clipRunes(s string, max int) string {
 	return string(r[:max])
 }
 
+// DecodeAndValidateReport unmarshals protojson ReviewReport bytes and enforces field and enum bounds.
+func DecodeAndValidateReport(raw []byte) (*reviewv1.ReviewReport, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return nil, fmt.Errorf("sandbox produced empty report")
+	}
+	var report reviewv1.ReviewReport
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, &report); err != nil {
+		return nil, fmt.Errorf("decode ReviewReport protojson: %w", err)
+	}
+	ValidateReport(&report)
+	return &report, nil
+}
+
+// ValidateReport clips string lengths, clamps lines, clears invalid confidence values, and normalizes closed enums.
 func ValidateReport(r *reviewv1.ReviewReport) {
 	if r == nil {
 		return
@@ -66,7 +82,7 @@ func ValidateReport(r *reviewv1.ReviewReport) {
 	r.Findings = kept
 }
 
-// FailReportOnRejectedRequests marks r HARNESS_FAILED and returns true when cmd/adapter rejected
+// FailReportOnRejectedRequests marks r HARNESS_FAILED and returns true when the controller proxy rejected
 // harness-phase requests and the harness left no deterministic report file.
 func FailReportOnRejectedRequests(r *reviewv1.ReviewReport, usage *reviewv1.SandboxUsage) bool {
 	if r == nil || usage.GetRejectedRequests() == 0 {

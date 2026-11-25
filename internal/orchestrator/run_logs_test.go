@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -22,20 +20,22 @@ func TestRunLifecycleIsLoggedWithUsage(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	defer slog.SetDefault(prev)
 
-	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"jti":"any","requests":3,"normalizeRequests":0,"promptTokens":"1200","cachedTokens":"1000","completionTokens":"300"}`)
-	}))
-	defer usageSrv.Close()
-
 	ctx := context.Background()
 	vcs := &fakeVCS{
 		liveHeadSHA:  "h-logs",
 		diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\n"),
-		tarballBytes: []byte("t"),
+		tarballBytes: emptyTestTarGZ(t),
 	}
-	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
-		return &reviewv1.ReviewReport{
+	broker := newFakeBroker()
+	broker.defaultUsage = &reviewv1.SandboxUsage{
+		Jti:              "any",
+		Requests:         3,
+		PromptTokens:     1200,
+		CachedTokens:     1000,
+		CompletionTokens: 300,
+	}
+	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
 			Summary: "One finding.",
 			Findings: []*reviewv1.ReviewFinding{{
 				File:           "a.go",
@@ -53,13 +53,11 @@ func TestRunLifecycleIsLoggedWithUsage(t *testing.T) {
 				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
 				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
 			},
-		}, nil
+		})
 	})
 	orch := New(Config{
-		TokenKey:           []byte("0123456789abcdef0123456789abcdef"),
-		DebounceWindow:     0,
-		AdapterInternalURL: usageSrv.URL,
-	}, store.NewInMemoryStore(), vcs, sbx, nil)
+		DebounceWindow: 0,
+	}, store.NewInMemoryStore(), vcs, sbx, broker, nil)
 
 	if _, err := orch.HandleEvent(ctx, &reviewv1.ReviewEvent{
 		EventId:      "ev-logs",

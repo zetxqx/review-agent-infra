@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -249,5 +251,14 @@ def anchor_finding(finding: review_pb2.ReviewFinding, src: Path) -> review_pb2.R
 
 def write_report(report: review_pb2.ReviewReport, output_file: Path) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json_format.MessageToJson(report, preserving_proto_field_name=False)
-    output_file.write_text(serialized + "\n", encoding="utf-8")
+    serialized = json_format.MessageToJson(report, preserving_proto_field_name=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=output_file.parent, prefix=".report.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(serialized)
+            tmp_file.flush()
+        os.replace(tmp_name, output_file)
+    except BaseException:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise

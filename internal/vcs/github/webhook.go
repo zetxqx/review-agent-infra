@@ -61,6 +61,8 @@ type issueCommentWebhookPayload struct {
 	Action string `json:"action"`
 	Issue  struct {
 		Number      int             `json:"number"`
+		Title       string          `json:"title"`
+		Body        string          `json:"body"`
 		User        ghUser          `json:"user"`
 		PullRequest json.RawMessage `json:"pull_request"`
 	} `json:"issue"`
@@ -179,6 +181,8 @@ func parsePullRequestEvent(deliveryID string, body []byte) (*reviewv1.ReviewEven
 		TriggeredBy:  payload.Sender.Login,
 		IsMaintainer: isMaintainerAssociation(payload.PullRequest.AuthorAssociation),
 		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+		PrTitle:      payload.PullRequest.Title,
+		PrBody:       payload.PullRequest.Body,
 	}, nil
 }
 
@@ -229,6 +233,8 @@ func (p *Plugin) parseIssueCommentEvent(ctx context.Context, deliveryID string, 
 		IsMaintainer:  isMaintainerAssociation(payload.Comment.AuthorAssociation),
 		TriggerType:   reviewv1.TriggerType_TRIGGER_TYPE_MANUAL_COMMAND,
 		ForceRerunSeq: payload.Comment.ID,
+		PrTitle:       payload.Issue.Title,
+		PrBody:        payload.Issue.Body,
 	}
 	if requestedProfile != "" {
 		ev.RequestedHarness = &requestedProfile
@@ -241,6 +247,12 @@ func (p *Plugin) parseIssueCommentEvent(ctx context.Context, deliveryID string, 
 			ev.IsDraft = pr.Draft
 			ev.Author = pr.User.Login
 			ev.IsBotAuthor = isBotUser(pr.User)
+			if pr.Title != "" {
+				ev.PrTitle = pr.Title
+			}
+			if pr.Body != "" {
+				ev.PrBody = pr.Body
+			}
 			ev.IsFork = true
 			if pr.Head.Repo != nil {
 				ev.IsFork = pr.Head.Repo.Fork || !strings.EqualFold(pr.Head.Repo.FullName, payload.Repository.FullName)

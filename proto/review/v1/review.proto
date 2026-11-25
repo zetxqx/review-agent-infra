@@ -94,13 +94,15 @@ message ReviewEvent {
   TriggerType trigger_type = 14;
   int64 force_rerun_seq = 15;                // 0 for auto; comment ID for manual /review
   optional string requested_harness = 16;    // Optional profile name from "/review <profile>"
+  string pr_title = 17;                      // Pull request title propagated into AgentTask
+  string pr_body = 18;                       // Pull request description propagated into AgentTask
 }
 
 // TaskBudget bounds requests, context size, cumulative uncached tokens, and runtime for one sandbox Pod.
 message TaskBudget {
-  int32 max_requests = 1;                    // Hard cap enforced by cmd/adapter
+  int32 max_requests = 1;                    // Hard cap enforced by the controller inference proxy
   int32 max_context_tokens = 2;              // Passed to each harness's own context setting
-  int64 max_total_tokens = 3;                // Cumulative cap on uncached input + output tokens enforced by cmd/adapter
+  int64 max_total_tokens = 3;                // Cumulative cap on uncached input + output tokens enforced by the controller proxy
   int64 normalizer_reserve_tokens = 4;       // Uncached token slice held exclusively for 1-shot Normalizer
   int32 wall_clock_seconds = 5;              // Subprocess timeout inside the sandbox
 }
@@ -112,15 +114,10 @@ message HarnessRef {
   map<string, string> options = 3;
 }
 
-// GitInfo records the local two-branch repository prepared by cmd/loader inside /workspace/src.
+// GitInfo records the local two-branch repository prepared by review-kit inside /workspace/src.
 message GitInfo {
   optional string base_ref = 1;              // "base", or unset if git apply -R failed
   string head_ref = 2;                       // Always "pr"
-}
-
-// ToolEndpoints holds optional network endpoints enabled by M4 extensions.
-message ToolEndpoints {
-  optional string scoped_test = 1;           // ClusterIP:port of air-gapped test runner Pod
 }
 
 // AgentTask is serialized via protojson into /workspace/.review/in/task.json.
@@ -133,15 +130,14 @@ message AgentTask {
   string pr_title = 5;
   string pr_body = 6;
   string base_branch = 7;
-  string src_dir = 8;                        // Default: "/workspace/src" (RO in harness container)
+  string src_dir = 8;                        // Default: "/workspace/src" (locked RO by review-kit before harness starts)
   string diff_file = 9;                      // Default: "/workspace/.review/in/diff.patch"
   string rules_dir = 10;                     // Default: "/workspace/.review/in/rules" (from base_sha)
   optional string ci_logs_file = 11;         // Optional truncated CI logs from CheckLogFetcher
   string out_dir = 12;                       // Default: "/workspace/.review/out"
-  GitInfo git = 13;                          // Populated by cmd/loader before harness starts
-  repeated string masked_files = 14;         // Untrusted instruction files deleted by cmd/loader
-  ToolEndpoints tool_endpoints = 15;
-  TaskBudget budget = 16;
+  GitInfo git = 13;                          // Populated by review-kit before harness starts
+  repeated string masked_files = 14;         // Untrusted instruction files stripped by host-side internal/loader
+  TaskBudget budget = 15;
 }
 
 // ReviewFinding is one candidate defect emitted by a harness and normalized for Go denoising.
@@ -160,7 +156,7 @@ message ReviewFinding {
   string evidence = 12;                      // <= 2000 chars
 }
 
-// Provenance captures self-reported execution metadata; token accounting comes solely from cmd/adapter.
+// Provenance captures self-reported execution metadata; token accounting comes solely from the controller proxy.
 message Provenance {
   string profile = 1;
   string harness_version = 2;
@@ -177,7 +173,7 @@ message ReviewReport {
   Provenance provenance = 3;
 }
 
-// TaskClaims defines the HS256 JWT payload minted by cmd/controller and verified by cmd/adapter.
+// TaskClaims defines the in-memory session policy bound to an opaque random task token on controller :8081.
 message TaskClaims {
   string run_id = 1;
   string session_id = 2;                     // "<run_id>-s<shard>" or "<run_id>-s<shard>-<profile>"
@@ -189,10 +185,10 @@ message TaskClaims {
   int64 normalizer_reserve_tokens = 8;       // Uncached token slice reserved for 1-shot Normalizer
   int32 max_output_tokens = 9;
   int64 exp = 10;                            // Unix epoch expiration seconds
-  string jti = 11;                           // Unique token ID indexing cmd/adapter's atomic ledger
+  string jti = 11;                           // Unique session ID indexing the controller proxy's atomic ledger
 }
 
-// SandboxUsage is returned by cmd/adapter /internal/usage/{jti} for the PostgreSQL scorecard.
+// SandboxUsage is returned in memory by ProxyHandler.FinishSession for run telemetry and scorecards.
 message SandboxUsage {
   string jti = 1;
   int32 requests = 2;

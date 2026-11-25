@@ -1,54 +1,7 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: postgres-ingress-controller-only
-  namespace: review-system
-spec:
-  podSelector:
-    matchLabels:
-      app: postgres
-  policyTypes:
-    - Ingress
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app: review-controller
-      ports:
-        - protocol: TCP
-          port: 5432
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: adapter-ingress-sandbox-and-controller
-  namespace: review-system
-spec:
-  podSelector:
-    matchLabels:
-      app: inference-adapter
-  policyTypes:
-    - Ingress
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: review-sandbox
-      ports:
-        - protocol: TCP
-          port: 8080
-    - from:
-        - podSelector:
-            matchLabels:
-              app: review-controller
-      ports:
-        - protocol: TCP
-          port: 9090
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: controller-ingress-load-balancer-only
+  name: controller-ingress-policy
   namespace: review-system
 spec:
   podSelector:
@@ -65,3 +18,10 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: review-sandbox
+      ports:
+        - protocol: TCP
+          port: 8081

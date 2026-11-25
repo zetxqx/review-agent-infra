@@ -53,9 +53,7 @@ type Config struct {
 	TopN                   int
 	SupportsFileComments   bool
 	MaxCheckLogBytes       int
-	AdapterSandboxURL      string
-	AdapterInternalURL     string
-	TokenKey               []byte
+	ControllerSandboxURL   string
 	ModelAlias             string
 	RateLimitWindow        time.Duration
 	MaxRunsPerRepoWindow   int

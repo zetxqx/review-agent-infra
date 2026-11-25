@@ -191,6 +191,10 @@ func (p *Plugin) FetchBaseRules(ctx context.Context, repo, baseSHA string, chang
 	return rules, nil
 }
 
+func (p *Plugin) ListPublishedFingerprints(_ context.Context, _ string, _ int) ([]string, error) {
+	return nil, nil
+}
+
 func (p *Plugin) PublishReview(_ context.Context, req contract.PublishRequest) (*contract.PublishResult, error) {
 	p.Published = append(p.Published, req)
 	comments := make([]contract.PublishedComment, 0, len(req.Inlines)+len(req.FileComments))
