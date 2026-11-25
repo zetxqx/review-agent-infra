@@ -1,0 +1,43 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: review-controller-backend
+  namespace: review-system
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    port: 8080
+    checkIntervalSec: 10
+    timeoutSec: 5
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: review-webhook-cert
+  namespace: review-system
+spec:
+  domains:
+    - review-webhook.example.com
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: review-webhook
+  namespace: review-system
+  annotations:
+    kubernetes.io/ingress.class: gce
+    kubernetes.io/ingress.global-static-ip-name: review-webhook-ip
+    networking.gke.io/managed-certificates: review-webhook-cert
+spec:
+  rules:
+    - host: review-webhook.example.com
+      http:
+        paths:
+          - path: /webhook/github
+            pathType: Exact
+            backend:
+              service:
+                name: review-controller
+                port:
+                  number: 8080

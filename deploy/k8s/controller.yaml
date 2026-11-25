@@ -6,7 +6,9 @@ metadata:
   labels:
     app: review-controller
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: review-controller
@@ -35,6 +37,8 @@ spec:
             - "--runtime-class=gvisor"
             - "--adapter-sandbox-url=http://inference-adapter.review-system.svc.cluster.local:8080"
             - "--adapter-internal-url=http://inference-adapter.review-system.svc.cluster.local:9090"
+            - "--max-concurrent-runs=1"
+            - "--config=/etc/review/harness.json"
           ports:
             - name: http
               containerPort: 8080
@@ -60,6 +64,21 @@ spec:
                 secretKeyRef:
                   name: review-system-secrets
                   key: github_private_key_pem
+            - name: GITHUB_APP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: review-system-config
+                  key: github_app_id
+            - name: GITHUB_INSTALLATION_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: review-system-config
+                  key: github_installation_id
+            - name: SANDBOX_LOADER_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: review-system-config
+                  key: sandbox_image
           readinessProbe:
             httpGet:
               path: /healthz
@@ -80,6 +99,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: harness-config
+              mountPath: /etc/review
+              readOnly: true
           resources:
             requests:
               cpu: 250m
@@ -91,6 +113,9 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 2Gi
+        - name: harness-config
+          configMap:
+            name: review-harness-config
 ---
 apiVersion: v1
 kind: Service
@@ -99,6 +124,9 @@ metadata:
   namespace: review-system
   labels:
     app: review-controller
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "review-controller-backend"}'
 spec:
   selector:
     app: review-controller
