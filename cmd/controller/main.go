@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,6 +77,14 @@ func main() {
 func parseControllerFlags(args []string) (controllerFlags, error) {
 	fs := flag.NewFlagSet("controller", flag.ContinueOnError)
 	var f controllerFlags
+	appIDDefault, err := envInt64("GITHUB_APP_ID")
+	if err != nil {
+		return f, err
+	}
+	installIDDefault, err := envInt64("GITHUB_INSTALLATION_ID")
+	if err != nil {
+		return f, err
+	}
 	fs.StringVar(&f.listenAddr, "listen-addr", envOrDefault("CONTROLLER_LISTEN_ADDR", ":8080"), "")
 	fs.StringVar(&f.databaseURL, "database-url", os.Getenv("DATABASE_URL"), "")
 	fs.BoolVar(&f.inMemoryStore, "in-memory-store", os.Getenv("CONTROLLER_IN_MEMORY_STORE") == "true", "")
@@ -96,8 +105,8 @@ func parseControllerFlags(args []string) (controllerFlags, error) {
 	fs.StringVar(&f.modelAlias, "model-alias", envOrDefault("MODEL_ALIAS", "review-coder"), "")
 	fs.StringVar(&f.tokenKey, "token-key", os.Getenv("ADAPTER_TOKEN_KEY"), "")
 	fs.StringVar(&f.tokenKeyHex, "token-key-hex", os.Getenv("ADAPTER_TOKEN_KEY_HEX"), "")
-	fs.Int64Var(&f.githubAppID, "github-app-id", 0, "")
-	fs.Int64Var(&f.githubInstallID, "github-installation-id", 0, "")
+	fs.Int64Var(&f.githubAppID, "github-app-id", appIDDefault, "")
+	fs.Int64Var(&f.githubInstallID, "github-installation-id", installIDDefault, "")
 	fs.StringVar(&f.githubKeyFile, "github-private-key-file", os.Getenv("GITHUB_PRIVATE_KEY_FILE"), "")
 	fs.StringVar(&f.githubKeyPEM, "github-private-key-pem", os.Getenv("GITHUB_PRIVATE_KEY_PEM"), "")
 	fs.StringVar(&f.githubToken, "github-token", os.Getenv("GITHUB_TOKEN"), "")
@@ -172,6 +181,14 @@ func runController(ctx context.Context, args []string) error {
 		WebhookSecret:  []byte(flags.githubWebhookSec),
 		APIBaseURL:     flags.githubAPIURL,
 	})
+	if flags.sandboxRunner == "k8s" || flags.githubAppID > 0 {
+		checkCtx, cancelCheck := context.WithTimeout(ctx, 30*time.Second)
+		checkErr := vcs.CheckCredentials(checkCtx)
+		cancelCheck()
+		if checkErr != nil {
+			return fmt.Errorf("check GitHub credentials: %w", checkErr)
+		}
+	}
 
 	sbxRunner, reaper, closeRunner, err := buildControllerSandbox(flags)
 	if err != nil {
@@ -371,6 +388,14 @@ func loadHarnessConfigJSON(path string) (orchestrator.HarnessConfig, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return orchestrator.HarnessConfig{}, fmt.Errorf("decode harness config %s: %w", path, err)
 	}
+	for name, profile := range cfg.Profiles {
+		if profile.Budget == nil {
+			return orchestrator.HarnessConfig{}, fmt.Errorf("harness profile %q in %s has no budget", name, path)
+		}
+	}
+	if _, ok := cfg.Profiles[cfg.Default]; !ok {
+		return orchestrator.HarnessConfig{}, fmt.Errorf("default harness profile %q in %s is not defined", cfg.Default, path)
+	}
 	return cfg, nil
 }
 
@@ -390,6 +415,18 @@ func defaultWorkerID() string {
 		return "controller-0"
 	}
 	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
+
+func envInt64(name string) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", name, err)
+	}
+	return v, nil
 }
 
 func envOrDefault(name, fallback string) string {

@@ -85,6 +85,10 @@ func NewPlugin(cfg Config) *Plugin {
 	}
 }
 
+func (p *Plugin) CheckCredentials(ctx context.Context) error {
+	return p.auth.Check(ctx)
+}
+
 func (p *Plugin) canFetchLivePR() bool {
 	return p.auth.HasCredentials() || p.apiBaseURL != defaultGitHubAPIBase
 }
