@@ -302,6 +302,102 @@ func TestK8sSandboxRunnerGrantsKitFinalizeGraceBeyondWallClock(t *testing.T) {
 	}
 }
 
+func TestBuildHardenedPodDefaultsLeaveRoomForPullPrepareAndFinalize(t *testing.T) {
+	pod := BuildHardenedPod("review-sbx-defaults", contract.SandboxSpec{
+		ShortRunID:     "d3f4u17",
+		Role:           "primary",
+		HarnessProfile: "openhands",
+		HarnessImage:   "registry.example/sandbox:1",
+		TimeoutSeconds: 1800,
+	}, K8sConfig{})
+	if got := ptr.Deref(pod.Spec.ActiveDeadlineSeconds, 0); got != 2400 {
+		t.Fatalf("expected activeDeadlineSeconds=2400 for an 1800 s wall clock, got %d", got)
+	}
+	// key: container name; value: CPU request, memory request, CPU limit, memory limit
+	want := map[string][4]string{
+		"loader":  {"50m", "128Mi", "1", "1Gi"},
+		"harness": {"500m", "1Gi", "2", "4Gi"},
+	}
+	for _, c := range pod.Spec.Containers {
+		w, ok := want[c.Name]
+		if !ok {
+			t.Fatalf("unexpected container %q", c.Name)
+		}
+		got := [4]string{
+			c.Resources.Requests.Cpu().String(),
+			c.Resources.Requests.Memory().String(),
+			c.Resources.Limits.Cpu().String(),
+			c.Resources.Limits.Memory().String(),
+		}
+		if got != w {
+			t.Fatalf("container %s resources (cpu req, mem req, cpu lim, mem lim) = %v, want %v", c.Name, got, w)
+		}
+	}
+}
+
+func TestK8sSandboxRunnerWaitsLongerForPodStartAndPrepare(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
+		p.Status.Phase = corev1.PodRunning
+		_ = cs.Tracker().Add(p)
+		return true, p, nil
+	})
+	tarPath := filepath.Join(t.TempDir(), "snap.tar.gz")
+	if err := os.WriteFile(tarPath, []byte("tgz-payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taskBytes, err := protojson.Marshal(&reviewv1.AgentTask{RunId: "run-prepare"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportOut, err := protojson.Marshal(&reviewv1.ReviewReport{
+		Provenance: &reviewv1.Provenance{Status: reviewv1.ReportStatus_REPORT_STATUS_OK},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var prepareBudget time.Duration
+	runner := NewK8sSandboxRunner(cs, nil, K8sConfig{
+		Namespace:    "review-sandbox",
+		PollInterval: 5 * time.Millisecond,
+		Executor: func(ctx context.Context, _, _ string, cmd []string, _ io.Reader, stdout io.Writer) error {
+			switch cmd[1] {
+			case "prepare":
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					return errors.New("prepare exec context has no deadline")
+				}
+				prepareBudget = time.Until(deadline)
+			case "read-report":
+				_, err := stdout.Write(reportOut)
+				return err
+			}
+			return nil
+		},
+	})
+	if runner.cfg.WaitRunningTimeout != 300*time.Second {
+		t.Fatalf("expected a 300 s default wait for the sandbox pod to start, got %v", runner.cfg.WaitRunningTimeout)
+	}
+	if _, err := runner.Run(context.Background(), contract.SandboxSpec{
+		ShortRunID:     "5c0ffee1",
+		Role:           "primary",
+		HarnessProfile: "openhands",
+		TarballPath:    tarPath,
+		// key: file path relative to /workspace/.review/in; value: raw file bytes
+		Inputs:         map[string][]byte{"task.json": taskBytes, "diff.patch": []byte("diff --git a/a.go b/a.go\n")},
+		AdapterURL:     "http://10.96.0.42:8080/v1",
+		TaskToken:      "jwt-secret-token",
+		TimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatalf("k8s runner run failed: %v", err)
+	}
+	if prepareBudget <= 80*time.Second || prepareBudget > 90*time.Second {
+		t.Fatalf("prepare exec budget = %v, want within (80s, 90s]", prepareBudget)
+	}
+}
+
 func TestOrphanPodReaper(t *testing.T) {
 	now := time.Now().UTC()
 	cs := fake.NewSimpleClientset(
