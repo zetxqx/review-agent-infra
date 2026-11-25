@@ -178,7 +178,7 @@ Python stays confined strictly inside the `harness` container behind the Protobu
   "git": { "baseRef": "base", "headRef": "pr" },
   "maskedFiles": ["AGENTS.md", ".codex/*"],
   "budget": {
-    "maxRequests": 60,
+    "maxRequests": 120,
     "maxContextTokens": 32768,
     "maxTotalTokens": "5000000",
     "normalizerReserveTokens": "50000",
@@ -238,7 +238,7 @@ harness:
       adapter: openhands
       image: ghcr.io/zetxqx/review-harness-openhands:1.0.0
       cache_shape: append_only
-      budget: { max_requests: 60, max_context_tokens: 32768, max_total_tokens: 5000000, normalizer_reserve_tokens: 50000, wall_clock_seconds: 900 }
+      budget: { max_requests: 120, max_context_tokens: 32768, max_total_tokens: 5000000, normalizer_reserve_tokens: 50000, wall_clock_seconds: 900 }
     pr-agent:
       adapter: pr-agent
       image: ghcr.io/zetxqx/review-harness-pr-agent:1.0.0
@@ -273,7 +273,7 @@ harness:
 | `POST /v1/responses` | Responses API (Codex CLI) | Stateless pass-through: forces `store=false`, strips `previous_response_id` and `conversation`, extracts usage from `response.completed`. |
 | `GET /v1/models` | Harness startup probe | Verifies Bearer token and returns single configured `model_alias`. |
 
-* **Atomic Budget & Request Enforcement (`SessionLedger`)**: Reserves `estimated_input + max_output_tokens` atomically before forwarding and settles to uncached work `(prompt - cached) + completion` afterward (charging estimate if a `2xx` stream drops without usage, while continuing to track raw prompt, cached, and completion totals separately). Enforces separate `max_requests` (60) and `max_normalize_requests` (2) counters plus `normalizer_reserve_tokens` (50,000 for multi-turn profiles; 20,000 for single-shot), so spoofing `x-review-phase: normalize` cannot bypass request caps or exceed `max_total_tokens`. Returns HTTP `403` (`budget_exhausted` / `request_limit_exhausted`) so SDKs do not auto-retry.
+* **Atomic Budget & Request Enforcement (`SessionLedger`)**: Reserves `estimated_input + max_output_tokens` atomically before forwarding and settles to uncached work `(prompt - cached) + completion` afterward (charging estimate if a `2xx` stream drops without usage, while continuing to track raw prompt, cached, and completion totals separately). Enforces separate `max_requests` (120 for OpenHands) and `max_normalize_requests` (2) counters plus `normalizer_reserve_tokens` (50,000 for multi-turn profiles; 20,000 for single-shot), so spoofing `x-review-phase: normalize` cannot bypass request caps or exceed `max_total_tokens`. Returns HTTP `403` (`budget_exhausted` / `request_limit_exhausted`) so SDKs do not auto-retry.
 
 #### 3.5.1 Prefix-Cache Compatibility Matrix
 

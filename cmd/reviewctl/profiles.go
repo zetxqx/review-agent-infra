@@ -40,7 +40,7 @@ func builtinProfiles() map[string]ProfileSpec {
 			Image:             "review-agent-infra/poc-sandbox:local",
 			DefaultConfidence: 0.80,
 			Budget: &reviewv1.TaskBudget{
-				MaxRequests:             60,
+				MaxRequests:             120,
 				MaxContextTokens:        32768,
 				MaxTotalTokens:          5000000,
 				NormalizerReserveTokens: 50000,
