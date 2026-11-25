@@ -15,22 +15,36 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/loader ./cmd/loader
 
 FROM python:3.12-slim-bookworm
 
+ARG PIP_INDEX_URL
+ARG PIP_TRUSTED_HOST
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ripgrep ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends git ripgrep ca-certificates tmux \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --gid 65532 nonroot \
+ && useradd --uid 65532 --gid 65532 --home-dir /scratch/home --no-create-home --shell /bin/bash nonroot
+COPY deploy/docker/openhands-requirements.txt /tmp/openhands-requirements.txt
+RUN python3 -m venv /opt/openhands \
+ && /opt/openhands/bin/pip install --no-cache-dir \
+      ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} \
+      -r /tmp/openhands-requirements.txt \
+ && rm /tmp/openhands-requirements.txt \
+ && ln -s /opt/openhands/bin/openhands /usr/local/bin/openhands
 
 COPY --from=loader-builder /out/loader /usr/local/bin/loader
 COPY gen/schema/llm_review_report.schema.json /opt/kit/share/llm_review_report.schema.json
 COPY python /tmp/review-harness-kit
 
 RUN python3 -m venv /opt/kit \
- && /opt/kit/bin/pip install --no-cache-dir /tmp/review-harness-kit \
+ && /opt/kit/bin/pip install --no-cache-dir \
+      ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} \
+      /tmp/review-harness-kit \
  && rm -rf /tmp/review-harness-kit \
  && ln -s /opt/kit/bin/review-kit /usr/local/bin/review-kit \
  && cp /opt/kit/lib/python3.12/site-packages/review_harness_kit/prompts/review_task.md /opt/kit/share/review_task.md \
  && mkdir -p /workspace/src /workspace/.review/in /workspace/.review/out /scratch/home \
  && chown -R 65532:65532 /workspace /scratch
 
+ENV USER=nonroot LOGNAME=nonroot
 USER 65532:65532
 WORKDIR /workspace
 CMD ["review-kit", "wait"]
