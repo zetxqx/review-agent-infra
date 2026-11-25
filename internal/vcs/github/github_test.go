@@ -468,3 +468,61 @@ func TestFetchDiffTarballRulesCheckLogsPublishIdempotencyAndFeedback(t *testing.
 		t.Fatalf("unexpected feedback samples: %+v", fb)
 	}
 }
+
+func TestCheckCredentialsVerifiesAppAndMintsInstallationToken(t *testing.T) {
+	ctx := context.Background()
+	appKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var tokenExchanges atomic.Int32
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		tok, parseErr := jwt.Parse(bearer, func(_ *jwt.Token) (any, error) {
+			return &appKey.PublicKey, nil
+		})
+		if parseErr != nil || !tok.Valid {
+			http.Error(w, `{"message":"A JSON web token could not be decoded"}`, http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/app":
+			_, _ = w.Write([]byte(`{"id":123,"slug":"review-bot"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/77/access_tokens":
+			tokenExchanges.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"ghs_check_token","expires_at":"2099-01-01T00:00:00Z"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghSrv.Close()
+
+	good := NewPlugin(Config{AppID: 123, InstallationID: 77, PrivateKey: appKey, APIBaseURL: ghSrv.URL})
+	if err := good.CheckCredentials(ctx); err != nil {
+		t.Fatalf("CheckCredentials with valid App credentials: %v", err)
+	}
+	if tokenExchanges.Load() != 1 {
+		t.Fatalf("expected one installation token exchange, got %d", tokenExchanges.Load())
+	}
+
+	wrongKey := NewPlugin(Config{AppID: 123, InstallationID: 77, PrivateKey: otherKey, APIBaseURL: ghSrv.URL})
+	if err := wrongKey.CheckCredentials(ctx); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected a 401 error for a key GitHub does not accept, got %v", err)
+	}
+
+	missing := NewPlugin(Config{APIBaseURL: ghSrv.URL})
+	if err := missing.CheckCredentials(ctx); err == nil {
+		t.Fatal("expected an error when no GitHub credentials are configured")
+	}
+
+	static := NewPlugin(Config{StaticToken: "ghs_static", APIBaseURL: ghSrv.URL})
+	if err := static.CheckCredentials(ctx); err != nil {
+		t.Fatalf("CheckCredentials with a static token: %v", err)
+	}
+}

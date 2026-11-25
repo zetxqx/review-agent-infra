@@ -103,6 +103,41 @@ func (a *AppAuthenticator) MintAppJWT() (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(a.privateKey)
 }
 
+func (a *AppAuthenticator) Check(ctx context.Context) error {
+	if a.staticToken != "" {
+		return nil
+	}
+	appJWT, err := a.MintAppJWT()
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.apiBaseURL+"/app", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("verify GitHub App: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if a.installationID > 0 {
+		if _, err := a.TokenForRepo(ctx, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (a *AppAuthenticator) TokenForRepo(ctx context.Context, repo string) (string, error) {
 	if a.staticToken != "" {
 		return a.staticToken, nil
