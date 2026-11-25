@@ -12,3 +12,8 @@ func ClipLinePreview(s string, maxBytes int) string {
 	}
 	return trimmed[:maxBytes] + "..."
 }
+
+func FirstLineOf(s string) string {
+	idx := strings.IndexByte(s, '\n')
+	return s[:idx]
+}
