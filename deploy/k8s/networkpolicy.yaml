@@ -4,9 +4,7 @@ metadata:
   name: sandbox-egress-adapter-only
   namespace: review-sandbox
 spec:
-  podSelector:
-    matchLabels:
-      app: review-sandbox
+  podSelector: {}
   policyTypes:
     - Ingress
     - Egress

@@ -53,8 +53,11 @@ k8s-apply:
 	kubectl apply -f deploy/k8s/namespaces.yaml
 	kubectl apply -f deploy/k8s/rbac.yaml
 	kubectl apply -f deploy/k8s/networkpolicy.yaml
+	kubectl apply -f deploy/k8s/networkpolicy-review-system.yaml
+	kubectl apply -f deploy/k8s/postgres.yaml
 	kubectl apply -f deploy/k8s/adapter.yaml
 	kubectl apply -f deploy/k8s/controller.yaml
+	kubectl apply -f deploy/k8s/ingress.yaml
 
 smoke: build
 	./$(BIN_DIR)/reviewctl compare --repo $(SMOKE_REPO) --commit HEAD --harnesses single-shot,mock-llm --mock-upstream
