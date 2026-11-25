@@ -59,13 +59,13 @@ func NewK8sSandboxRunner(clientset kubernetes.Interface, restCfg *rest.Config, c
 		cfg.RuntimeClassName = "gvisor"
 	}
 	if cfg.WaitRunningTimeout <= 0 {
-		cfg.WaitRunningTimeout = 120 * time.Second
+		cfg.WaitRunningTimeout = 300 * time.Second
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 250 * time.Millisecond
 	}
 	if cfg.ActiveDeadlinePaddingSeconds <= 0 {
-		cfg.ActiveDeadlinePaddingSeconds = 300
+		cfg.ActiveDeadlinePaddingSeconds = 600
 	}
 	return &K8sSandboxRunner{
 		clientset: clientset,
@@ -121,7 +121,7 @@ func BuildHardenedPod(podName string, spec contract.SandboxSpec, cfg K8sConfig) 
 	}
 	padSec := cfg.ActiveDeadlinePaddingSeconds
 	if padSec <= 0 {
-		padSec = 300
+		padSec = 600
 	}
 	role := spec.Role
 	if role == "" {
@@ -187,6 +187,10 @@ func BuildHardenedPod(podName string, spec contract.SandboxSpec, cfg K8sConfig) 
 					Command:         []string{"/usr/local/bin/loader", "wait"},
 					SecurityContext: containerSecurity.DeepCopy(),
 					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("50m"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
 						Limits: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("1"),
 							corev1.ResourceMemory: resource.MustParse("1Gi"),
@@ -205,6 +209,10 @@ func BuildHardenedPod(podName string, spec contract.SandboxSpec, cfg K8sConfig) 
 					Command:         []string{"review-kit", "wait"},
 					SecurityContext: containerSecurity.DeepCopy(),
 					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("500m"),
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
+						},
 						Limits: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("2"),
 							corev1.ResourceMemory: resource.MustParse("4Gi"),
@@ -237,7 +245,7 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 		timeoutSec = 900
 	}
 	kitTimeout := kitExecTimeout(timeoutSec)
-	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+180*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+r.cfg.WaitRunningTimeout+240*time.Second)
 	defer cancel()
 
 	podName := PodNameFor(spec)
@@ -278,7 +286,7 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) (
 	if err != nil {
 		return nil, err
 	}
-	if err := r.execStep(runCtx, podName, "loader", []string{"/usr/local/bin/loader", "prepare"}, 30*time.Second, bytes.NewReader(inputsTar), nil); err != nil {
+	if err := r.execStep(runCtx, podName, "loader", []string{"/usr/local/bin/loader", "prepare"}, 90*time.Second, bytes.NewReader(inputsTar), nil); err != nil {
 		return nil, fmt.Errorf("prepare workspace: %w", err)
 	}
 
