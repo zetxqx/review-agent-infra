@@ -37,6 +37,29 @@ def _extract_jsonl_agent_messages(log_text: str) -> str:
     return "\n\n".join(messages)
 
 
+MIN_CONDENSER_MAX_EVENTS = 240
+CONDENSER_EVENTS_PER_REQUEST = 4
+
+
+def condenser_max_events(task: review_pb2.AgentTask) -> int:
+    return max(MIN_CONDENSER_MAX_EVENTS, CONDENSER_EVENTS_PER_REQUEST * task.budget.max_requests)
+
+
+def build_agent_settings(task: review_pb2.AgentTask) -> dict[str, object]:
+    model = f"openai/{task.model_alias or 'default'}"
+    return {
+        "kind": "Agent",
+        "llm": {"model": model, "usage_id": "agent"},
+        "tools": [{"name": "terminal"}, {"name": "file_editor"}],
+        "condenser": {
+            "kind": "LLMSummarizingCondenser",
+            "llm": {"model": model, "usage_id": "condenser"},
+            "max_size": condenser_max_events(task),
+            "keep_first": 4,
+        },
+    }
+
+
 class OpenHandsAdapter:
     name = "openhands"
     cache_shape = "append_only"
@@ -44,6 +67,7 @@ class OpenHandsAdapter:
     def prepare(self, task: review_pb2.AgentTask, ctx: RunContext) -> HarnessInvocation:
         oh_dir = ctx.home / ".openhands"
         oh_dir.mkdir(parents=True, exist_ok=True)
+        (oh_dir / "agent_settings.json").write_text(json.dumps(build_agent_settings(task)), encoding="utf-8")
         hirc_file = ctx.home / ".hirc"
         if not hirc_file.exists():
             hirc_file.write_text("user_consents_to_publishing_history: false\n", encoding="utf-8")
