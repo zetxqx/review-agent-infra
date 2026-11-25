@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -153,9 +154,15 @@ func (o *Orchestrator) processRun(parentCtx context.Context, rec *store.RunRecor
 
 	go o.keepLeaseAlive(runCtx, runCancel, rec.ID)
 
+	slog.Info("run claimed", "run_id", rec.ID.String(), "repo", rec.Repo, "pr", rec.PRNumber, "head_sha", rec.HeadSHA, "attempt", rec.Attempt, "trigger", rec.TriggerType)
 	started := time.Now()
 	err := o.executeReview(runCtx, rec)
 	elapsed := time.Since(started)
+	if err != nil {
+		slog.Error("run failed", "run_id", rec.ID.String(), "duration_ms", elapsed.Milliseconds(), "error", err.Error())
+	} else {
+		slog.Info("run finished", "run_id", rec.ID.String(), "duration_ms", elapsed.Milliseconds())
+	}
 
 	profileName := o.cfg.Harness.Default
 	if rec.HarnessProfile != nil && *rec.HarnessProfile != "" {
@@ -437,6 +444,7 @@ func (o *Orchestrator) runShard(
 	if usage != nil && o.cfg.AdapterInternalURL != "" {
 		o.telemetry.AddTokens(rec.Repo, profile.Name, usage.PromptTokens, usage.CompletionTokens, usage.CachedTokens)
 	}
+	logShardFinished(runIDStr, shardIdx, role, profile.Name, elapsed, report, usage, runErr)
 
 	return shardOutcome{
 		shardIndex: shardIdx,
@@ -561,6 +569,7 @@ func (o *Orchestrator) denoiseAndPublish(
 	}
 
 	if rec.TriggerType == "auto" && len(finalItems) == 0 && len(failedShards) == 0 {
+		slog.Info("review not published", "run_id", rec.ID.String(), "reason", "no_findings")
 		doneOK, doneErr := o.store.MarkDoneIfActive(ctx, rec.ID, o.cfg.WorkerID)
 		if doneErr != nil {
 			return doneErr
@@ -579,6 +588,7 @@ func (o *Orchestrator) denoiseAndPublish(
 		return err
 	}
 	if liveSHA != rec.HeadSHA {
+		slog.Info("review not published", "run_id", rec.ID.String(), "reason", "head_moved", "live_head_sha", liveSHA)
 		_ = o.store.MarkSuperseded(ctx, rec.ID)
 		o.telemetry.IncRun(rec.Repo, profile.Name, store.StatusSuperseded)
 		return nil
@@ -587,6 +597,9 @@ func (o *Orchestrator) denoiseAndPublish(
 	pubRes, err := o.vcs.PublishReview(ctx, pubReq)
 	if err != nil {
 		return err
+	}
+	if pubRes != nil {
+		slog.Info("review published", "run_id", rec.ID.String(), "repo", rec.Repo, "pr", rec.PRNumber, "review_id", pubRes.ReviewID, "comments", len(pubRes.Comments), "findings", len(finalItems))
 	}
 
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -916,4 +929,26 @@ func randomTokenHex(nBytes int) string {
 	b := make([]byte, nBytes)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func logShardFinished(runID string, shardIdx int, role, profile string, elapsed time.Duration, report *reviewv1.ReviewReport, usage *reviewv1.SandboxUsage, runErr error) {
+	status := report.GetProvenance().GetStatus().String()
+	if runErr != nil {
+		status = "sandbox_error"
+	}
+	attrs := []any{"run_id", runID, "shard", shardIdx, "role", role, "profile", profile, "status", status, "duration_ms", elapsed.Milliseconds()}
+	if usage != nil {
+		attrs = append(attrs,
+			"requests", usage.GetRequests(),
+			"normalize_requests", usage.GetNormalizeRequests(),
+			"rejected_requests", usage.GetRejectedRequests(),
+			"prompt_tokens", usage.GetPromptTokens(),
+			"cached_tokens", usage.GetCachedTokens(),
+			"completion_tokens", usage.GetCompletionTokens(),
+		)
+	}
+	if runErr != nil {
+		attrs = append(attrs, "error", runErr.Error())
+	}
+	slog.Info("shard finished", attrs...)
 }

@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -64,6 +65,7 @@ type controllerFlags struct {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
@@ -280,9 +282,11 @@ func handleGitHubWebhook(w http.ResponseWriter, r *http.Request, vcs contract.VC
 	ev, err := vcs.VerifyAndParseWebhook(r.Context(), r.Header, body)
 	if err != nil {
 		if errors.Is(err, ghvcs.ErrInvalidWebhookSignature) {
+			slog.Warn("webhook rejected", "reason", "invalid_signature")
 			writeJSON(w, http.StatusUnauthorized, webhookResponse{Status: "unauthorized", Reason: "invalid_signature"})
 			return
 		}
+		slog.Warn("webhook rejected", "reason", "bad_request", "error", err.Error())
 		writeJSON(w, http.StatusBadRequest, webhookResponse{Status: "bad_request", Reason: err.Error()})
 		return
 	}
@@ -311,6 +315,7 @@ func handleGitHubWebhook(w http.ResponseWriter, r *http.Request, vcs contract.VC
 	} else if res.Enqueued {
 		code = http.StatusAccepted
 	}
+	slog.Info("webhook", "event", ev.GetEventKind().String(), "repo", ev.GetRepo(), "pr", ev.GetPrNumber(), "trigger", ev.GetTriggerType().String(), "http_status", code, "action", res.Action, "allowed", res.Allowed, "reason", res.Reason, "run_id", resp.RunID)
 	writeJSON(w, code, resp)
 }
 

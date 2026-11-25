@@ -308,22 +308,24 @@ func (r *K8sSandboxRunner) waitRunning(ctx context.Context, podName string) erro
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
 
+	var last *corev1.Pod
 	for {
 		pod, err := r.clientset.CoreV1().Pods(r.cfg.Namespace).Get(waitCtx, podName, metav1.GetOptions{})
 		if err == nil {
+			last = pod
 			switch pod.Status.Phase {
 			case corev1.PodRunning:
 				return nil
 			case corev1.PodFailed, corev1.PodSucceeded:
 				return fmt.Errorf("sandbox pod %s terminated prematurely with phase %s", podName, pod.Status.Phase)
 			}
-		} else if !apierrors.IsNotFound(err) {
+		} else if waitCtx.Err() == nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return fmt.Errorf("wait sandbox pod %s running: %w", podName, waitCtx.Err())
+			return fmt.Errorf("wait sandbox pod %s running: %w%s", podName, waitCtx.Err(), podStuckReasons(last))
 		case <-ticker.C:
 		}
 	}
@@ -364,9 +366,11 @@ func (r *K8sSandboxRunner) execStep(ctx context.Context, podName, container stri
 	if err != nil {
 		return err
 	}
-	return exec.StreamWithContext(execCtx, remotecommand.StreamOptions{
+	stderr := &stderrTail{max: 4096}
+	streamErr := exec.StreamWithContext(execCtx, remotecommand.StreamOptions{
 		Stdin:  stdin,
 		Stdout: stdout,
-		Stderr: io.Discard,
+		Stderr: stderr,
 	})
+	return withStderr(streamErr, stderr.String())
 }
