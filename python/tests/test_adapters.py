@@ -94,6 +94,26 @@ def test_pr_agent_prepare_and_deterministic_yaml_extract(tmp_path: Path) -> None
     assert not finding.HasField("confidence")
 
 
+@pytest.mark.parametrize(("max_requests", "want_max_size"), [(0, 240), (60, 240), (120, 480)])
+def test_openhands_prepare_persists_agent_settings_with_budget_sized_condenser(
+    tmp_path: Path, max_requests: int, want_max_size: int
+) -> None:
+    task = review_pb2.AgentTask(src_dir=str(tmp_path / "src"), out_dir=str(tmp_path / "out"), model_alias="qwen-coder")
+    task.budget.max_requests = max_requests
+    ctx = make_run_context(tmp_path)
+
+    inv = OpenHandsAdapter().prepare(task, ctx)
+
+    settings_path = Path(inv.env["OPENHANDS_PERSISTENCE_DIR"]) / "agent_settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings["kind"] == "Agent"
+    assert settings["llm"]["model"] == "openai/qwen-coder"
+    assert settings["condenser"]["kind"] == "LLMSummarizingCondenser"
+    assert settings["condenser"]["max_size"] == want_max_size
+    assert settings["condenser"]["llm"]["model"] == "openai/qwen-coder"
+    assert ctx.api_key not in settings_path.read_text(encoding="utf-8")
+
+
 def test_openhands_prepare_collect_and_fallback(tmp_path: Path) -> None:
     adapter = OpenHandsAdapter()
     out_dir = tmp_path / "out"
