@@ -737,3 +737,207 @@ func TestCheckCapturesBotLoginAndRejectsForeignBotMarkers(t *testing.T) {
 		t.Fatalf("ListPublishedFingerprints = %v, want [fp_own_bot]", fps)
 	}
 }
+
+func TestStaticTokenMarkerTrustRequiresTokenOwnerLogin(t *testing.T) {
+	ctx := context.Background()
+
+	var userCalls atomic.Int32
+	var postCalls atomic.Int32
+	var postedBody atomic.Value
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			userCalls.Add(1)
+			if r.Header.Get("Authorization") != "Bearer ghp_owner" {
+				http.Error(w, "bad token", http.StatusUnauthorized)
+				return
+			}
+			_, _ = io.WriteString(w, `{"login":"Review-Owner","type":"User"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/7/reviews":
+			_ = json.NewEncoder(w).Encode([]ghReviewRecord{
+				{ID: 1, Body: "<!-- review-run: run-spoof sha: h1 fps: fp_spoofed --> attacker", User: ghUser{Login: "attacker", Type: "User"}},
+				{ID: 2, Body: "<!-- review-run: run-own sha: h1 fps: fp_own --> owner", User: ghUser{Login: "review-owner", Type: "User"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/7/comments":
+			_ = json.NewEncoder(w).Encode([]ghCommentRecord{
+				{ID: 10, Body: "spoof\n<!-- fp:fp_spoof_inline -->", User: ghUser{Login: "attacker", Type: "User"}},
+				{ID: 11, Body: "own\n<!-- fp:fp_own_inline -->", User: ghUser{Login: "review-owner", Type: "User"}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/llm-d/router/pulls/7/reviews":
+			postCalls.Add(1)
+			raw, _ := io.ReadAll(r.Body)
+			postedBody.Store(string(raw))
+			_, _ = io.WriteString(w, `{"id":321}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/7/reviews/321/comments":
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghSrv.Close()
+
+	plugin := NewPlugin(Config{StaticToken: "ghp_owner", APIBaseURL: ghSrv.URL})
+
+	fps, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 7)
+	if err != nil {
+		t.Fatalf("ListPublishedFingerprints: %v", err)
+	}
+	if !slices.Equal(fps, []string{"fp_own"}) {
+		t.Fatalf("ListPublishedFingerprints = %v, want [fp_own]", fps)
+	}
+
+	res, err := plugin.PublishReview(ctx, contract.PublishRequest{
+		Repo:     "llm-d/router",
+		PRNumber: 7,
+		CommitID: "h2",
+		RunID:    "run-spoof",
+		Summary:  "Static token review.",
+		Inlines: []contract.InlineComment{
+			{Fingerprint: "fp_spoof_inline", File: "a.go", Line: 1, Body: "real finding a"},
+			{Fingerprint: "fp_spoofed", File: "b.go", Line: 2, Body: "real finding b"},
+			{Fingerprint: "fp_own_inline", File: "c.go", Line: 3, Body: "already posted"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PublishReview: %v", err)
+	}
+	if postCalls.Load() != 1 || res.ReviewID != 321 {
+		t.Fatalf("expected spoofed run marker ignored and review posted, got calls=%d res=%+v", postCalls.Load(), res)
+	}
+	body, _ := postedBody.Load().(string)
+	if !strings.Contains(body, "fp:fp_spoof_inline") || !strings.Contains(body, "fp:fp_spoofed") || strings.Contains(body, "fp:fp_own_inline") {
+		t.Fatalf("unexpected posted review payload: %s", body)
+	}
+	for _, c := range res.Comments {
+		if c.CommentID == 10 {
+			t.Fatalf("fallback comment collection returned untrusted author comment: %+v", res.Comments)
+		}
+	}
+	if len(res.Comments) != 1 || res.Comments[0].CommentID != 11 || res.Comments[0].Fingerprint != "fp_own_inline" {
+		t.Fatalf("expected only the token owner comment from fallback collection, got %+v", res.Comments)
+	}
+	if userCalls.Load() != 1 {
+		t.Fatalf("expected token owner login resolved once and cached, got %d /user calls", userCalls.Load())
+	}
+}
+
+func TestStaticTokenMarkerTrustFallbacks(t *testing.T) {
+	ctx := context.Background()
+	reviews := []ghReviewRecord{
+		{ID: 1, Body: "<!-- review-run: r1 sha: h1 fps: fp_user -->", User: ghUser{Login: "someone", Type: "User"}},
+		{ID: 2, Body: "<!-- review-run: r2 sha: h1 fps: fp_bot -->", User: ghUser{Login: "github-actions[bot]", Type: "Bot"}},
+		{ID: 3, Body: "<!-- review-run: r3 sha: h1 fps: fp_owner -->", User: ghUser{Login: "owner", Type: "User"}},
+	}
+
+	newServer := func(userHandler func(w http.ResponseWriter, call int32)) (*httptest.Server, *atomic.Int32) {
+		var userCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/user":
+				userHandler(w, userCalls.Add(1))
+			case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/5/reviews":
+				_ = json.NewEncoder(w).Encode(reviews)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		return srv, &userCalls
+	}
+
+	listTwice := func(t *testing.T, plugin *Plugin) ([]string, []string) {
+		t.Helper()
+		first, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 5)
+		if err != nil {
+			t.Fatalf("first ListPublishedFingerprints: %v", err)
+		}
+		second, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 5)
+		if err != nil {
+			t.Fatalf("second ListPublishedFingerprints: %v", err)
+		}
+		return first, second
+	}
+
+	t.Run("user endpoint missing keeps legacy trust", func(t *testing.T) {
+		srv, userCalls := newServer(func(w http.ResponseWriter, _ int32) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		})
+		defer srv.Close()
+		first, second := listTwice(t, NewPlugin(Config{StaticToken: "ghp_mock", APIBaseURL: srv.URL}))
+		want := []string{"fp_bot", "fp_owner", "fp_user"}
+		if !slices.Equal(first, want) || !slices.Equal(second, want) {
+			t.Fatalf("got %v and %v, want %v", first, second, want)
+		}
+		if userCalls.Load() != 1 {
+			t.Fatalf("expected 404 outcome cached, got %d /user calls", userCalls.Load())
+		}
+	})
+
+	t.Run("empty login keeps legacy trust", func(t *testing.T) {
+		srv, _ := newServer(func(w http.ResponseWriter, _ int32) {
+			_, _ = io.WriteString(w, `{}`)
+		})
+		defer srv.Close()
+		first, _ := listTwice(t, NewPlugin(Config{StaticToken: "ghp_mock", APIBaseURL: srv.URL}))
+		if want := []string{"fp_bot", "fp_owner", "fp_user"}; !slices.Equal(first, want) {
+			t.Fatalf("got %v, want %v", first, want)
+		}
+	})
+
+	t.Run("integration token forbidden trusts only bots", func(t *testing.T) {
+		srv, userCalls := newServer(func(w http.ResponseWriter, _ int32) {
+			http.Error(w, `{"message":"Resource not accessible by integration"}`, http.StatusForbidden)
+		})
+		defer srv.Close()
+		first, second := listTwice(t, NewPlugin(Config{StaticToken: "ghs_actions", APIBaseURL: srv.URL}))
+		want := []string{"fp_bot"}
+		if !slices.Equal(first, want) || !slices.Equal(second, want) {
+			t.Fatalf("got %v and %v, want %v", first, second, want)
+		}
+		if userCalls.Load() != 1 {
+			t.Fatalf("expected 403 outcome cached, got %d /user calls", userCalls.Load())
+		}
+	})
+
+	t.Run("transient failure is not cached", func(t *testing.T) {
+		srv, userCalls := newServer(func(w http.ResponseWriter, call int32) {
+			if call == 1 {
+				http.Error(w, "upstream down", http.StatusBadGateway)
+				return
+			}
+			_, _ = io.WriteString(w, `{"login":"owner"}`)
+		})
+		defer srv.Close()
+		first, second := listTwice(t, NewPlugin(Config{StaticToken: "ghp_owner", APIBaseURL: srv.URL}))
+		if !slices.Equal(first, []string{"fp_bot"}) || !slices.Equal(second, []string{"fp_owner"}) {
+			t.Fatalf("got %v then %v, want [fp_bot] then [fp_owner]", first, second)
+		}
+		if userCalls.Load() != 2 {
+			t.Fatalf("expected retry after transient failure, got %d /user calls", userCalls.Load())
+		}
+	})
+
+	t.Run("concurrent resolution is race free", func(t *testing.T) {
+		srv, _ := newServer(func(w http.ResponseWriter, _ int32) {
+			_, _ = io.WriteString(w, `{"login":"OWNER"}`)
+		})
+		defer srv.Close()
+		plugin := NewPlugin(Config{StaticToken: "ghp_owner", APIBaseURL: srv.URL})
+		results := make(chan []string, 8)
+		errs := make(chan error, 8)
+		for range 8 {
+			go func() {
+				fps, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 5)
+				errs <- err
+				results <- fps
+			}()
+		}
+		for range 8 {
+			if err := <-errs; err != nil {
+				t.Fatalf("ListPublishedFingerprints: %v", err)
+			}
+			if fps := <-results; !slices.Equal(fps, []string{"fp_owner"}) {
+				t.Fatalf("got %v, want [fp_owner]", fps)
+			}
+		}
+	})
+}

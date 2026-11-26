@@ -688,3 +688,38 @@ func TestProxyUncachedBudgetForChatAndResponses(t *testing.T) {
 		t.Fatalf("expected raw prompt/cached/completion totals (3500/3150/350), got %+v", usagePB)
 	}
 }
+
+func TestSanitizePayloadCollapsesDualChatOutputTokenFields(t *testing.T) {
+	handler := NewProxyHandler(Config{ModelAlias: "review-model"})
+	claims := testClaims("jti-dual", 5, 100000, 0)
+	cases := []struct {
+		name    string
+		raw     string
+		wantKey string
+		wantOut int64
+		dropKey string
+	}{
+		{"completion small max huge", `{"messages":[],"max_completion_tokens":1,"max_tokens":999999}`, "max_completion_tokens", 1, "max_tokens"},
+		{"completion null max small", `{"messages":[],"max_completion_tokens":null,"max_tokens":10}`, "max_completion_tokens", 10, "max_tokens"},
+		{"completion huge max small", `{"messages":[],"max_completion_tokens":999999,"max_tokens":20}`, "max_completion_tokens", 20, "max_tokens"},
+		{"max tokens only", `{"messages":[],"max_tokens":999999}`, "max_tokens", 512, "max_completion_tokens"},
+		{"neither", `{"messages":[]}`, "max_tokens", 512, "max_completion_tokens"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, plan, err := handler.sanitizePayload("chat", []byte(tc.raw), claims)
+			if err != nil {
+				t.Fatalf("sanitizePayload: %v", err)
+			}
+			if _, present := out[tc.dropKey]; present {
+				t.Fatalf("expected %s removed, got %+v", tc.dropKey, out)
+			}
+			if got, _ := out[tc.wantKey].(int64); got != tc.wantOut {
+				t.Fatalf("%s = %v, want %d", tc.wantKey, out[tc.wantKey], tc.wantOut)
+			}
+			if plan.Estimate < tc.wantOut || plan.Estimate > tc.wantOut+200 {
+				t.Fatalf("estimate %d does not reserve forwarded output cap %d", plan.Estimate, tc.wantOut)
+			}
+		})
+	}
+}

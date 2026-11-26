@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
@@ -75,6 +76,9 @@ type Plugin struct {
 	auth          *AppAuthenticator
 	maxDiffBytes  int64
 	maxTarBytes   int64
+
+	staticTrustMu sync.Mutex
+	staticTrust   *markerTrust
 }
 
 func NewPlugin(cfg Config) *Plugin {
@@ -300,19 +304,6 @@ func formatReviewRunMarker(runID, commitID string, fps []string) string {
 	return fmt.Sprintf("<!-- review-run: %s sha: %s fps: %s -->", runID, commitID, strings.Join(uniq, ","))
 }
 
-func (p *Plugin) isTrustedMarkerAuthor(app *ghAppMeta, user ghUser) bool {
-	if p.auth.AppID() <= 0 {
-		return true
-	}
-	if app != nil && app.ID > 0 {
-		return app.ID == p.auth.AppID()
-	}
-	if botLogin := p.auth.BotLogin(); botLogin != "" {
-		return strings.EqualFold(strings.TrimSpace(user.Login), botLogin)
-	}
-	return isBotUser(user)
-}
-
 func (p *Plugin) listPRReviews(ctx context.Context, repo, owner, name string, prNumber int) ([]ghReviewRecord, error) {
 	var all []ghReviewRecord
 	for page := 1; page <= maxListPages; page++ {
@@ -342,11 +333,12 @@ func (p *Plugin) ListPublishedFingerprints(ctx context.Context, repo string, prN
 	if err != nil {
 		return nil, err
 	}
+	trust := p.markerTrustFor(ctx, repo)
 	// key: published finding fingerprint from PR review markers; value: true
 	seen := make(map[string]bool)
 	var out []string
 	for _, rv := range reviews {
-		if !p.isTrustedMarkerAuthor(rv.PerformedViaGitHubApp, rv.User) {
+		if !trust.allows(rv.PerformedViaGitHubApp, rv.User) {
 			continue
 		}
 		for _, m := range reReviewRunMarker.FindAllStringSubmatch(rv.Body, -1) {
@@ -596,8 +588,9 @@ func (p *Plugin) findExistingReviewByRunID(ctx context.Context, repo, owner, nam
 	if err != nil {
 		return 0, false, err
 	}
+	trust := p.markerTrustFor(ctx, repo)
 	for _, rv := range reviews {
-		if !p.isTrustedMarkerAuthor(rv.PerformedViaGitHubApp, rv.User) {
+		if !trust.allows(rv.PerformedViaGitHubApp, rv.User) {
 			continue
 		}
 		for _, m := range reReviewRunMarker.FindAllStringSubmatch(rv.Body, -1) {
@@ -613,6 +606,7 @@ func (p *Plugin) findExistingReviewByRunID(ctx context.Context, repo, owner, nam
 func (p *Plugin) listExistingPRCommentFingerprints(ctx context.Context, repo, owner, name string, prNumber int) (map[string]bool, error) {
 	// key: finding fingerprint; value: true when already present on PR review comments
 	out := make(map[string]bool)
+	trust := p.markerTrustFor(ctx, repo)
 	for page := 1; page <= maxListPages; page++ {
 		commentsPath := fmt.Sprintf("/repos/%s/%s/pulls/%d/comments?per_page=%d&page=%d", owner, name, prNumber, listPageSize, page)
 		raw, err := p.doBytes(ctx, repo, http.MethodGet, commentsPath, "application/vnd.github+json", nil, 4<<20)
@@ -624,7 +618,7 @@ func (p *Plugin) listExistingPRCommentFingerprints(ctx context.Context, repo, ow
 			return out, err
 		}
 		for _, c := range comments {
-			if !p.isTrustedMarkerAuthor(c.PerformedViaGitHubApp, c.User) {
+			if !trust.allows(c.PerformedViaGitHubApp, c.User) {
 				continue
 			}
 			if m := reFPMarker.FindStringSubmatch(c.Body); len(m) == 2 {
@@ -654,16 +648,17 @@ func (p *Plugin) collectPostedCommentsForReview(ctx context.Context, repo, owner
 		}
 	}
 
-	var ghComments []struct {
-		ID   int64  `json:"id"`
-		Body string `json:"body"`
-	}
+	var ghComments []ghCommentRecord
 	if err := json.Unmarshal(raw, &ghComments); err != nil {
 		return nil, err
 	}
 
+	trust := p.markerTrustFor(ctx, repo)
 	var out []contract.PublishedComment
 	for _, c := range ghComments {
+		if hasAuthorMetadata(c.PerformedViaGitHubApp, c.User) && !trust.allows(c.PerformedViaGitHubApp, c.User) {
+			continue
+		}
 		m := reFPMarker.FindStringSubmatch(c.Body)
 		if len(m) != 2 {
 			continue

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/url"
 	"strings"
@@ -376,5 +377,143 @@ func TestOrphanPodReaperSweepsPodsAndOrphanSecrets(t *testing.T) {
 	remainingSecrets, err := cs.CoreV1().Secrets("review-sandbox").List(context.Background(), metav1.ListOptions{})
 	if err != nil || len(remainingSecrets.Items) != 1 || remainingSecrets.Items[0].Name != "active-running" {
 		t.Fatalf("expected only active-running secret left, got %+v err=%v", remainingSecrets.Items, err)
+	}
+}
+
+func TestPodNameForLongProfilesKeepsDistinctHashedNames(t *testing.T) {
+	prefix := strings.Repeat("p", 50)
+	a := PodNameFor(contract.SandboxSpec{ShortRunID: "run12345", Role: "shadow", HarnessProfile: prefix + "-alpha"})
+	b := PodNameFor(contract.SandboxSpec{ShortRunID: "run12345", Role: "shadow", HarnessProfile: prefix + "-bravo"})
+	if a == b {
+		t.Fatalf("long shadow profiles collided: %q", a)
+	}
+	for _, name := range []string{a, b} {
+		if len(name) > 63 || strings.Trim(name, "-") != name || nonDNSLabel.MatchString(name) {
+			t.Fatalf("invalid DNS label %q", name)
+		}
+	}
+	if again := PodNameFor(contract.SandboxSpec{ShortRunID: "run12345", Role: "shadow", HarnessProfile: prefix + "-alpha"}); again != a {
+		t.Fatalf("pod name not deterministic: %q vs %q", a, again)
+	}
+}
+
+func TestK8sSandboxRunnerCreateConflictLeavesSiblingResources(t *testing.T) {
+	spec := contract.SandboxSpec{
+		ShortRunID:     "dup001",
+		Role:           "primary",
+		HarnessProfile: "openhands",
+		ControllerURL:  "http://10.96.0.42:8081",
+		TaskToken:      "opaque-secret-token",
+		TimeoutSeconds: 60,
+	}
+	name := PodNameFor(spec)
+	// key: Kubernetes label name; value: label value
+	labels := map[string]string{"app": "review-sandbox"}
+	cs := fake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "review-sandbox", UID: types.UID("sibling-pod"), Labels: labels}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "review-sandbox", UID: types.UID("sibling-secret"), Labels: labels}},
+	)
+	runner := NewK8sSandboxRunner(cs, K8sConfig{Namespace: "review-sandbox", WaitRunningTimeout: time.Second, PollInterval: 5 * time.Millisecond})
+	err := runner.Run(context.Background(), spec)
+	if err == nil || !apierrors.IsAlreadyExists(errors.Unwrap(err)) {
+		t.Fatalf("expected AlreadyExists create error, got %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("review-sandbox").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("sibling pod must survive a conflicting run: %v", err)
+	}
+	if _, err := cs.CoreV1().Secrets("review-sandbox").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("sibling secret must survive a conflicting run: %v", err)
+	}
+	for _, action := range cs.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Fatalf("conflicting run must not delete anything, saw %s %s", action.GetVerb(), action.GetResource().Resource)
+		}
+	}
+
+	csPodConflict := fake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "review-sandbox", UID: types.UID("sibling-pod"), Labels: labels}},
+	)
+	podConflictRunner := NewK8sSandboxRunner(csPodConflict, K8sConfig{Namespace: "review-sandbox", WaitRunningTimeout: time.Second, PollInterval: 5 * time.Millisecond})
+	if err := podConflictRunner.Run(context.Background(), spec); err == nil {
+		t.Fatal("expected pod create conflict error")
+	}
+	if _, err := csPodConflict.CoreV1().Pods("review-sandbox").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("sibling pod must survive a pod create conflict: %v", err)
+	}
+	if _, err := csPodConflict.CoreV1().Secrets("review-sandbox").Get(context.Background(), name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("secret created by the failing run must be cleaned up, got err=%v", err)
+	}
+}
+
+func TestK8sSandboxRunnerDeletesPodWithUIDPrecondition(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	var podDeleteUID types.UID
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
+		p.UID = types.UID("pod-uid-precond")
+		p.Status.Phase = corev1.PodSucceeded
+		_ = cs.Tracker().Add(p)
+		return true, p, nil
+	})
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		opts := action.(k8stesting.DeleteActionImpl).DeleteOptions
+		if opts.Preconditions != nil && opts.Preconditions.UID != nil {
+			podDeleteUID = *opts.Preconditions.UID
+		}
+		return false, nil, nil
+	})
+	runner := NewK8sSandboxRunner(cs, K8sConfig{Namespace: "review-sandbox", WaitRunningTimeout: time.Second, PollInterval: 5 * time.Millisecond})
+	if err := runner.Run(context.Background(), contract.SandboxSpec{
+		ShortRunID:     "uid001",
+		Role:           "primary",
+		HarnessProfile: "openhands",
+		ControllerURL:  "http://10.96.0.42:8081",
+		TaskToken:      "opaque-secret-token",
+		TimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if podDeleteUID != "pod-uid-precond" {
+		t.Fatalf("expected pod delete precondition UID pod-uid-precond, got %q", podDeleteUID)
+	}
+}
+
+func TestOrphanPodReaperKeepsSecretOfPodCreatedBetweenLists(t *testing.T) {
+	now := time.Now().UTC()
+	cs := fake.NewSimpleClientset()
+	var raced bool
+	cs.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		snapshot, err := cs.Tracker().List(corev1.SchemeGroupVersion.WithResource("pods"), corev1.SchemeGroupVersion.WithKind("Pod"), "review-sandbox")
+		if err != nil {
+			return true, nil, err
+		}
+		if !raced {
+			raced = true
+			// key: Kubernetes label name; value: label value
+			labels := map[string]string{"app": "review-sandbox"}
+			_ = cs.Tracker().Add(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "fresh", Namespace: "review-sandbox", UID: types.UID("u-fresh"), CreationTimestamp: metav1.NewTime(now), Labels: labels},
+				Status:     corev1.PodStatus{Phase: corev1.PodPending},
+			})
+			_ = cs.Tracker().Add(&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "fresh",
+					Namespace:         "review-sandbox",
+					CreationTimestamp: metav1.NewTime(now),
+					Labels:            labels,
+					OwnerReferences:   []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "fresh", UID: types.UID("u-fresh")}},
+				},
+			})
+		}
+		return true, snapshot, nil
+	})
+
+	reaper := NewOrphanPodReaper(cs, "review-sandbox", 5*time.Minute)
+	reaper.now = func() time.Time { return now }
+	if _, err := reaper.ReapOnce(context.Background()); err != nil {
+		t.Fatalf("reap failed: %v", err)
+	}
+	if _, err := cs.CoreV1().Secrets("review-sandbox").Get(context.Background(), "fresh", metav1.GetOptions{}); err != nil {
+		t.Fatalf("bootstrap secret of a pod created between lists must survive: %v", err)
 	}
 }

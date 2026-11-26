@@ -286,3 +286,41 @@ func TestBuildBundleTGZAllowsDanglingIntraRootSymlinkAndRejectsOversizedFile(t *
 		t.Fatalf("expected oversize file rejection, got: %v", err)
 	}
 }
+
+func TestBuildBundleTGZStripsRootAndNestedGitMetadata(t *testing.T) {
+	srcTar := buildTarBytes(t, []tarEntry{
+		{name: "org-repo-sha/", typeflag: tar.TypeDir},
+		{name: "org-repo-sha/main.go", typeflag: tar.TypeReg, body: "package main\n"},
+		{name: "org-repo-sha/.git/", typeflag: tar.TypeDir},
+		{name: "org-repo-sha/.git/config", typeflag: tar.TypeReg, body: "[core]\n\tfsmonitor = /bin/evil\n"},
+		{name: "org-repo-sha/.git/hooks/pre-commit", typeflag: tar.TypeReg, body: "#!/bin/sh\nexit 0\n"},
+		{name: "org-repo-sha/vendor/sub/.git/config", typeflag: tar.TypeReg, body: "[filter \"x\"]\n\tclean = /bin/evil\n"},
+		{name: "org-repo-sha/vendor/sub/lib.go", typeflag: tar.TypeReg, body: "package sub\n"},
+		{name: "org-repo-sha/modules/.git", typeflag: tar.TypeReg, body: "gitdir: ../../outside\n"},
+	})
+
+	var out bytes.Buffer
+	if err := BuildBundleTGZFromReader(bytes.NewReader(srcTar), minimalTaskInputs(t), &out); err != nil {
+		t.Fatalf("BuildBundleTGZFromReader: %v", err)
+	}
+	entries := readBundleEntries(t, out.Bytes())
+	for name := range entries {
+		if strings.Contains("/"+name+"/", "/.git/") {
+			t.Fatalf("expected git metadata %s stripped from bundle", name)
+		}
+	}
+	for _, kept := range []string{"src/main.go", "src/vendor/sub/lib.go"} {
+		if _, ok := entries[kept]; !ok {
+			t.Fatalf("expected %s kept in bundle", kept)
+		}
+	}
+	var updated reviewv1.AgentTask
+	if err := protojson.Unmarshal(entries[".review/in/task.json"].body, &updated); err != nil {
+		t.Fatalf("unmarshal updated task.json: %v", err)
+	}
+	for _, want := range []string{".git/*", "vendor/sub/.git/*", "modules/.git/*"} {
+		if !slices.Contains(updated.MaskedFiles, want) {
+			t.Fatalf("missing %s in MaskedFiles: %v", want, updated.MaskedFiles)
+		}
+	}
+}

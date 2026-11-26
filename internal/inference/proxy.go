@@ -469,8 +469,11 @@ func (p *ProxyHandler) sanitizePayload(api string, raw []byte, claims *reviewv1.
 		if _, has := out["max_completion_tokens"]; has {
 			tokenKey = "max_completion_tokens"
 		}
-		if reqOut, ok := asInt64(out[tokenKey]); ok && reqOut > 0 && reqOut < maxOut {
-			maxOut = reqOut
+		for _, key := range []string{"max_completion_tokens", "max_tokens"} {
+			if reqOut, ok := asInt64(out[key]); ok && reqOut > 0 && reqOut < maxOut {
+				maxOut = reqOut
+			}
+			delete(out, key)
 		}
 		out[tokenKey] = maxOut
 		if stream {

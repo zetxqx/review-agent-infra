@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -84,7 +86,8 @@ func PodNameFor(spec contract.SandboxSpec) string {
 	runSlug := sanitizeDNSLabel(spec.ShortRunID)
 	name := fmt.Sprintf("review-sbx-%s-s%d-a%d-%s", runSlug, spec.ShardIndex, spec.Attempt, suffix)
 	if len(name) > 63 {
-		name = strings.TrimRight(name[:63], "-")
+		sum := sha256.Sum256([]byte(name))
+		name = strings.TrimRight(name[:54], "-") + "-" + hex.EncodeToString(sum[:])[:8]
 	}
 	return name
 }
@@ -300,25 +303,42 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) e
 	}
 	pod := BuildHardenedPod(podName, secretName, spec, r.cfg)
 
+	var createdSecretUID, createdPodUID types.UID
+	var secretCreated, podCreated bool
 	defer func() {
+		if !secretCreated && !podCreated {
+			return
+		}
 		delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer delCancel()
-		delOpts := metav1.DeleteOptions{GracePeriodSeconds: ptr.To(int64(0))}
-		if delErr := r.clientset.CoreV1().Pods(r.cfg.Namespace).Delete(delCtx, podName, delOpts); delErr != nil && !apierrors.IsNotFound(delErr) {
-			_ = delErr
+		if podCreated {
+			if delErr := r.clientset.CoreV1().Pods(r.cfg.Namespace).Delete(delCtx, podName, ownedDeleteOptions(createdPodUID)); delErr != nil && !apierrors.IsNotFound(delErr) {
+				_ = delErr
+			}
 		}
-		if delErr := r.clientset.CoreV1().Secrets(r.cfg.Namespace).Delete(delCtx, secretName, delOpts); delErr != nil && !apierrors.IsNotFound(delErr) {
-			_ = delErr
+		if secretCreated {
+			if delErr := r.clientset.CoreV1().Secrets(r.cfg.Namespace).Delete(delCtx, secretName, ownedDeleteOptions(createdSecretUID)); delErr != nil && !apierrors.IsNotFound(delErr) {
+				_ = delErr
+			}
 		}
 	}()
 
-	if _, err := r.clientset.CoreV1().Secrets(r.cfg.Namespace).Create(runCtx, secret, metav1.CreateOptions{}); err != nil {
+	createdSecret, err := r.clientset.CoreV1().Secrets(r.cfg.Namespace).Create(runCtx, secret, metav1.CreateOptions{})
+	if err != nil {
 		return fmt.Errorf("create sandbox bootstrap secret: %w", err)
+	}
+	secretCreated = true
+	if createdSecret != nil {
+		createdSecretUID = createdSecret.UID
 	}
 
 	createdPod, err := r.clientset.CoreV1().Pods(r.cfg.Namespace).Create(runCtx, pod, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("create sandbox pod: %w", err)
+	}
+	podCreated = true
+	if createdPod != nil {
+		createdPodUID = createdPod.UID
 	}
 
 	if createdPod != nil && createdPod.UID != "" {
@@ -346,6 +366,14 @@ func (r *K8sSandboxRunner) Run(ctx context.Context, spec contract.SandboxSpec) e
 	}
 
 	return r.waitCompletion(runCtx, podName, spec.TaskToken)
+}
+
+func ownedDeleteOptions(uid types.UID) metav1.DeleteOptions {
+	opts := metav1.DeleteOptions{GracePeriodSeconds: ptr.To(int64(0))}
+	if uid != "" {
+		opts.Preconditions = &metav1.Preconditions{UID: ptr.To(uid)}
+	}
+	return opts
 }
 
 func (r *K8sSandboxRunner) waitCompletion(ctx context.Context, podName, taskToken string) error {

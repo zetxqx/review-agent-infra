@@ -29,9 +29,8 @@ type LocalProcessRunner struct {
 	WorkParentDir    string
 	OnCompleted      func(workRoot string)
 
-	pyOnce sync.Once
-	pyKit  string
-	pyErr  error
+	pyMu  sync.Mutex
+	pyKit string
 }
 
 func NewLocalProcessRunner(repoRoot string) *LocalProcessRunner {
@@ -121,49 +120,51 @@ func (r *LocalProcessRunner) resolveRepoRoot() (string, error) {
 }
 
 func (r *LocalProcessRunner) ensureReviewKit(ctx context.Context) ([]string, error) {
-	r.pyOnce.Do(func() {
-		pyDir := r.PythonProjectDir
-		if pyDir == "" {
-			repoRoot, err := r.resolveRepoRoot()
-			if err != nil {
-				r.pyErr = err
-				return
-			}
-			pyDir = filepath.Join(repoRoot, "python")
-		}
-		absPyDir, err := filepath.Abs(pyDir)
-		if err != nil {
-			r.pyErr = err
-			return
-		}
-		venvKit := filepath.Join(absPyDir, ".venv", "bin", "review-kit")
-		if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
-			r.pyKit = venvKit
-			return
-		}
-
-		uvBin, err := resolveUVBinary(r.UVBin)
-		if err != nil {
-			r.pyErr = err
-			return
-		}
-		cmd := exec.CommandContext(ctx, uvBin, "--project", absPyDir, "sync", "--quiet")
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if syncErr := cmd.Run(); syncErr != nil {
-			r.pyErr = fmt.Errorf("uv sync %s: %w (%s)", absPyDir, syncErr, strings.TrimSpace(stderr.String()))
-			return
-		}
-		if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
-			r.pyKit = venvKit
-			return
-		}
-		r.pyErr = fmt.Errorf("review-kit binary not found at %s after uv sync", venvKit)
-	})
-	if r.pyErr != nil {
-		return nil, r.pyErr
+	r.pyMu.Lock()
+	defer r.pyMu.Unlock()
+	if r.pyKit != "" {
+		return []string{r.pyKit}, nil
 	}
-	return []string{r.pyKit}, nil
+	kit, err := r.installReviewKit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.pyKit = kit
+	return []string{kit}, nil
+}
+
+func (r *LocalProcessRunner) installReviewKit(ctx context.Context) (string, error) {
+	pyDir := r.PythonProjectDir
+	if pyDir == "" {
+		repoRoot, err := r.resolveRepoRoot()
+		if err != nil {
+			return "", err
+		}
+		pyDir = filepath.Join(repoRoot, "python")
+	}
+	absPyDir, err := filepath.Abs(pyDir)
+	if err != nil {
+		return "", err
+	}
+	venvKit := filepath.Join(absPyDir, ".venv", "bin", "review-kit")
+	if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
+		return venvKit, nil
+	}
+
+	uvBin, err := resolveUVBinary(r.UVBin)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, uvBin, "--project", absPyDir, "sync", "--quiet")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if syncErr := cmd.Run(); syncErr != nil {
+		return "", fmt.Errorf("uv sync %s: %w (%s)", absPyDir, syncErr, strings.TrimSpace(stderr.String()))
+	}
+	if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
+		return venvKit, nil
+	}
+	return "", fmt.Errorf("review-kit binary not found at %s after uv sync", venvKit)
 }
 
 func resolveUVBinary(explicit string) (string, error) {
@@ -214,6 +215,7 @@ func runExec(ctx context.Context, cwd, bin string, args []string, stdin io.Reade
 		cmd.Stdout = io.Discard
 	}
 	cmd.Stderr = stderr
+	cmd.WaitDelay = execWaitDelay
 	if err := cmd.Run(); err != nil {
 		return withStderr(fmt.Errorf("%s %v: %w", filepath.Base(bin), args, err), stderr.String(), secretTokens...)
 	}

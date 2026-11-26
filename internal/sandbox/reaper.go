@@ -69,6 +69,12 @@ func (r *OrphanPodReaper) shouldReapSecret(secret corev1.Secret, survivingPods m
 }
 
 func (r *OrphanPodReaper) ReapOnce(ctx context.Context) (int, error) {
+	secrets, err := r.clientset.CoreV1().Secrets(r.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=review-sandbox",
+	})
+	if err != nil {
+		return 0, err
+	}
 	pods, err := r.clientset.CoreV1().Pods(r.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=review-sandbox",
 	})
@@ -96,12 +102,6 @@ func (r *OrphanPodReaper) ReapOnce(ctx context.Context) (int, error) {
 		return deleted, delErr
 	}
 
-	secrets, err := r.clientset.CoreV1().Secrets(r.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app=review-sandbox",
-	})
-	if err != nil {
-		return deleted, err
-	}
 	for _, secret := range secrets.Items {
 		if !r.shouldReapSecret(secret, survivingPods, ts) {
 			continue

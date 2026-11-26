@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -19,6 +20,7 @@ DEFAULT_BOOTSTRAP_PATH = Path("/var/run/review-task/bootstrap.json")
 DEFAULT_WORKSPACE_DIR = Path("/workspace")
 MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_REPORT_BYTES = 2 * 1024 * 1024
+DIRECT_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ def download_and_extract_bundle(
     )
     try:
         total_bytes = 0
-        with urllib.request.urlopen(req, timeout=120) as resp, bundle_tmp.open("wb") as dst:
+        with DIRECT_HTTP_OPENER.open(req, timeout=120) as resp, bundle_tmp.open("wb") as dst:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
@@ -108,7 +110,22 @@ def _must_git(src_dir: Path, args: list[str], scratch_home: Path) -> str:
     return proc.stdout.strip()
 
 
+def remove_embedded_git_metadata(src_dir: Path) -> None:
+    for cur_root, dirnames, filenames in os.walk(src_dir, topdown=True, followlinks=False):
+        cur_path = Path(cur_root)
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+            git_dir = cur_path / ".git"
+            if git_dir.is_symlink():
+                git_dir.unlink()
+            else:
+                shutil.rmtree(git_dir)
+        if ".git" in filenames:
+            (cur_path / ".git").unlink()
+
+
 def init_local_git_repo(src_dir: Path, diff_file: Path, masked_files: list[str], scratch_home: Path) -> str:
+    remove_embedded_git_metadata(src_dir)
     _must_git(src_dir, ["init", "-q", "-b", "pr"], scratch_home)
     _must_git(src_dir, ["add", "-A", "-f"], scratch_home)
     head_tree = _must_git(src_dir, ["write-tree"], scratch_home)
@@ -251,7 +268,7 @@ def upload_report(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with DIRECT_HTTP_OPENER.open(req, timeout=30) as resp:
                 resp.read()
                 if 200 <= resp.status < 300:
                     return

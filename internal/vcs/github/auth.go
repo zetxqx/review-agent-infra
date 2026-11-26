@@ -97,6 +97,10 @@ func (a *AppAuthenticator) AppID() int64 {
 	return a.appID
 }
 
+func (a *AppAuthenticator) UsesStaticToken() bool {
+	return a.staticToken != ""
+}
+
 func (a *AppAuthenticator) BotLogin() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()

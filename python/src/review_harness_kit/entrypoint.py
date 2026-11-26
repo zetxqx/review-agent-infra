@@ -79,9 +79,15 @@ EMBEDDED_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "review_tas
 REPO_SCHEMA_PATH = Path(__file__).resolve().parents[3] / "gen" / "schema" / "llm_review_report.schema.json"
 
 STATIC_OFFLINE_ENV = {
-    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_COUNT": "3",
     "GIT_CONFIG_KEY_0": "safe.directory",
     "GIT_CONFIG_VALUE_0": "*",
+    "GIT_CONFIG_KEY_1": "core.hooksPath",
+    "GIT_CONFIG_VALUE_1": "/dev/null",
+    "GIT_CONFIG_KEY_2": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_2": "false",
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_TERMINAL_PROMPT": "0",
     "LITELLM_LOCAL_MODEL_COST_MAP": "True",
@@ -91,6 +97,16 @@ STATIC_OFFLINE_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "NO_COLOR": "1",
 }
+
+PROXY_ENV_KEYS = frozenset(
+    name
+    for base in ("http_proxy", "https_proxy", "all_proxy")
+    for name in (base, base.upper())
+)
+
+
+def strip_proxy_env(env: dict[str, str]) -> dict[str, str]:
+    return {key: val for key, val in env.items() if key not in PROXY_ENV_KEYS}
 
 
 def normalize_base_url(raw_url: str) -> str:
@@ -297,7 +313,7 @@ def run_harness(
     for subdir in (ctx.home / ".config", ctx.home / ".cache", ctx.home / ".local" / "share"):
         subdir.mkdir(parents=True, exist_ok=True)
 
-    env = {
+    env = strip_proxy_env({
         **STATIC_OFFLINE_ENV,
         "PATH": build_subprocess_path(),
         "TMPDIR": str(tmp_dir),
@@ -308,7 +324,7 @@ def run_harness(
         "OPENAI_BASE_URL": ctx.base_url,
         "OPENAI_API_KEY": ctx.api_key,
         **invocation.env,
-    }
+    })
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "harness.log"

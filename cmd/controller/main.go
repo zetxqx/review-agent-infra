@@ -223,16 +223,8 @@ func runController(ctx context.Context, args []string) error {
 
 	poller := orchestrator.NewFeedbackPoller(st, vcs, 30*24*time.Hour)
 
-	publicSrv := &http.Server{
-		Addr:              flags.listenAddr,
-		Handler:           NewControllerMux(vcs, orch, tel),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	sandboxSrv := &http.Server{
-		Addr:              flags.sandboxListenAddr,
-		Handler:           proxy.SandboxMux(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	publicSrv := newPublicServer(flags.listenAddr, NewControllerMux(vcs, orch, tel))
+	sandboxSrv := newSandboxServer(flags.sandboxListenAddr, proxy.SandboxMux())
 
 	var bgWG sync.WaitGroup
 	bgWG.Add(1)
@@ -443,4 +435,24 @@ func envOrDefault(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func newPublicServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
+func newSandboxServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 }

@@ -41,6 +41,7 @@ var maskedNames = map[string]bool{
 
 // key: directory name of untrusted agent config directory; value: true when stripped recursively from bundle src
 var maskedDirs = map[string]bool{
+	".git":       true,
 	".agents":    true,
 	".codex":     true,
 	".opencode":  true,
