@@ -158,3 +158,30 @@ func TestFailReportOnRejectedRequests(t *testing.T) {
 		t.Fatal("nil report must not be marked failed")
 	}
 }
+
+func TestValidateReportCanonicalizesFindingPaths(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"./pkg/a.go", "pkg/a.go"},
+		{"/pkg/a.go", "pkg/a.go"},
+		{" .//./pkg//b.go ", "pkg/b.go"},
+		{"pkg/./sub/../c.go", "pkg/c.go"},
+		{"plain.go", "plain.go"},
+	}
+	for _, tc := range cases {
+		report := &reviewv1.ReviewReport{Findings: []*reviewv1.ReviewFinding{{File: tc.raw, Title: "issue"}}}
+		ValidateReport(report)
+		if len(report.Findings) != 1 || report.Findings[0].File != tc.want {
+			t.Fatalf("ValidateReport(%q) findings = %+v, want File %q", tc.raw, report.Findings, tc.want)
+		}
+	}
+	for _, raw := range []string{".", "./", "/", "..", "../x.go", "pkg/../../x.go", "./../x.go"} {
+		report := &reviewv1.ReviewReport{Findings: []*reviewv1.ReviewFinding{{File: raw, Title: "issue"}}}
+		ValidateReport(report)
+		if len(report.Findings) != 0 {
+			t.Fatalf("expected finding with File %q dropped, got %+v", raw, report.Findings)
+		}
+	}
+}

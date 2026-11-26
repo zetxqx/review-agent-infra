@@ -33,15 +33,25 @@ func (s *stderrTail) String() string {
 	return string(s.buf)
 }
 
-func withStderr(err error, stderr string) error {
+func redactOutput(text string, secretTokens ...string) string {
+	out := strings.TrimSpace(text)
+	for _, tok := range secretTokens {
+		if tok != "" {
+			out = strings.ReplaceAll(out, tok, "[redacted]")
+		}
+	}
+	return jwtLikePattern.ReplaceAllString(out, "[redacted]")
+}
+
+func withStderr(err error, stderr string, secretTokens ...string) error {
 	if err == nil {
 		return nil
 	}
-	trimmed := strings.TrimSpace(stderr)
+	trimmed := redactOutput(stderr, secretTokens...)
 	if trimmed == "" {
 		return err
 	}
-	return fmt.Errorf("%w (stderr: %s)", err, jwtLikePattern.ReplaceAllString(trimmed, "[redacted]"))
+	return fmt.Errorf("%w (stderr: %s)", err, trimmed)
 }
 
 func podStuckReasons(pod *corev1.Pod) string {
@@ -62,6 +72,37 @@ func podStuckReasons(pod *corev1.Pod) string {
 	}
 	if len(parts) == 0 {
 		return fmt.Sprintf(" (phase %s)", pod.Status.Phase)
+	}
+	return " (" + strings.Join(parts, "; ") + ")"
+}
+
+func podTerminatedReasons(pod *corev1.Pod, secretTokens ...string) string {
+	if pod == nil {
+		return ""
+	}
+	var parts []string
+	if pod.Status.Reason != "" {
+		msg := redactOutput(pod.Status.Message, secretTokens...)
+		if msg != "" {
+			parts = append(parts, fmt.Sprintf("pod: %s: %s", pod.Status.Reason, msg))
+		} else {
+			parts = append(parts, fmt.Sprintf("pod: %s", pod.Status.Reason))
+		}
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if term := cs.State.Terminated; term != nil {
+			detail := fmt.Sprintf("%s: exit=%d", cs.Name, term.ExitCode)
+			if term.Reason != "" {
+				detail += " reason=" + term.Reason
+			}
+			if msg := redactOutput(term.Message, secretTokens...); msg != "" {
+				detail += " message=" + msg
+			}
+			parts = append(parts, detail)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
 	}
 	return " (" + strings.Join(parts, "; ") + ")"
 }

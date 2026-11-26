@@ -172,6 +172,8 @@ func (s *InMemoryStore) EnqueueOrSupersede(_ context.Context, ev *reviewv1.Revie
 		ID:               id,
 		Repo:             ev.Repo,
 		PRNumber:         prNum,
+		PRTitle:          ev.PrTitle,
+		PRBody:           ev.PrBody,
 		BaseSHA:          ev.BaseSha,
 		HeadSHA:          ev.HeadSha,
 		TriggerType:      trig,

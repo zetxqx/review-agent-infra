@@ -131,11 +131,11 @@ func TestSmokeScriptAllPipelineBranchesSingleShotAndMockLLM(t *testing.T) {
 
 	var claudeMaskedCount int
 	runner := sandbox.NewLocalProcessRunner("")
-	runner.OnPrepared = func(srcDir, inDir string) {
-		if _, statErr := os.Stat(filepath.Join(srcDir, "CLAUDE.md")); !errors.Is(statErr, os.ErrNotExist) {
+	runner.OnCompleted = func(workRoot string) {
+		if _, statErr := os.Stat(filepath.Join(workRoot, "src", "CLAUDE.md")); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("CLAUDE.md was not masked from unpacked src dir (stat err=%v)", statErr)
 		}
-		taskBytes, readErr := os.ReadFile(filepath.Join(inDir, "task.json"))
+		taskBytes, readErr := os.ReadFile(filepath.Join(workRoot, ".review", "in", "task.json"))
 		if readErr != nil || !strings.Contains(string(taskBytes), "CLAUDE.md") {
 			t.Fatalf("expected CLAUDE.md in maskedFiles inside task.json (err=%v): %s", readErr, string(taskBytes))
 		}

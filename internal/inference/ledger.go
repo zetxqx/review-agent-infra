@@ -1,6 +1,7 @@
 package inference
 
 import (
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -115,53 +116,25 @@ func (l *SessionLedger) Snapshot() *reviewv1.SandboxUsage {
 	}
 }
 
-type LedgerStore struct {
-	mu sync.RWMutex
-	// key: task token JWT ID (jti); value: atomic per-token budget ledger
-	entries map[string]*SessionLedger
+type ActiveSession struct {
+	token      string
+	claims     *reviewv1.TaskClaims
+	ledger     *SessionLedger
+	bundlePath string
+	bundleRead atomic.Bool
+
+	reportMu sync.Mutex
+	report   []byte
 }
 
-func NewLedgerStore() *LedgerStore {
-	return &LedgerStore{
-		// key: task token JWT ID (jti); value: atomic per-token budget ledger
-		entries: make(map[string]*SessionLedger),
-	}
+func (s *ActiveSession) SetReport(raw []byte) {
+	s.reportMu.Lock()
+	s.report = slices.Clone(raw)
+	s.reportMu.Unlock()
 }
 
-func (s *LedgerStore) GetOrCreate(claims *reviewv1.TaskClaims) *SessionLedger {
-	s.mu.RLock()
-	l, ok := s.entries[claims.Jti]
-	s.mu.RUnlock()
-	if ok {
-		return l
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if l, ok = s.entries[claims.Jti]; ok {
-		return l
-	}
-	l = NewSessionLedger(claims)
-	s.entries[claims.Jti] = l
-	return l
-}
-
-func (s *LedgerStore) Get(jti string) (*SessionLedger, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	l, ok := s.entries[jti]
-	return l, ok
-}
-
-func (s *LedgerStore) SweepExpired(nowUnix int64) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	removed := 0
-	for k, l := range s.entries {
-		if l.expiresAtUnix <= nowUnix {
-			delete(s.entries, k)
-			removed++
-		}
-	}
-	return removed
+func (s *ActiveSession) Report() []byte {
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	return slices.Clone(s.report)
 }

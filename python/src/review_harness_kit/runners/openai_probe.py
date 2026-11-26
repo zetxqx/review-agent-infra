@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 
 def stream_chat_turn(client: OpenAI, model: str, messages: list[dict[str, str]]) -> str:
@@ -127,7 +127,13 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("OPENAI_BASE_URL is required")
 
     prompt_text = Path(args.prompt_file).read_text(encoding="utf-8", errors="replace")
-    client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0, timeout=180)
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        max_retries=0,
+        timeout=180,
+        http_client=DefaultHttpxClient(trust_env=False),
+    )
     out_dir = Path(args.out_dir)
 
     if args.mode in ("deterministic", "json", "single-shot"):

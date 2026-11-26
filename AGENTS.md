@@ -16,7 +16,6 @@ Write short, factual comments strictly on contract boundaries:
 
 * **Protobuf schemas (`proto/**/*.proto`)**: Messages, fields, enums, invariants, and numeric/length bounds.
 * **Cross-module plugin interfaces (`pkg/contract/*.go`, `python/src/review_harness_kit/contracts.py`)**: Interface/Protocol contracts and method pre/postconditions.
-* **SQL schema migrations (`migrations/*.sql`)**: Table, column, partial unique index, and lock invariants.
 
 ### 3. Mandatory Go `map[string]...` Exception
 
@@ -67,22 +66,25 @@ def load_report(path: Path) -> ReviewReport:
 
 ## Architecture and Ownership Boundaries
 
-* **Contracts (`proto/review/v1/review.proto` + `buf`)**: Single source of truth for cross-language messages (`ReviewEvent`, `AgentTask`, `ReviewReport`, `TaskClaims`, `SandboxUsage`). Never hand-edit `gen/` or `python/src/review_harness_kit/gen/`; edit `.proto` and run `buf generate` plus `go run ./cmd/schemagen gen/schema/llm_review_report.schema.json`.
-* **Go infrastructure (`cmd/*`, `internal/*`, `pkg/contract/`)**: Owns webhooks, admission, PostgreSQL `pgx/v5` state machine, Kubernetes `client-go` Exec sandboxes, `CGO_ENABLED=0` `cmd/loader`, streaming `cmd/adapter`, denoising/publishing, and `reviewctl`. Keep packages strictly acyclic per [implementation-plan.md](docs/design/implementation-plan.md).
-* **Python harness kit (`python/review-harness-kit`)**: Runs solely inside the read-only `harness` container to wrap existing open-source harnesses (`OpenHands`, `PR-Agent`, `Codex CLI`, `mini-SWE-agent`, `OpenCode`, `Goose`, `Aider`) and normalize output to `ReviewReport`. Do not implement a custom agent loop and do not pull orchestration, K8s, or PG logic into Python.
+* **Three Build Artifacts**: `bin/controller` (sole cluster Deployment exposing `:8080` webhooks/healthz/metrics and `:8081` sandbox bundle/report/inference API), `review-kit` (sole in-sandbox Python CLI), and `bin/reviewctl` (local evaluation CLI). `cmd/schemagen` is a build-time generator invoked via `go run ./cmd/schemagen`.
+* **Contracts (`proto/review/v1/review.proto`)**: Single source of truth for cross-language messages (`ReviewEvent`, `AgentTask`, `ReviewReport`, `TaskClaims`, `SandboxUsage`). Never hand-edit `gen/` or `python/src/review_harness_kit/gen/`; edit `.proto` and run `make proto && make schema`.
+* **Go infrastructure (`cmd/*`, `internal/*`, `pkg/contract/`)**: Owns webhooks, admission, stateless in-memory queue (`InMemoryStore`), host-side safe bundle building (`internal/loader`), embedded `:8081` streaming proxy and opaque-token `SessionLedger` (`internal/inference`), single-container gVisor/Docker/local sandbox runners (`internal/sandbox`), denoising/publishing with GitHub PR marker deduplication (`internal/publisher`, `internal/vcs/github`), and `reviewctl`. Keep packages strictly acyclic.
+* **Python harness kit (`python/review-harness-kit`)**: Runs solely inside the disposable sandbox (`review-kit run`) to download the clean `bundle.tar.gz`, initialize offline `base`/`pr` git branches, lock `/workspace/src` and `/workspace/.review/in` read-only, wrap existing open-source harnesses (`OpenHands`, `PR-Agent`, `Codex CLI`, `mini-SWE-agent`, `OpenCode`, `Goose`, `Aider`), normalize output to `ReviewReport`, and upload `report.json` to the controller `:8081` endpoint. Do not implement a custom agent loop and do not pull orchestration or Kubernetes logic into Python.
 
 ## Security and Contract Invariants
 
-* Keep sandbox Pod mounts `readOnly: true` for the `harness` container; only Go `cmd/loader` writes `/workspace/src` via `os.OpenRoot`, masks untrusted instruction files (`AGENTS.md`, `AGENTS.override.md`, `.codex/`, etc.), and reads `/workspace/.review/out/report.json` via `syscall.O_NOFOLLOW` with a 2 MiB cap.
-* Pass task tokens over Exec stdin into harness process RAM only; never write them to `task.json` or Pod specs.
-* Remember `protojson` serializes `int64` fields (`maxTotalTokens`, `normalizerReserveTokens`, `forceRerunSeq`) as JSON strings: parse `task.json` strictly with `protojson` / `google.protobuf.json_format`, keep `TaskClaims` JWTs on plain JSON with numeric `exp`, and keep `int64` out of `llm_review_report.schema.json`.
+* Host-side `internal/loader` sanitizes untrusted repository tarballs before packaging `bundle.tar.gz`: strips top-level wrapper directories, rejects path traversal, escaping symlinks, chained symlink escapes, escaping hardlinks, device nodes, and oversized files (`64 MiB` per file, `2 GiB` total), and strips untrusted instruction files (`AGENTS.md`, `AGENTS.override.md`, `.codex/`, etc.) while recording `masked_files`.
+* Sandbox Pods run a single `sandbox` container under gVisor (`RestartPolicy: Never`, `DNSPolicy: None` with `127.0.0.1`, `ReadOnlyRootFilesystem: true`, `Capabilities: Drop ALL`, zero `pods/exec` RBAC). Per-Pod `v1.Secret` credentials (`controller_url` resolved to ClusterIP + 32-byte random opaque `task_token`) are mounted `0400` at `/var/run/review-task/bootstrap.json`, linked via `OwnerReferences` to the Pod UID, and deleted immediately on completion or cancellation; Docker and local runners pipe the same bootstrap JSON over stdin.
+* `GET /v1/sandbox/bundle` enforces atomic one-time read (`410 Gone` on replay), `POST /v1/sandbox/report` enforces a `2 MiB` body cap, and `review-kit` locks `/workspace/src` and `/workspace/.review/in` read-only before launching any harness subprocess. Never write `task_token` to `task.json` or workspace files.
+* Remember `protojson` serializes `int64` fields (`maxTotalTokens`, `normalizerReserveTokens`, `forceRerunSeq`) as JSON strings: parse `task.json` strictly with `protojson` / `google.protobuf.json_format`, and keep `int64` out of `llm_review_report.schema.json`.
 * Enforce `ValidateReport` bounds, finite `confidence` in `[0, 1]`, `line >= 0`, and closed `proto3` enums before publishing.
 
 ## Git and Verification Hygiene
 
 * Write one-sentence English commit messages only (no body paragraphs, no bullet lists, no AI attribution trailers).
 * Before claiming a change is complete, run the checks matching the files you touched and report observed results:
-  * `proto/`: `buf lint`, `buf generate`, and `go run ./cmd/schemagen gen/schema/llm_review_report.schema.json`
-  * Go: `go build ./...` and `go test -race ./...`
-  * Python (`python/`): `uv run pytest` and `uv run ruff check`
+  * `proto/`: `make proto && make schema`
+  * Go: `make build` and `GO111MODULE=on go test -race ./...`
+  * Python (`python/`): `uv run pytest -v` and `uv run ruff check`
+  * Smoke: `make smoke`
   * Docs/repo text: `rg '\p{Han}'` (must output zero matches)

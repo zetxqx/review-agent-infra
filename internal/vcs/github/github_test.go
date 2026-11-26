@@ -3,24 +3,41 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
 )
+
+func verifyRS256JWT(raw string, pub *rsa.PublicKey) error {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return errors.New("malformed jwt")
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	return rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sig)
+}
 
 func TestWebhookSignatureAndEventParsing(t *testing.T) {
 	ctx := context.Background()
@@ -31,6 +48,8 @@ func TestWebhookSignatureAndEventParsing(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{
 				"number": 42,
+				"title": "Fork PR title from API",
+				"body": "Fork PR body from API",
 				"draft": false,
 				"user": {"login": "ext-contributor", "type": "User"},
 				"base": {"sha": "base111"},
@@ -53,6 +72,8 @@ func TestWebhookSignatureAndEventParsing(t *testing.T) {
 		"number": 17,
 		"pull_request": {
 			"number": 17,
+			"title": "Fix scorer race",
+			"body": "Uses mutex for shared map",
 			"draft": false,
 			"author_association": "MEMBER",
 			"user": {"login": "alice", "type": "User"},
@@ -82,7 +103,7 @@ func TestWebhookSignatureAndEventParsing(t *testing.T) {
 	if ev.EventKind != reviewv1.EventKind_EVENT_KIND_REVIEW || ev.TriggerType != reviewv1.TriggerType_TRIGGER_TYPE_AUTO {
 		t.Fatalf("unexpected PR event kind/type: %+v", ev)
 	}
-	if ev.Repo != "llm-d/router" || ev.PrNumber != 17 || ev.BaseSha != "aaa111" || ev.HeadSha != "bbb222" || ev.IsFork || !ev.IsMaintainer {
+	if ev.Repo != "llm-d/router" || ev.PrNumber != 17 || ev.BaseSha != "aaa111" || ev.HeadSha != "bbb222" || ev.IsFork || !ev.IsMaintainer || ev.PrTitle != "Fix scorer race" || ev.PrBody != "Uses mutex for shared map" {
 		t.Fatalf("unexpected PR fields: %+v", ev)
 	}
 
@@ -128,6 +149,8 @@ func TestWebhookSignatureAndEventParsing(t *testing.T) {
 		cmdEv.GetRequestedHarness() != "openhands" ||
 		cmdEv.BaseSha != "base111" ||
 		cmdEv.HeadSha != "head222" ||
+		cmdEv.PrTitle != "Fork PR title from API" ||
+		cmdEv.PrBody != "Fork PR body from API" ||
 		!cmdEv.IsFork {
 		t.Fatalf("unexpected manual /review event: %+v", cmdEv)
 	}
@@ -194,10 +217,7 @@ func TestAppJWTAndCachedInstallationTokenExchange(t *testing.T) {
 		case "/repos/llm-d/router/installation":
 			installLookups.Add(1)
 			auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			tok, parseErr := jwt.Parse(auth, func(_ *jwt.Token) (any, error) {
-				return &privKey.PublicKey, nil
-			})
-			if parseErr != nil || !tok.Valid {
+			if err := verifyRS256JWT(auth, &privKey.PublicKey); err != nil {
 				http.Error(w, "bad app jwt", http.StatusUnauthorized)
 				return
 			}
@@ -460,6 +480,11 @@ func TestFetchDiffTarballRulesCheckLogsPublishIdempotencyAndFeedback(t *testing.
 		t.Fatalf("expected fp111 skipped and only fp222 added (total 2 PR comments, 1 new in round 2), got comments=%d res=%+v", len(comments), resRound2)
 	}
 
+	listedFPs, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 12)
+	if err != nil || !slices.Equal(listedFPs, []string{"fp111", "fp222"}) {
+		t.Fatalf("expected ListPublishedFingerprints=[fp111 fp222], got %v err=%v", listedFPs, err)
+	}
+
 	fb, err := plugin.PollFeedback(ctx, "llm-d/router", 12, []int64{501})
 	if err != nil {
 		t.Fatalf("PollFeedback: %v", err)
@@ -483,10 +508,7 @@ func TestCheckCredentialsVerifiesAppAndMintsInstallationToken(t *testing.T) {
 	var tokenExchanges atomic.Int32
 	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		tok, parseErr := jwt.Parse(bearer, func(_ *jwt.Token) (any, error) {
-			return &appKey.PublicKey, nil
-		})
-		if parseErr != nil || !tok.Valid {
+		if err := verifyRS256JWT(bearer, &appKey.PublicKey); err != nil {
 			http.Error(w, `{"message":"A JSON web token could not be decoded"}`, http.StatusUnauthorized)
 			return
 		}
@@ -525,4 +547,397 @@ func TestCheckCredentialsVerifiesAppAndMintsInstallationToken(t *testing.T) {
 	if err := static.CheckCredentials(ctx); err != nil {
 		t.Fatalf("CheckCredentials with a static token: %v", err)
 	}
+}
+
+func TestPaginationMarkerAuthorTrustAndEmptyPublishSkip(t *testing.T) {
+	ctx := context.Background()
+
+	var postCalls atomic.Int32
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/99/reviews":
+			if page == "" || page == "1" {
+				batch := make([]ghReviewRecord, listPageSize)
+				batch[0] = ghReviewRecord{
+					ID:   1,
+					Body: "<!-- review-run: run-spoof sha: h1 fps: fp_spoofed -->",
+					User: ghUser{Login: "attacker", Type: "User"},
+				}
+				batch[1] = ghReviewRecord{
+					ID:                    2,
+					Body:                  "<!-- review-run: run-other sha: h1 fps: fp_other_app -->",
+					User:                  ghUser{Login: "other-bot[bot]", Type: "Bot"},
+					PerformedViaGitHubApp: &ghAppMeta{ID: 999},
+				}
+				batch[2] = ghReviewRecord{
+					ID:                    3,
+					Body:                  "<!-- review-run: run-1 sha: h1 fps: fp_page1_app -->",
+					User:                  ghUser{Login: "review-bot[bot]", Type: "Bot"},
+					PerformedViaGitHubApp: &ghAppMeta{ID: 123},
+				}
+				batch[3] = ghReviewRecord{
+					ID:   4,
+					Body: "<!-- review-run: run-2 sha: h1 fps: fp_page1_bot -->",
+					User: ghUser{Login: "review-bot[bot]", Type: "Bot"},
+				}
+				_ = json.NewEncoder(w).Encode(batch)
+				return
+			}
+			if page == "2" {
+				_ = json.NewEncoder(w).Encode([]ghReviewRecord{
+					{
+						ID:                    101,
+						Body:                  "<!-- review-run: run-3 sha: h2 fps: fp_page2 -->",
+						User:                  ghUser{Login: "review-bot[bot]", Type: "Bot"},
+						PerformedViaGitHubApp: &ghAppMeta{ID: 123},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]ghReviewRecord{})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/99/comments":
+			if page == "" || page == "1" {
+				batch := make([]ghCommentRecord, listPageSize)
+				batch[0] = ghCommentRecord{
+					ID:   10,
+					Body: "spoofed\n<!-- fp:fp_spoof_inline -->",
+					User: ghUser{Login: "attacker", Type: "User"},
+				}
+				_ = json.NewEncoder(w).Encode(batch)
+				return
+			}
+			if page == "2" {
+				_ = json.NewEncoder(w).Encode([]ghCommentRecord{
+					{
+						ID:                    110,
+						Body:                  "real\n<!-- fp:fp_comment_page2 -->",
+						User:                  ghUser{Login: "review-bot[bot]", Type: "Bot"},
+						PerformedViaGitHubApp: &ghAppMeta{ID: 123},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]ghCommentRecord{})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/llm-d/router/pulls/99/reviews":
+			postCalls.Add(1)
+			_, _ = io.WriteString(w, `{"id":555}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/99/reviews/555/comments":
+			_ = json.NewEncoder(w).Encode([]ghCommentRecord{
+				{ID: 777, Body: "posted\n<!-- fp:fp_spoof_inline -->"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghSrv.Close()
+
+	plugin := NewPlugin(Config{
+		AppID:       123,
+		StaticToken: "ghs_test",
+		APIBaseURL:  ghSrv.URL,
+	})
+
+	fps, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 99)
+	if err != nil {
+		t.Fatalf("ListPublishedFingerprints: %v", err)
+	}
+	wantFPs := []string{"fp_page1_app", "fp_page1_bot", "fp_page2"}
+	if !slices.Equal(fps, wantFPs) {
+		t.Fatalf("ListPublishedFingerprints = %v, want %v", fps, wantFPs)
+	}
+
+	skipRes, err := plugin.PublishReview(ctx, contract.PublishRequest{
+		Repo:     "llm-d/router",
+		PRNumber: 99,
+		CommitID: "h3",
+		RunID:    "run-dedup-empty",
+		Summary:  "",
+		Inlines: []contract.InlineComment{
+			{Fingerprint: "fp_page2", File: "a.go", Line: 1, Body: "dup from review marker"},
+			{Fingerprint: "fp_comment_page2", File: "b.go", Line: 2, Body: "dup from page 2 comment"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PublishReview all-deduped: %v", err)
+	}
+	if postCalls.Load() != 0 || skipRes.ReviewID != 0 {
+		t.Fatalf("expected empty deduped PublishReview to skip POST, got calls=%d res=%+v", postCalls.Load(), skipRes)
+	}
+
+	spoofRes, err := plugin.PublishReview(ctx, contract.PublishRequest{
+		Repo:     "llm-d/router",
+		PRNumber: 99,
+		CommitID: "h3",
+		RunID:    "run-not-spoofed",
+		Summary:  "",
+		Inlines: []contract.InlineComment{
+			{Fingerprint: "fp_spoof_inline", File: "c.go", Line: 3, Body: "real finding"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PublishReview spoofed comment must not suppress: %v", err)
+	}
+	if postCalls.Load() != 1 || spoofRes.ReviewID != 555 {
+		t.Fatalf("expected spoofed user marker ignored and review posted, got calls=%d res=%+v", postCalls.Load(), spoofRes)
+	}
+}
+
+func TestCheckCapturesBotLoginAndRejectsForeignBotMarkers(t *testing.T) {
+	ctx := context.Background()
+	appKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/app":
+			_, _ = io.WriteString(w, `{"id":123,"slug":"review-bot"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/77/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"token":"ghs_tok","expires_at":"2099-01-01T00:00:00Z"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/15/reviews":
+			_ = json.NewEncoder(w).Encode([]ghReviewRecord{
+				{
+					ID:   1,
+					Body: "<!-- review-run: r1 sha: h1 fps: fp_foreign_bot -->",
+					User: ghUser{Login: "other-bot[bot]", Type: "Bot"},
+				},
+				{
+					ID:   2,
+					Body: "<!-- review-run: r2 sha: h1 fps: fp_own_bot -->",
+					User: ghUser{Login: "review-bot[bot]", Type: "Bot"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghSrv.Close()
+
+	plugin := NewPlugin(Config{
+		AppID:          123,
+		InstallationID: 77,
+		PrivateKey:     appKey,
+		APIBaseURL:     ghSrv.URL,
+	})
+	if err := plugin.CheckCredentials(ctx); err != nil {
+		t.Fatalf("CheckCredentials: %v", err)
+	}
+	if got := plugin.auth.BotLogin(); got != "review-bot[bot]" {
+		t.Fatalf("BotLogin() = %q, want review-bot[bot]", got)
+	}
+
+	fps, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 15)
+	if err != nil {
+		t.Fatalf("ListPublishedFingerprints: %v", err)
+	}
+	if !slices.Equal(fps, []string{"fp_own_bot"}) {
+		t.Fatalf("ListPublishedFingerprints = %v, want [fp_own_bot]", fps)
+	}
+}
+
+func TestStaticTokenMarkerTrustRequiresTokenOwnerLogin(t *testing.T) {
+	ctx := context.Background()
+
+	var userCalls atomic.Int32
+	var postCalls atomic.Int32
+	var postedBody atomic.Value
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			userCalls.Add(1)
+			if r.Header.Get("Authorization") != "Bearer ghp_owner" {
+				http.Error(w, "bad token", http.StatusUnauthorized)
+				return
+			}
+			_, _ = io.WriteString(w, `{"login":"Review-Owner","type":"User"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/7/reviews":
+			_ = json.NewEncoder(w).Encode([]ghReviewRecord{
+				{ID: 1, Body: "<!-- review-run: run-spoof sha: h1 fps: fp_spoofed --> attacker", User: ghUser{Login: "attacker", Type: "User"}},
+				{ID: 2, Body: "<!-- review-run: run-own sha: h1 fps: fp_own --> owner", User: ghUser{Login: "review-owner", Type: "User"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/7/comments":
+			_ = json.NewEncoder(w).Encode([]ghCommentRecord{
+				{ID: 10, Body: "spoof\n<!-- fp:fp_spoof_inline -->", User: ghUser{Login: "attacker", Type: "User"}},
+				{ID: 11, Body: "own\n<!-- fp:fp_own_inline -->", User: ghUser{Login: "review-owner", Type: "User"}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/llm-d/router/pulls/7/reviews":
+			postCalls.Add(1)
+			raw, _ := io.ReadAll(r.Body)
+			postedBody.Store(string(raw))
+			_, _ = io.WriteString(w, `{"id":321}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/7/reviews/321/comments":
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghSrv.Close()
+
+	plugin := NewPlugin(Config{StaticToken: "ghp_owner", APIBaseURL: ghSrv.URL})
+
+	fps, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 7)
+	if err != nil {
+		t.Fatalf("ListPublishedFingerprints: %v", err)
+	}
+	if !slices.Equal(fps, []string{"fp_own"}) {
+		t.Fatalf("ListPublishedFingerprints = %v, want [fp_own]", fps)
+	}
+
+	res, err := plugin.PublishReview(ctx, contract.PublishRequest{
+		Repo:     "llm-d/router",
+		PRNumber: 7,
+		CommitID: "h2",
+		RunID:    "run-spoof",
+		Summary:  "Static token review.",
+		Inlines: []contract.InlineComment{
+			{Fingerprint: "fp_spoof_inline", File: "a.go", Line: 1, Body: "real finding a"},
+			{Fingerprint: "fp_spoofed", File: "b.go", Line: 2, Body: "real finding b"},
+			{Fingerprint: "fp_own_inline", File: "c.go", Line: 3, Body: "already posted"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PublishReview: %v", err)
+	}
+	if postCalls.Load() != 1 || res.ReviewID != 321 {
+		t.Fatalf("expected spoofed run marker ignored and review posted, got calls=%d res=%+v", postCalls.Load(), res)
+	}
+	body, _ := postedBody.Load().(string)
+	if !strings.Contains(body, "fp:fp_spoof_inline") || !strings.Contains(body, "fp:fp_spoofed") || strings.Contains(body, "fp:fp_own_inline") {
+		t.Fatalf("unexpected posted review payload: %s", body)
+	}
+	for _, c := range res.Comments {
+		if c.CommentID == 10 {
+			t.Fatalf("fallback comment collection returned untrusted author comment: %+v", res.Comments)
+		}
+	}
+	if len(res.Comments) != 1 || res.Comments[0].CommentID != 11 || res.Comments[0].Fingerprint != "fp_own_inline" {
+		t.Fatalf("expected only the token owner comment from fallback collection, got %+v", res.Comments)
+	}
+	if userCalls.Load() != 1 {
+		t.Fatalf("expected token owner login resolved once and cached, got %d /user calls", userCalls.Load())
+	}
+}
+
+func TestStaticTokenMarkerTrustFallbacks(t *testing.T) {
+	ctx := context.Background()
+	reviews := []ghReviewRecord{
+		{ID: 1, Body: "<!-- review-run: r1 sha: h1 fps: fp_user -->", User: ghUser{Login: "someone", Type: "User"}},
+		{ID: 2, Body: "<!-- review-run: r2 sha: h1 fps: fp_bot -->", User: ghUser{Login: "github-actions[bot]", Type: "Bot"}},
+		{ID: 3, Body: "<!-- review-run: r3 sha: h1 fps: fp_owner -->", User: ghUser{Login: "owner", Type: "User"}},
+	}
+
+	newServer := func(userHandler func(w http.ResponseWriter, call int32)) (*httptest.Server, *atomic.Int32) {
+		var userCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/user":
+				userHandler(w, userCalls.Add(1))
+			case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/5/reviews":
+				_ = json.NewEncoder(w).Encode(reviews)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		return srv, &userCalls
+	}
+
+	listTwice := func(t *testing.T, plugin *Plugin) ([]string, []string) {
+		t.Helper()
+		first, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 5)
+		if err != nil {
+			t.Fatalf("first ListPublishedFingerprints: %v", err)
+		}
+		second, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 5)
+		if err != nil {
+			t.Fatalf("second ListPublishedFingerprints: %v", err)
+		}
+		return first, second
+	}
+
+	t.Run("user endpoint missing keeps legacy trust", func(t *testing.T) {
+		srv, userCalls := newServer(func(w http.ResponseWriter, _ int32) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		})
+		defer srv.Close()
+		first, second := listTwice(t, NewPlugin(Config{StaticToken: "ghp_mock", APIBaseURL: srv.URL}))
+		want := []string{"fp_bot", "fp_owner", "fp_user"}
+		if !slices.Equal(first, want) || !slices.Equal(second, want) {
+			t.Fatalf("got %v and %v, want %v", first, second, want)
+		}
+		if userCalls.Load() != 1 {
+			t.Fatalf("expected 404 outcome cached, got %d /user calls", userCalls.Load())
+		}
+	})
+
+	t.Run("empty login keeps legacy trust", func(t *testing.T) {
+		srv, _ := newServer(func(w http.ResponseWriter, _ int32) {
+			_, _ = io.WriteString(w, `{}`)
+		})
+		defer srv.Close()
+		first, _ := listTwice(t, NewPlugin(Config{StaticToken: "ghp_mock", APIBaseURL: srv.URL}))
+		if want := []string{"fp_bot", "fp_owner", "fp_user"}; !slices.Equal(first, want) {
+			t.Fatalf("got %v, want %v", first, want)
+		}
+	})
+
+	t.Run("integration token forbidden trusts only bots", func(t *testing.T) {
+		srv, userCalls := newServer(func(w http.ResponseWriter, _ int32) {
+			http.Error(w, `{"message":"Resource not accessible by integration"}`, http.StatusForbidden)
+		})
+		defer srv.Close()
+		first, second := listTwice(t, NewPlugin(Config{StaticToken: "ghs_actions", APIBaseURL: srv.URL}))
+		want := []string{"fp_bot"}
+		if !slices.Equal(first, want) || !slices.Equal(second, want) {
+			t.Fatalf("got %v and %v, want %v", first, second, want)
+		}
+		if userCalls.Load() != 1 {
+			t.Fatalf("expected 403 outcome cached, got %d /user calls", userCalls.Load())
+		}
+	})
+
+	t.Run("transient failure is not cached", func(t *testing.T) {
+		srv, userCalls := newServer(func(w http.ResponseWriter, call int32) {
+			if call == 1 {
+				http.Error(w, "upstream down", http.StatusBadGateway)
+				return
+			}
+			_, _ = io.WriteString(w, `{"login":"owner"}`)
+		})
+		defer srv.Close()
+		first, second := listTwice(t, NewPlugin(Config{StaticToken: "ghp_owner", APIBaseURL: srv.URL}))
+		if !slices.Equal(first, []string{"fp_bot"}) || !slices.Equal(second, []string{"fp_owner"}) {
+			t.Fatalf("got %v then %v, want [fp_bot] then [fp_owner]", first, second)
+		}
+		if userCalls.Load() != 2 {
+			t.Fatalf("expected retry after transient failure, got %d /user calls", userCalls.Load())
+		}
+	})
+
+	t.Run("concurrent resolution is race free", func(t *testing.T) {
+		srv, _ := newServer(func(w http.ResponseWriter, _ int32) {
+			_, _ = io.WriteString(w, `{"login":"OWNER"}`)
+		})
+		defer srv.Close()
+		plugin := NewPlugin(Config{StaticToken: "ghp_owner", APIBaseURL: srv.URL})
+		results := make(chan []string, 8)
+		errs := make(chan error, 8)
+		for range 8 {
+			go func() {
+				fps, err := plugin.ListPublishedFingerprints(ctx, "llm-d/router", 5)
+				errs <- err
+				results <- fps
+			}()
+		}
+		for range 8 {
+			if err := <-errs; err != nil {
+				t.Fatalf("ListPublishedFingerprints: %v", err)
+			}
+			if fps := <-results; !slices.Equal(fps, []string{"fp_owner"}) {
+				t.Fatalf("got %v, want [fp_owner]", fps)
+			}
+		}
+	})
 }

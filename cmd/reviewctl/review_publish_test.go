@@ -230,9 +230,31 @@ func TestMockScriptAndPublishPRToGitHubAPI(t *testing.T) {
 				}{SHA: headSHA},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/zetxqx/review-agent-infra/pulls/19/reviews":
-			_, _ = w.Write([]byte("[]"))
+			type ghReview struct {
+				ID   int    `json:"id"`
+				Body string `json:"body"`
+			}
+			mu.Lock()
+			out := make([]ghReview, 0, len(postedReviews))
+			for idx, pr := range postedReviews {
+				out = append(out, ghReview{ID: 9001 + idx, Body: pr.Body})
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(out)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/zetxqx/review-agent-infra/pulls/19/comments":
-			_, _ = w.Write([]byte("[]"))
+			type ghComment struct {
+				ID   int    `json:"id"`
+				Body string `json:"body"`
+			}
+			mu.Lock()
+			var out []ghComment
+			for rIdx, pr := range postedReviews {
+				for cIdx, c := range pr.Comments {
+					out = append(out, ghComment{ID: 500 + rIdx*100 + cIdx, Body: c.Body})
+				}
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(out)
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/zetxqx/review-agent-infra/pulls/19/reviews":
 			var req postedReview
 			if decErr := json.NewDecoder(r.Body).Decode(&req); decErr != nil {
@@ -321,8 +343,8 @@ func TestMockScriptAndPublishPRToGitHubAPI(t *testing.T) {
 	if rev.Event != "COMMENT" || rev.CommitID != wantHeadSHA {
 		t.Fatalf("unexpected posted review header: event=%q commit=%q", rev.Event, rev.CommitID)
 	}
-	if !strings.Contains(rev.Body, "<!-- review-run:run-smoke-1 -->") || !strings.Contains(rev.Body, "F3 fallback to summary") {
-		t.Fatalf("expected run marker and F3 fallback in review body:\n%s", rev.Body)
+	if !strings.Contains(rev.Body, "<!-- review-run: run-smoke-1 sha: "+wantHeadSHA+" fps: ") || !strings.Contains(rev.Body, "F3 fallback to summary") {
+		t.Fatalf("expected run marker with sha/fps and F3 fallback in review body:\n%s", rev.Body)
 	}
 	if len(rev.Comments) != 3 {
 		t.Fatalf("expected 3 inline comments (F1, F2, F5), got %d: %+v", len(rev.Comments), rev.Comments)
@@ -336,6 +358,31 @@ func TestMockScriptAndPublishPRToGitHubAPI(t *testing.T) {
 	}
 	if strings.Contains(rev.Body, "F4 low confidence") || strings.Contains(rev.Body, "F6 duplicate") {
 		t.Fatalf("unexpected filtered/deduped finding in body:\n%s", rev.Body)
+	}
+
+	var rerunOut bytes.Buffer
+	err = runCLI(ctx, []string{
+		"review",
+		"--repo", repoDir,
+		"--commit", "HEAD",
+		"--harness", "single-shot",
+		"--mock-upstream",
+		"--mock-script", scriptPath,
+		"--publish-pr", "19",
+		"--run-id", "run-smoke-2",
+		"--format", "json",
+	}, &rerunOut)
+	if err != nil {
+		t.Fatalf("second review --publish-pr failed: %v", err)
+	}
+	mu.Lock()
+	revsAfterRerun := append([]postedReview(nil), postedReviews...)
+	mu.Unlock()
+	if len(revsAfterRerun) != 2 {
+		t.Fatalf("expected 2nd review posted for summary, got %d", len(revsAfterRerun))
+	}
+	if len(revsAfterRerun[1].Comments) != 0 || strings.Contains(revsAfterRerun[1].Body, "F3 fallback to summary") {
+		t.Fatalf("expected prior PR marker fingerprints to dedup both inlines and fallback summary finding, got comments=%d body:\n%s", len(revsAfterRerun[1].Comments), revsAfterRerun[1].Body)
 	}
 
 	mu.Lock()

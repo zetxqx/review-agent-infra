@@ -517,6 +517,8 @@ type ReviewEvent struct {
 	TriggerType      TriggerType            `protobuf:"varint,14,opt,name=trigger_type,json=triggerType,proto3,enum=review.v1.TriggerType" json:"trigger_type,omitempty"`
 	ForceRerunSeq    int64                  `protobuf:"varint,15,opt,name=force_rerun_seq,json=forceRerunSeq,proto3" json:"force_rerun_seq,omitempty"`             // 0 for auto; comment ID for manual /review
 	RequestedHarness *string                `protobuf:"bytes,16,opt,name=requested_harness,json=requestedHarness,proto3,oneof" json:"requested_harness,omitempty"` // Optional profile name from "/review <profile>"
+	PrTitle          string                 `protobuf:"bytes,17,opt,name=pr_title,json=prTitle,proto3" json:"pr_title,omitempty"`                                  // Pull request title propagated into AgentTask
+	PrBody           string                 `protobuf:"bytes,18,opt,name=pr_body,json=prBody,proto3" json:"pr_body,omitempty"`                                     // Pull request description propagated into AgentTask
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -663,12 +665,26 @@ func (x *ReviewEvent) GetRequestedHarness() string {
 	return ""
 }
 
+func (x *ReviewEvent) GetPrTitle() string {
+	if x != nil {
+		return x.PrTitle
+	}
+	return ""
+}
+
+func (x *ReviewEvent) GetPrBody() string {
+	if x != nil {
+		return x.PrBody
+	}
+	return ""
+}
+
 // TaskBudget bounds requests, context size, cumulative uncached tokens, and runtime for one sandbox Pod.
 type TaskBudget struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
-	MaxRequests             int32                  `protobuf:"varint,1,opt,name=max_requests,json=maxRequests,proto3" json:"max_requests,omitempty"`                                       // Hard cap enforced by cmd/adapter
+	MaxRequests             int32                  `protobuf:"varint,1,opt,name=max_requests,json=maxRequests,proto3" json:"max_requests,omitempty"`                                       // Hard cap enforced by the controller inference proxy
 	MaxContextTokens        int32                  `protobuf:"varint,2,opt,name=max_context_tokens,json=maxContextTokens,proto3" json:"max_context_tokens,omitempty"`                      // Passed to each harness's own context setting
-	MaxTotalTokens          int64                  `protobuf:"varint,3,opt,name=max_total_tokens,json=maxTotalTokens,proto3" json:"max_total_tokens,omitempty"`                            // Cumulative cap on uncached input + output tokens enforced by cmd/adapter
+	MaxTotalTokens          int64                  `protobuf:"varint,3,opt,name=max_total_tokens,json=maxTotalTokens,proto3" json:"max_total_tokens,omitempty"`                            // Cumulative cap on uncached input + output tokens enforced by the controller proxy
 	NormalizerReserveTokens int64                  `protobuf:"varint,4,opt,name=normalizer_reserve_tokens,json=normalizerReserveTokens,proto3" json:"normalizer_reserve_tokens,omitempty"` // Uncached token slice held exclusively for 1-shot Normalizer
 	WallClockSeconds        int32                  `protobuf:"varint,5,opt,name=wall_clock_seconds,json=wallClockSeconds,proto3" json:"wall_clock_seconds,omitempty"`                      // Subprocess timeout inside the sandbox
 	unknownFields           protoimpl.UnknownFields
@@ -801,7 +817,7 @@ func (x *HarnessRef) GetOptions() map[string]string {
 	return nil
 }
 
-// GitInfo records the local two-branch repository prepared by cmd/loader inside /workspace/src.
+// GitInfo records the local two-branch repository prepared by review-kit inside /workspace/src.
 type GitInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	BaseRef       *string                `protobuf:"bytes,1,opt,name=base_ref,json=baseRef,proto3,oneof" json:"base_ref,omitempty"` // "base", or unset if git apply -R failed
@@ -854,51 +870,6 @@ func (x *GitInfo) GetHeadRef() string {
 	return ""
 }
 
-// ToolEndpoints holds optional network endpoints enabled by M4 extensions.
-type ToolEndpoints struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ScopedTest    *string                `protobuf:"bytes,1,opt,name=scoped_test,json=scopedTest,proto3,oneof" json:"scoped_test,omitempty"` // ClusterIP:port of air-gapped test runner Pod
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ToolEndpoints) Reset() {
-	*x = ToolEndpoints{}
-	mi := &file_review_v1_review_proto_msgTypes[4]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ToolEndpoints) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ToolEndpoints) ProtoMessage() {}
-
-func (x *ToolEndpoints) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[4]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ToolEndpoints.ProtoReflect.Descriptor instead.
-func (*ToolEndpoints) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{4}
-}
-
-func (x *ToolEndpoints) GetScopedTest() string {
-	if x != nil && x.ScopedTest != nil {
-		return *x.ScopedTest
-	}
-	return ""
-}
-
 // AgentTask is serialized via protojson into /workspace/.review/in/task.json.
 // It MUST NEVER contain task tokens, GitHub credentials, or model API keys.
 type AgentTask struct {
@@ -910,22 +881,21 @@ type AgentTask struct {
 	PrTitle       string                 `protobuf:"bytes,5,opt,name=pr_title,json=prTitle,proto3" json:"pr_title,omitempty"`
 	PrBody        string                 `protobuf:"bytes,6,opt,name=pr_body,json=prBody,proto3" json:"pr_body,omitempty"`
 	BaseBranch    string                 `protobuf:"bytes,7,opt,name=base_branch,json=baseBranch,proto3" json:"base_branch,omitempty"`
-	SrcDir        string                 `protobuf:"bytes,8,opt,name=src_dir,json=srcDir,proto3" json:"src_dir,omitempty"`                      // Default: "/workspace/src" (RO in harness container)
+	SrcDir        string                 `protobuf:"bytes,8,opt,name=src_dir,json=srcDir,proto3" json:"src_dir,omitempty"`                      // Default: "/workspace/src" (locked RO by review-kit before harness starts)
 	DiffFile      string                 `protobuf:"bytes,9,opt,name=diff_file,json=diffFile,proto3" json:"diff_file,omitempty"`                // Default: "/workspace/.review/in/diff.patch"
 	RulesDir      string                 `protobuf:"bytes,10,opt,name=rules_dir,json=rulesDir,proto3" json:"rules_dir,omitempty"`               // Default: "/workspace/.review/in/rules" (from base_sha)
 	CiLogsFile    *string                `protobuf:"bytes,11,opt,name=ci_logs_file,json=ciLogsFile,proto3,oneof" json:"ci_logs_file,omitempty"` // Optional truncated CI logs from CheckLogFetcher
 	OutDir        string                 `protobuf:"bytes,12,opt,name=out_dir,json=outDir,proto3" json:"out_dir,omitempty"`                     // Default: "/workspace/.review/out"
-	Git           *GitInfo               `protobuf:"bytes,13,opt,name=git,proto3" json:"git,omitempty"`                                         // Populated by cmd/loader before harness starts
-	MaskedFiles   []string               `protobuf:"bytes,14,rep,name=masked_files,json=maskedFiles,proto3" json:"masked_files,omitempty"`      // Untrusted instruction files deleted by cmd/loader
-	ToolEndpoints *ToolEndpoints         `protobuf:"bytes,15,opt,name=tool_endpoints,json=toolEndpoints,proto3" json:"tool_endpoints,omitempty"`
-	Budget        *TaskBudget            `protobuf:"bytes,16,opt,name=budget,proto3" json:"budget,omitempty"`
+	Git           *GitInfo               `protobuf:"bytes,13,opt,name=git,proto3" json:"git,omitempty"`                                         // Populated by review-kit before harness starts
+	MaskedFiles   []string               `protobuf:"bytes,14,rep,name=masked_files,json=maskedFiles,proto3" json:"masked_files,omitempty"`      // Untrusted instruction files stripped by host-side internal/loader
+	Budget        *TaskBudget            `protobuf:"bytes,15,opt,name=budget,proto3" json:"budget,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AgentTask) Reset() {
 	*x = AgentTask{}
-	mi := &file_review_v1_review_proto_msgTypes[5]
+	mi := &file_review_v1_review_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -937,7 +907,7 @@ func (x *AgentTask) String() string {
 func (*AgentTask) ProtoMessage() {}
 
 func (x *AgentTask) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[5]
+	mi := &file_review_v1_review_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -950,7 +920,7 @@ func (x *AgentTask) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentTask.ProtoReflect.Descriptor instead.
 func (*AgentTask) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{5}
+	return file_review_v1_review_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *AgentTask) GetRunId() string {
@@ -1051,13 +1021,6 @@ func (x *AgentTask) GetMaskedFiles() []string {
 	return nil
 }
 
-func (x *AgentTask) GetToolEndpoints() *ToolEndpoints {
-	if x != nil {
-		return x.ToolEndpoints
-	}
-	return nil
-}
-
 func (x *AgentTask) GetBudget() *TaskBudget {
 	if x != nil {
 		return x.Budget
@@ -1086,7 +1049,7 @@ type ReviewFinding struct {
 
 func (x *ReviewFinding) Reset() {
 	*x = ReviewFinding{}
-	mi := &file_review_v1_review_proto_msgTypes[6]
+	mi := &file_review_v1_review_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1098,7 +1061,7 @@ func (x *ReviewFinding) String() string {
 func (*ReviewFinding) ProtoMessage() {}
 
 func (x *ReviewFinding) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[6]
+	mi := &file_review_v1_review_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1111,7 +1074,7 @@ func (x *ReviewFinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReviewFinding.ProtoReflect.Descriptor instead.
 func (*ReviewFinding) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{6}
+	return file_review_v1_review_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ReviewFinding) GetFile() string {
@@ -1198,7 +1161,7 @@ func (x *ReviewFinding) GetEvidence() string {
 	return ""
 }
 
-// Provenance captures self-reported execution metadata; token accounting comes solely from cmd/adapter.
+// Provenance captures self-reported execution metadata; token accounting comes solely from the controller proxy.
 type Provenance struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Profile        string                 `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
@@ -1212,7 +1175,7 @@ type Provenance struct {
 
 func (x *Provenance) Reset() {
 	*x = Provenance{}
-	mi := &file_review_v1_review_proto_msgTypes[7]
+	mi := &file_review_v1_review_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1224,7 +1187,7 @@ func (x *Provenance) String() string {
 func (*Provenance) ProtoMessage() {}
 
 func (x *Provenance) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[7]
+	mi := &file_review_v1_review_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1237,7 +1200,7 @@ func (x *Provenance) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Provenance.ProtoReflect.Descriptor instead.
 func (*Provenance) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{7}
+	return file_review_v1_review_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Provenance) GetProfile() string {
@@ -1288,7 +1251,7 @@ type ReviewReport struct {
 
 func (x *ReviewReport) Reset() {
 	*x = ReviewReport{}
-	mi := &file_review_v1_review_proto_msgTypes[8]
+	mi := &file_review_v1_review_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1300,7 +1263,7 @@ func (x *ReviewReport) String() string {
 func (*ReviewReport) ProtoMessage() {}
 
 func (x *ReviewReport) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[8]
+	mi := &file_review_v1_review_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1313,7 +1276,7 @@ func (x *ReviewReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReviewReport.ProtoReflect.Descriptor instead.
 func (*ReviewReport) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{8}
+	return file_review_v1_review_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ReviewReport) GetSummary() string {
@@ -1337,7 +1300,7 @@ func (x *ReviewReport) GetProvenance() *Provenance {
 	return nil
 }
 
-// TaskClaims defines the HS256 JWT payload minted by cmd/controller and verified by cmd/adapter.
+// TaskClaims defines the in-memory session policy bound to an opaque random task token on controller :8081.
 type TaskClaims struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	RunId                   string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
@@ -1350,14 +1313,14 @@ type TaskClaims struct {
 	NormalizerReserveTokens int64                  `protobuf:"varint,8,opt,name=normalizer_reserve_tokens,json=normalizerReserveTokens,proto3" json:"normalizer_reserve_tokens,omitempty"` // Uncached token slice reserved for 1-shot Normalizer
 	MaxOutputTokens         int32                  `protobuf:"varint,9,opt,name=max_output_tokens,json=maxOutputTokens,proto3" json:"max_output_tokens,omitempty"`
 	Exp                     int64                  `protobuf:"varint,10,opt,name=exp,proto3" json:"exp,omitempty"` // Unix epoch expiration seconds
-	Jti                     string                 `protobuf:"bytes,11,opt,name=jti,proto3" json:"jti,omitempty"`  // Unique token ID indexing cmd/adapter's atomic ledger
+	Jti                     string                 `protobuf:"bytes,11,opt,name=jti,proto3" json:"jti,omitempty"`  // Unique session ID indexing the controller proxy's atomic ledger
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
 
 func (x *TaskClaims) Reset() {
 	*x = TaskClaims{}
-	mi := &file_review_v1_review_proto_msgTypes[9]
+	mi := &file_review_v1_review_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1369,7 +1332,7 @@ func (x *TaskClaims) String() string {
 func (*TaskClaims) ProtoMessage() {}
 
 func (x *TaskClaims) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[9]
+	mi := &file_review_v1_review_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1382,7 +1345,7 @@ func (x *TaskClaims) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskClaims.ProtoReflect.Descriptor instead.
 func (*TaskClaims) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{9}
+	return file_review_v1_review_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *TaskClaims) GetRunId() string {
@@ -1462,7 +1425,7 @@ func (x *TaskClaims) GetJti() string {
 	return ""
 }
 
-// SandboxUsage is returned by cmd/adapter /internal/usage/{jti} for the PostgreSQL scorecard.
+// SandboxUsage is returned in memory by ProxyHandler.FinishSession for run telemetry and scorecards.
 type SandboxUsage struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	Jti               string                 `protobuf:"bytes,1,opt,name=jti,proto3" json:"jti,omitempty"`
@@ -1478,7 +1441,7 @@ type SandboxUsage struct {
 
 func (x *SandboxUsage) Reset() {
 	*x = SandboxUsage{}
-	mi := &file_review_v1_review_proto_msgTypes[10]
+	mi := &file_review_v1_review_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1490,7 +1453,7 @@ func (x *SandboxUsage) String() string {
 func (*SandboxUsage) ProtoMessage() {}
 
 func (x *SandboxUsage) ProtoReflect() protoreflect.Message {
-	mi := &file_review_v1_review_proto_msgTypes[10]
+	mi := &file_review_v1_review_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1503,7 +1466,7 @@ func (x *SandboxUsage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxUsage.ProtoReflect.Descriptor instead.
 func (*SandboxUsage) Descriptor() ([]byte, []int) {
-	return file_review_v1_review_proto_rawDescGZIP(), []int{10}
+	return file_review_v1_review_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SandboxUsage) GetJti() string {
@@ -1559,7 +1522,7 @@ var File_review_v1_review_proto protoreflect.FileDescriptor
 
 const file_review_v1_review_proto_rawDesc = "" +
 	"\n" +
-	"\x16review/v1/review.proto\x12\treview.v1\"\xd9\x04\n" +
+	"\x16review/v1/review.proto\x12\treview.v1\"\x8d\x05\n" +
 	"\vReviewEvent\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x123\n" +
 	"\n" +
@@ -1578,7 +1541,9 @@ const file_review_v1_review_proto_rawDesc = "" +
 	"\ris_maintainer\x18\r \x01(\bR\fisMaintainer\x129\n" +
 	"\ftrigger_type\x18\x0e \x01(\x0e2\x16.review.v1.TriggerTypeR\vtriggerType\x12&\n" +
 	"\x0fforce_rerun_seq\x18\x0f \x01(\x03R\rforceRerunSeq\x120\n" +
-	"\x11requested_harness\x18\x10 \x01(\tH\x00R\x10requestedHarness\x88\x01\x01B\x14\n" +
+	"\x11requested_harness\x18\x10 \x01(\tH\x00R\x10requestedHarness\x88\x01\x01\x12\x19\n" +
+	"\bpr_title\x18\x11 \x01(\tR\aprTitle\x12\x17\n" +
+	"\apr_body\x18\x12 \x01(\tR\x06prBodyB\x14\n" +
 	"\x12_requested_harness\"\xf1\x01\n" +
 	"\n" +
 	"TaskBudget\x12!\n" +
@@ -1598,11 +1563,7 @@ const file_review_v1_review_proto_rawDesc = "" +
 	"\aGitInfo\x12\x1e\n" +
 	"\bbase_ref\x18\x01 \x01(\tH\x00R\abaseRef\x88\x01\x01\x12\x19\n" +
 	"\bhead_ref\x18\x02 \x01(\tR\aheadRefB\v\n" +
-	"\t_base_ref\"E\n" +
-	"\rToolEndpoints\x12$\n" +
-	"\vscoped_test\x18\x01 \x01(\tH\x00R\n" +
-	"scopedTest\x88\x01\x01B\x0e\n" +
-	"\f_scoped_test\"\xc7\x04\n" +
+	"\t_base_ref\"\x86\x04\n" +
 	"\tAgentTask\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1f\n" +
 	"\vshard_index\x18\x02 \x01(\x05R\n" +
@@ -1622,9 +1583,8 @@ const file_review_v1_review_proto_rawDesc = "" +
 	"ciLogsFile\x88\x01\x01\x12\x17\n" +
 	"\aout_dir\x18\f \x01(\tR\x06outDir\x12$\n" +
 	"\x03git\x18\r \x01(\v2\x12.review.v1.GitInfoR\x03git\x12!\n" +
-	"\fmasked_files\x18\x0e \x03(\tR\vmaskedFiles\x12?\n" +
-	"\x0etool_endpoints\x18\x0f \x01(\v2\x18.review.v1.ToolEndpointsR\rtoolEndpoints\x12-\n" +
-	"\x06budget\x18\x10 \x01(\v2\x15.review.v1.TaskBudgetR\x06budgetB\x0f\n" +
+	"\fmasked_files\x18\x0e \x03(\tR\vmaskedFiles\x12-\n" +
+	"\x06budget\x18\x0f \x01(\v2\x15.review.v1.TaskBudgetR\x06budgetB\x0f\n" +
 	"\r_ci_logs_file\"\xca\x03\n" +
 	"\rReviewFinding\x12\x12\n" +
 	"\x04file\x18\x01 \x01(\tR\x04file\x12\x12\n" +
@@ -1746,7 +1706,7 @@ func file_review_v1_review_proto_rawDescGZIP() []byte {
 }
 
 var file_review_v1_review_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_review_v1_review_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_review_v1_review_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_review_v1_review_proto_goTypes = []any{
 	(EventKind)(0),        // 0: review.v1.EventKind
 	(TriggerSource)(0),    // 1: review.v1.TriggerSource
@@ -1761,37 +1721,35 @@ var file_review_v1_review_proto_goTypes = []any{
 	(*TaskBudget)(nil),    // 10: review.v1.TaskBudget
 	(*HarnessRef)(nil),    // 11: review.v1.HarnessRef
 	(*GitInfo)(nil),       // 12: review.v1.GitInfo
-	(*ToolEndpoints)(nil), // 13: review.v1.ToolEndpoints
-	(*AgentTask)(nil),     // 14: review.v1.AgentTask
-	(*ReviewFinding)(nil), // 15: review.v1.ReviewFinding
-	(*Provenance)(nil),    // 16: review.v1.Provenance
-	(*ReviewReport)(nil),  // 17: review.v1.ReviewReport
-	(*TaskClaims)(nil),    // 18: review.v1.TaskClaims
-	(*SandboxUsage)(nil),  // 19: review.v1.SandboxUsage
-	nil,                   // 20: review.v1.HarnessRef.OptionsEntry
+	(*AgentTask)(nil),     // 13: review.v1.AgentTask
+	(*ReviewFinding)(nil), // 14: review.v1.ReviewFinding
+	(*Provenance)(nil),    // 15: review.v1.Provenance
+	(*ReviewReport)(nil),  // 16: review.v1.ReviewReport
+	(*TaskClaims)(nil),    // 17: review.v1.TaskClaims
+	(*SandboxUsage)(nil),  // 18: review.v1.SandboxUsage
+	nil,                   // 19: review.v1.HarnessRef.OptionsEntry
 }
 var file_review_v1_review_proto_depIdxs = []int32{
 	0,  // 0: review.v1.ReviewEvent.event_kind:type_name -> review.v1.EventKind
 	1,  // 1: review.v1.ReviewEvent.source:type_name -> review.v1.TriggerSource
 	2,  // 2: review.v1.ReviewEvent.trigger_type:type_name -> review.v1.TriggerType
-	20, // 3: review.v1.HarnessRef.options:type_name -> review.v1.HarnessRef.OptionsEntry
+	19, // 3: review.v1.HarnessRef.options:type_name -> review.v1.HarnessRef.OptionsEntry
 	11, // 4: review.v1.AgentTask.harness:type_name -> review.v1.HarnessRef
 	12, // 5: review.v1.AgentTask.git:type_name -> review.v1.GitInfo
-	13, // 6: review.v1.AgentTask.tool_endpoints:type_name -> review.v1.ToolEndpoints
-	10, // 7: review.v1.AgentTask.budget:type_name -> review.v1.TaskBudget
-	3,  // 8: review.v1.ReviewFinding.side:type_name -> review.v1.DiffSide
-	4,  // 9: review.v1.ReviewFinding.anchor:type_name -> review.v1.AnchorKind
-	5,  // 10: review.v1.ReviewFinding.severity:type_name -> review.v1.Severity
-	6,  // 11: review.v1.ReviewFinding.category:type_name -> review.v1.FindingCategory
-	7,  // 12: review.v1.Provenance.normalizer:type_name -> review.v1.NormalizerPath
-	8,  // 13: review.v1.Provenance.status:type_name -> review.v1.ReportStatus
-	15, // 14: review.v1.ReviewReport.findings:type_name -> review.v1.ReviewFinding
-	16, // 15: review.v1.ReviewReport.provenance:type_name -> review.v1.Provenance
-	16, // [16:16] is the sub-list for method output_type
-	16, // [16:16] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	10, // 6: review.v1.AgentTask.budget:type_name -> review.v1.TaskBudget
+	3,  // 7: review.v1.ReviewFinding.side:type_name -> review.v1.DiffSide
+	4,  // 8: review.v1.ReviewFinding.anchor:type_name -> review.v1.AnchorKind
+	5,  // 9: review.v1.ReviewFinding.severity:type_name -> review.v1.Severity
+	6,  // 10: review.v1.ReviewFinding.category:type_name -> review.v1.FindingCategory
+	7,  // 11: review.v1.Provenance.normalizer:type_name -> review.v1.NormalizerPath
+	8,  // 12: review.v1.Provenance.status:type_name -> review.v1.ReportStatus
+	14, // 13: review.v1.ReviewReport.findings:type_name -> review.v1.ReviewFinding
+	15, // 14: review.v1.ReviewReport.provenance:type_name -> review.v1.Provenance
+	15, // [15:15] is the sub-list for method output_type
+	15, // [15:15] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_review_v1_review_proto_init() }
@@ -1804,15 +1762,14 @@ func file_review_v1_review_proto_init() {
 	file_review_v1_review_proto_msgTypes[4].OneofWrappers = []any{}
 	file_review_v1_review_proto_msgTypes[5].OneofWrappers = []any{}
 	file_review_v1_review_proto_msgTypes[6].OneofWrappers = []any{}
-	file_review_v1_review_proto_msgTypes[7].OneofWrappers = []any{}
-	file_review_v1_review_proto_msgTypes[9].OneofWrappers = []any{}
+	file_review_v1_review_proto_msgTypes[8].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_review_v1_review_proto_rawDesc), len(file_review_v1_review_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   12,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

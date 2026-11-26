@@ -37,6 +37,10 @@ func TestWithStderrAppendsRedactedTail(t *testing.T) {
 	if strings.Contains(cut, "eyJzdWIi") || strings.Contains(cut, "c2lnbmF0dXJl") {
 		t.Fatalf("expected a token cut at the tail boundary to be redacted, got %q", cut)
 	}
+	opaque := withStderr(base, "failed auth with secret123456", "secret123456").Error()
+	if strings.Contains(opaque, "secret123456") || !strings.Contains(opaque, "[redacted]") {
+		t.Fatalf("expected explicit opaque token redacted, got %q", opaque)
+	}
 	if same := withStderr(base, " \n"); same != base {
 		t.Fatalf("expected the error unchanged when stderr is blank, got %v", same)
 	}
@@ -51,7 +55,7 @@ func TestWaitRunningReportsWhyThePodIsStuck(t *testing.T) {
 		p := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
 		p.Status.Phase = corev1.PodPending
 		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
-			Name: "harness",
+			Name: "sandbox",
 			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
 				Reason:  "ImagePullBackOff",
 				Message: "Back-off pulling image registry.example/sandbox:missing",
@@ -60,19 +64,20 @@ func TestWaitRunningReportsWhyThePodIsStuck(t *testing.T) {
 		_ = cs.Tracker().Add(p)
 		return true, p, nil
 	})
-	runner := NewK8sSandboxRunner(cs, nil, K8sConfig{
+	runner := NewK8sSandboxRunner(cs, K8sConfig{
 		Namespace:          "review-sandbox",
 		WaitRunningTimeout: 100 * time.Millisecond,
 		PollInterval:       10 * time.Millisecond,
 	})
-	_, err := runner.Run(context.Background(), contract.SandboxSpec{
+	err := runner.Run(context.Background(), contract.SandboxSpec{
 		ShortRunID:     "57uck000",
 		Role:           "primary",
 		HarnessProfile: "openhands",
-		TarballPath:    "/nonexistent",
+		ControllerURL:  "http://10.96.0.42:8081",
+		TaskToken:      "tok",
 		TimeoutSeconds: 60,
 	})
-	if err == nil || !strings.Contains(err.Error(), "harness") || !strings.Contains(err.Error(), "ImagePullBackOff") {
-		t.Fatalf("expected the timeout error to name the harness container and ImagePullBackOff, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "sandbox") || !strings.Contains(err.Error(), "ImagePullBackOff") {
+		t.Fatalf("expected the timeout error to name the sandbox container and ImagePullBackOff, got %v", err)
 	}
 }

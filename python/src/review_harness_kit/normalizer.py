@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import math
+import os
+import tempfile
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import yaml
 from google.protobuf import json_format
-from openai import OpenAI, OpenAIError
+from openai import DefaultHttpxClient, OpenAI, OpenAIError
 
 from review_harness_kit.contracts import HarnessAdapter, ProcessResult, RawOutput, RunContext
 from review_harness_kit.gen.review.v1 import review_pb2
@@ -77,18 +80,52 @@ def load_report_schema(schema_path: Path) -> dict[str, Any]:
     return json.loads(target.read_text(encoding="utf-8"))
 
 
+DIFF_PATH_PREFIXES = ("+++ b/", "--- a/", "rename from ", "rename to ")
+
+
+def diff_paths_in_order(diff_path: Path) -> list[str]:
+    seen: list[str] = []
+    for line in diff_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        prefix = next((p for p in DIFF_PATH_PREFIXES if line.startswith(p)), "")
+        if not prefix:
+            continue
+        candidate = line[len(prefix):].split("\t", 1)[0].strip()
+        if candidate and candidate != "/dev/null" and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
 def changed_files_from_diff(task: review_pb2.AgentTask) -> str:
     if not task.diff_file:
         return "(unknown)"
     diff_path = Path(task.diff_file)
     if not diff_path.is_file():
         return "(unknown)"
-    seen: list[str] = []
-    for line in diff_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        candidate = line[6:].strip() if line.startswith(("+++ b/", "--- a/")) else ""
-        if candidate and candidate != "/dev/null" and candidate not in seen:
-            seen.append(candidate)
+    seen = diff_paths_in_order(diff_path)
     return "\n".join(seen) if seen else "(none)"
+
+
+class ReviewablePaths:
+    def __init__(self, diff_paths: frozenset[str] = frozenset(), masked_patterns: tuple[str, ...] = ()) -> None:
+        self.diff_paths = diff_paths
+        self.masked_patterns = masked_patterns
+
+    def __contains__(self, rel_path: object) -> bool:
+        if not isinstance(rel_path, str) or not rel_path:
+            return False
+        if rel_path in self.diff_paths:
+            return True
+        return any(rel_path == pat or fnmatch.fnmatchcase(rel_path, pat) for pat in self.masked_patterns)
+
+
+def reviewable_paths_for_task(task: review_pb2.AgentTask) -> ReviewablePaths:
+    diff_paths: frozenset[str] = frozenset()
+    if task.diff_file:
+        diff_path = Path(task.diff_file)
+        if diff_path.is_file():
+            diff_paths = frozenset(diff_paths_in_order(diff_path))
+    masked = tuple(pat.strip() for pat in task.masked_files if pat.strip())
+    return ReviewablePaths(diff_paths=diff_paths, masked_patterns=masked)
 
 
 def resolve_harness_version(adapter: HarnessAdapter) -> str:
@@ -145,8 +182,9 @@ def normalize(
     out.provenance.status = review_pb2.REPORT_STATUS_OK
     out.summary = (cand.summary or "")[:8000]
     src = Path(task.src_dir) if task.src_dir else Path("/workspace/src")
+    reviewable = reviewable_paths_for_task(task)
     for finding in cand.findings[:100]:
-        anchored = anchor_finding(finding, src)
+        anchored = anchor_finding(finding, src, reviewable)
         if anchored is not None:
             out.findings.add().CopyFrom(anchored)
     return out
@@ -160,6 +198,7 @@ def llm_normalize(raw_text: str, task: review_pb2.AgentTask, ctx: RunContext) ->
         max_retries=0,
         timeout=400,
         default_headers={"x-review-phase": "normalize"},
+        http_client=DefaultHttpxClient(trust_env=False),
     )
     user_content = (
         f"Changed files:\n{changed_files_from_diff(task)}\n\n"
@@ -181,7 +220,12 @@ def llm_normalize(raw_text: str, task: review_pb2.AgentTask, ctx: RunContext) ->
     return parse_report_json(content or "{}")
 
 
-def anchor_finding(finding: review_pb2.ReviewFinding, src: Path) -> review_pb2.ReviewFinding | None:
+def anchor_finding(
+    finding: review_pb2.ReviewFinding,
+    src: Path,
+    reviewable: ReviewablePaths | None = None,
+) -> review_pb2.ReviewFinding | None:
+    known_paths = reviewable if reviewable is not None else ReviewablePaths()
     file_rel = finding.file.strip()
     while file_rel.startswith("./"):
         file_rel = file_rel[2:]
@@ -191,7 +235,7 @@ def anchor_finding(finding: review_pb2.ReviewFinding, src: Path) -> review_pb2.R
     root = src.resolve()
     if file_rel.startswith(("b/", "a/")) and not (root / file_rel).exists():
         trimmed = file_rel[2:]
-        if trimmed and not Path(trimmed).is_absolute() and (root / trimmed).exists():
+        if trimmed and not Path(trimmed).is_absolute() and ((root / trimmed).exists() or trimmed in known_paths):
             file_rel = trimmed
 
     path = (root / file_rel).resolve()
@@ -236,7 +280,11 @@ def anchor_finding(finding: review_pb2.ReviewFinding, src: Path) -> review_pb2.R
         return out
 
     if not path.is_file():
-        return None
+        if path.exists() or file_rel not in known_paths:
+            return None
+        out.line = 0
+        out.anchor = review_pb2.ANCHOR_KIND_DERIVED
+        return out
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if 1 <= out.line <= len(lines):
         out.target_line_text = lines[out.line - 1].strip()[:500]
@@ -249,5 +297,14 @@ def anchor_finding(finding: review_pb2.ReviewFinding, src: Path) -> review_pb2.R
 
 def write_report(report: review_pb2.ReviewReport, output_file: Path) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json_format.MessageToJson(report, preserving_proto_field_name=False)
-    output_file.write_text(serialized + "\n", encoding="utf-8")
+    serialized = json_format.MessageToJson(report, preserving_proto_field_name=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=output_file.parent, prefix=".report.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(serialized)
+            tmp_file.flush()
+        os.replace(tmp_name, output_file)
+    except BaseException:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise

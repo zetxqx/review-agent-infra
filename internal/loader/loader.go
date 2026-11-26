@@ -6,40 +6,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"os/exec"
 	"path"
-	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
+	"time"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const (
-	MaxReportBytes = 2 << 20
-	maxFileBytes   = 64 << 20
-	maxTotalBytes  = 2 << 30
+	MaxReportBytes   = 2 << 20
+	maxFileBytes     = 64 << 20
+	maxTotalBytes    = 2 << 30
+	maxSymlinkDepth  = 40
+	defaultWorkspace = "/workspace"
 )
 
-type Paths struct {
-	SrcDir string
-	InDir  string
-	OutDir string
-}
-
-func DefaultPaths() Paths {
-	return Paths{
-		SrcDir: "/workspace/src",
-		InDir:  "/workspace/.review/in",
-		OutDir: "/workspace/.review/out",
-	}
-}
-
-// key: basename of untrusted repository instruction file; value: true when deleted from workspace src
+// key: basename of untrusted repository instruction file; value: true when stripped from bundle src
 var maskedNames = map[string]bool{
 	"AGENTS.md":          true,
 	"AGENTS.override.md": true,
@@ -54,8 +39,9 @@ var maskedNames = map[string]bool{
 	".aider.conf.yml":    true,
 }
 
-// key: directory name of untrusted agent config directory; value: true when deleted recursively from workspace src
+// key: directory name of untrusted agent config directory; value: true when stripped recursively from bundle src
 var maskedDirs = map[string]bool{
+	".git":       true,
 	".agents":    true,
 	".codex":     true,
 	".opencode":  true,
@@ -65,91 +51,63 @@ var maskedDirs = map[string]bool{
 	".goose":     true,
 }
 
-func UnpackSourceTGZ(r io.Reader, srcDir string, stripTop bool) error {
-	gz, err := gzip.NewReader(r)
+// inputs key: file path relative to /workspace/.review/in; value: raw file bytes.
+func BuildBundleTGZ(tarballPath string, inputs map[string][]byte, dst io.Writer) error {
+	f, err := os.Open(tarballPath)
 	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	return ExtractSafeTar(gz, srcDir, stripTop)
-}
-
-func Prepare(r io.Reader, p Paths) error {
-	if err := os.MkdirAll(p.InDir, 0o755); err != nil {
-		return err
-	}
-	if err := ExtractSafeTar(r, p.InDir, false); err != nil {
-		return err
-	}
-	masked, err := MaskInstructionFiles(p.SrcDir)
-	if err != nil {
-		return err
-	}
-	baseRef, err := BuildLocalGitRepo(p.SrcDir, filepath.Join(p.InDir, "diff.patch"), masked)
-	if err != nil {
-		return err
-	}
-	return updateTaskJSON(filepath.Join(p.InDir, "task.json"), masked, baseRef)
-}
-
-func ReadReport(w io.Writer, outDir string) error {
-	root, err := os.OpenRoot(outDir)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-
-	f, err := root.OpenFile("report.json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
+		return fmt.Errorf("open snapshot tarball: %w", err)
 	}
 	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("report.json is not a regular file")
-	}
-	if info.Size() > MaxReportBytes {
-		return fmt.Errorf("report.json size %d exceeds %d byte cap", info.Size(), MaxReportBytes)
-	}
-	n, err := io.Copy(w, io.LimitReader(f, MaxReportBytes+1))
-	if err != nil {
-		return err
-	}
-	if n > MaxReportBytes {
-		return fmt.Errorf("report.json read exceeds %d byte cap", MaxReportBytes)
-	}
-	return nil
+	return BuildBundleTGZFromReader(f, inputs, dst)
 }
 
-type deferredSymlink struct {
-	rel      string
-	linkname string
-}
-
-func ExtractSafeTar(r io.Reader, dst string, stripTop bool) error {
-	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
-	}
-	root, err := os.OpenRoot(dst)
+// inputs key: file path relative to /workspace/.review/in; value: raw file bytes.
+func BuildBundleTGZFromReader(srcTGZ io.Reader, inputs map[string][]byte, dst io.Writer) error {
+	gzIn, err := gzip.NewReader(srcTGZ)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
+	defer gzIn.Close()
 
-	tr := tar.NewReader(r)
+	gw := gzip.NewWriter(dst)
+	tw := tar.NewWriter(gw)
+	zeroTime := time.Unix(0, 0)
+
+	for _, baseDir := range []string{"src", ".review", ".review/in", ".review/out"} {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     baseDir,
+			Typeflag: tar.TypeDir,
+			Mode:     0o755,
+			ModTime:  zeroTime,
+		}); err != nil {
+			_ = tw.Close()
+			_ = gw.Close()
+			return err
+		}
+	}
+
+	tr := tar.NewReader(gzIn)
 	var totalWritten int64
-	var symlinks []deferredSymlink
+	var allPaths []string
+	var symlinkOrder []string
+	// key: cleaned repo-relative symlink path; value: raw symlink target
+	symlinks := make(map[string]string)
+	// key: cleaned repo-relative non-symlink path; value: true when emitted as dir, regular file, or hardlink
+	nonSymlinkPaths := make(map[string]bool)
+	// key: cleaned repo-relative regular file path; value: true when emitted into bundle src
+	emittedRegs := make(map[string]bool)
+	// key: masked file path or masked dir glob ("<dir>/*"); value: true when stripped
+	maskedSet := make(map[string]bool)
+
 	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
+		hdr, nextErr := tr.Next()
+		if errors.Is(nextErr, io.EOF) {
 			break
 		}
-		if err != nil {
-			return err
+		if nextErr != nil {
+			_ = tw.Close()
+			_ = gw.Close()
+			return nextErr
 		}
 		if hdr.Typeflag == tar.TypeXGlobalHeader || hdr.Typeflag == tar.TypeXHeader {
 			continue
@@ -161,10 +119,7 @@ func ExtractSafeTar(r io.Reader, dst string, stripTop bool) error {
 			return fmt.Errorf("path traversal rejected: %q", hdr.Name)
 		}
 
-		rel := path.Clean(hdr.Name)
-		if stripTop {
-			rel = stripTopDir(rel)
-		}
+		rel := stripTopDir(path.Clean(hdr.Name))
 		if rel == "" || rel == "." {
 			continue
 		}
@@ -172,36 +127,57 @@ func ExtractSafeTar(r io.Reader, dst string, stripTop bool) error {
 			return fmt.Errorf("unsafe tar path %q", hdr.Name)
 		}
 
+		if maskedKey, isMasked := matchMaskedPath(rel, hdr.Typeflag == tar.TypeDir); isMasked {
+			maskedSet[maskedKey] = true
+			continue
+		}
+
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := root.MkdirAll(rel, 0o755); err != nil {
+			allPaths = append(allPaths, rel)
+			nonSymlinkPaths[rel] = true
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     "src/" + rel,
+				Typeflag: tar.TypeDir,
+				Mode:     0o755,
+				ModTime:  zeroTime,
+			}); err != nil {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
-			if dir := path.Dir(rel); dir != "." {
-				if err := root.MkdirAll(dir, 0o755); err != nil {
-					return err
-				}
+			if hdr.Size < 0 || hdr.Size > maxFileBytes {
+				return fmt.Errorf("file %q exceeds %d byte cap", rel, maxFileBytes)
 			}
-			f, err := root.OpenFile(rel, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode().Perm()|0o600)
-			if err != nil {
+			if totalWritten+hdr.Size > maxTotalBytes {
+				return fmt.Errorf("archive exceeds %d total byte cap", maxTotalBytes)
+			}
+			mode := (hdr.Mode & 0o777) | 0o600
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     "src/" + rel,
+				Typeflag: tar.TypeReg,
+				Mode:     mode,
+				Size:     hdr.Size,
+				ModTime:  zeroTime,
+			}); err != nil {
 				return err
 			}
-			n, copyErr := io.Copy(f, io.LimitReader(tr, maxFileBytes+1))
-			closeErr := f.Close()
+			n, copyErr := io.Copy(tw, io.LimitReader(tr, maxFileBytes+1))
 			if copyErr != nil {
 				return copyErr
 			}
-			if closeErr != nil {
-				return closeErr
-			}
 			if n > maxFileBytes {
 				return fmt.Errorf("file %q exceeds %d byte cap", rel, maxFileBytes)
+			}
+			if n != hdr.Size {
+				return fmt.Errorf("file %q short read: got %d want %d", rel, n, hdr.Size)
 			}
 			totalWritten += n
 			if totalWritten > maxTotalBytes {
 				return fmt.Errorf("archive exceeds %d total byte cap", maxTotalBytes)
 			}
+			allPaths = append(allPaths, rel)
+			nonSymlinkPaths[rel] = true
+			emittedRegs[rel] = true
 		case tar.TypeSymlink:
 			if hdr.Linkname == "" || path.IsAbs(hdr.Linkname) || strings.Contains(hdr.Linkname, "\\") {
 				return fmt.Errorf("unsafe symlink target %q -> %q", rel, hdr.Linkname)
@@ -210,96 +186,235 @@ func ExtractSafeTar(r io.Reader, dst string, stripTop bool) error {
 			if resolved == ".." || strings.HasPrefix(resolved, "../") {
 				return fmt.Errorf("escaping symlink rejected: %q -> %q", rel, hdr.Linkname)
 			}
-			symlinks = append(symlinks, deferredSymlink{rel: rel, linkname: hdr.Linkname})
+			if _, exists := symlinks[rel]; exists {
+				return fmt.Errorf("symlink destination %q already exists", rel)
+			}
+			symlinks[rel] = hdr.Linkname
+			symlinkOrder = append(symlinkOrder, rel)
+			allPaths = append(allPaths, rel)
 		case tar.TypeLink:
-			if strings.HasPrefix(hdr.Linkname, "/") || hasTraversalSegment(hdr.Linkname) {
+			if strings.HasPrefix(hdr.Linkname, "/") || strings.Contains(hdr.Linkname, "\\") || hasTraversalSegment(hdr.Linkname) {
 				return fmt.Errorf("escaping hardlink rejected: %q -> %q", rel, hdr.Linkname)
 			}
-			target := path.Clean(hdr.Linkname)
-			if stripTop {
-				target = stripTopDir(target)
-			}
+			target := stripTopDir(path.Clean(hdr.Linkname))
 			if target == "" || target == "." || path.IsAbs(target) || target == ".." || strings.HasPrefix(target, "../") {
 				return fmt.Errorf("escaping hardlink rejected: %q -> %q", rel, hdr.Linkname)
 			}
-			if dir := path.Dir(rel); dir != "." {
-				if err := root.MkdirAll(dir, 0o755); err != nil {
-					return err
-				}
+			if _, maskedTarget := matchMaskedPath(target, false); maskedTarget {
+				continue
 			}
-			if err := root.Link(target, rel); err != nil {
+			if !emittedRegs[target] {
+				return fmt.Errorf("escaping or unresolved hardlink rejected: %q -> %q", rel, hdr.Linkname)
+			}
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     "src/" + rel,
+				Typeflag: tar.TypeLink,
+				Linkname: "src/" + target,
+				Mode:     0o644,
+				ModTime:  zeroTime,
+			}); err != nil {
 				return err
 			}
+			allPaths = append(allPaths, rel)
+			nonSymlinkPaths[rel] = true
+			emittedRegs[rel] = true
 		default:
 			return fmt.Errorf("unsupported tar entry type %q for %q", hdr.Typeflag, rel)
 		}
 	}
 
-	var created []string
-	cleanupCreated := func() {
-		for i := len(created) - 1; i >= 0; i-- {
-			_ = root.Remove(created[i])
+	if err := validateSymlinks(allPaths, symlinkOrder, symlinks, nonSymlinkPaths); err != nil {
+		return err
+	}
+
+	for _, rel := range symlinkOrder {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     "src/" + rel,
+			Typeflag: tar.TypeSymlink,
+			Linkname: symlinks[rel],
+			Mode:     0o777,
+			ModTime:  zeroTime,
+		}); err != nil {
+			return err
 		}
 	}
 
-	for _, s := range symlinks {
-		if err := ensureRealAncestorDirs(root, path.Dir(s.rel)); err != nil {
-			cleanupCreated()
+	maskedFiles := make([]string, 0, len(maskedSet))
+	for k := range maskedSet {
+		maskedFiles = append(maskedFiles, k)
+	}
+	slices.Sort(maskedFiles)
+
+	preparedInputs, err := prepareBundleInputs(inputs, maskedFiles)
+	if err != nil {
+		return err
+	}
+	inputKeys := make([]string, 0, len(preparedInputs))
+	for k := range preparedInputs {
+		inputKeys = append(inputKeys, k)
+	}
+	slices.Sort(inputKeys)
+
+	for _, k := range inputKeys {
+		if strings.HasPrefix(k, "/") || strings.Contains(k, "\\") || hasTraversalSegment(k) {
+			return fmt.Errorf("unsafe input path %q", k)
+		}
+		cleaned := path.Clean(strings.TrimLeft(k, "/"))
+		if cleaned == "" || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return fmt.Errorf("unsafe input path %q", k)
+		}
+		data := preparedInputs[k]
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     ".review/in/" + cleaned,
+			Typeflag: tar.TypeReg,
+			Mode:     0o644,
+			Size:     int64(len(data)),
+			ModTime:  zeroTime,
+		}); err != nil {
 			return err
 		}
-		if _, err := root.Lstat(s.rel); err == nil {
-			cleanupCreated()
-			return fmt.Errorf("symlink destination %q already exists", s.rel)
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			cleanupCreated()
+		if _, err := tw.Write(data); err != nil {
 			return err
 		}
-		if err := root.Symlink(s.linkname, s.rel); err != nil {
-			cleanupCreated()
-			return err
-		}
-		created = append(created, s.rel)
 	}
 
-	for _, s := range symlinks {
-		if _, err := root.Stat(s.rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			cleanupCreated()
-			return fmt.Errorf("chained symlink escape rejected: %q -> %q: %w", s.rel, s.linkname, err)
+	if err := tw.Close(); err != nil {
+		_ = gw.Close()
+		return err
+	}
+	return gw.Close()
+}
+
+// symlinks key: cleaned repo-relative symlink path; value: raw symlink target.
+// nonSymlinkPaths key: cleaned repo-relative non-symlink path; value: true when emitted as dir, file, or hardlink.
+func validateSymlinks(allPaths, symlinkOrder []string, symlinks map[string]string, nonSymlinkPaths map[string]bool) error {
+	for _, rel := range symlinkOrder {
+		if nonSymlinkPaths[rel] {
+			return fmt.Errorf("symlink destination %q already exists", rel)
+		}
+	}
+	for _, p := range allPaths {
+		for dir := path.Dir(p); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			if _, isSym := symlinks[dir]; isSym {
+				return fmt.Errorf("symlink ancestor %q is not a real directory", dir)
+			}
+		}
+	}
+	for _, rel := range symlinkOrder {
+		if err := validateSymlinkChain(rel, symlinks); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func ensureRealAncestorDirs(root *os.Root, dir string) error {
-	if dir == "" || dir == "." {
-		return nil
+// symlinks key: cleaned repo-relative symlink path; value: raw symlink target.
+func validateSymlinkChain(start string, symlinks map[string]string) error {
+	var stack []string
+	if dir := path.Dir(start); dir != "." {
+		stack = strings.Split(dir, "/")
 	}
-	parts := strings.Split(dir, "/")
-	cur := ""
-	for _, seg := range parts {
+	remaining := strings.Split(symlinks[start], "/")
+	hops := 0
+
+	for len(remaining) > 0 {
+		seg := remaining[0]
+		remaining = remaining[1:]
 		if seg == "" || seg == "." {
 			continue
 		}
-		if cur == "" {
-			cur = seg
-		} else {
-			cur = cur + "/" + seg
-		}
-		info, err := root.Lstat(cur)
-		if errors.Is(err, fs.ErrNotExist) {
-			if mkErr := root.Mkdir(cur, 0o755); mkErr != nil {
-				return mkErr
+		if seg == ".." {
+			if len(stack) == 0 {
+				return fmt.Errorf("chained symlink escape rejected: %q -> %q", start, symlinks[start])
 			}
+			stack = stack[:len(stack)-1]
 			continue
 		}
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("symlink ancestor %q is not a real directory", cur)
+		stack = append(stack, seg)
+		cur := strings.Join(stack, "/")
+		if target, isSym := symlinks[cur]; isSym {
+			hops++
+			if hops > maxSymlinkDepth {
+				return fmt.Errorf("symlink loop rejected: %q -> %q", start, symlinks[start])
+			}
+			if target == "" || path.IsAbs(target) || strings.Contains(target, "\\") {
+				return fmt.Errorf("chained symlink escape rejected: %q -> %q", start, target)
+			}
+			stack = stack[:len(stack)-1]
+			nextSegs := strings.Split(target, "/")
+			remaining = append(nextSegs, remaining...)
 		}
 	}
 	return nil
+}
+
+func matchMaskedPath(rel string, isDir bool) (string, bool) {
+	parts := strings.Split(rel, "/")
+	for i, seg := range parts {
+		if maskedDirs[seg] {
+			return strings.Join(parts[:i+1], "/") + "/*", true
+		}
+	}
+	if !isDir && maskedNames[parts[len(parts)-1]] {
+		return rel, true
+	}
+	return "", false
+}
+
+// inputs key: file path relative to /workspace/.review/in; value: raw file bytes.
+// Return map key: file path relative to /workspace/.review/in; value: raw file bytes with updated task.json.
+func prepareBundleInputs(inputs map[string][]byte, maskedFiles []string) (map[string][]byte, error) {
+	// key: file path relative to /workspace/.review/in; value: raw file bytes
+	out := make(map[string][]byte, len(inputs))
+	for k, v := range inputs {
+		out[k] = v
+	}
+	rawTask, ok := out["task.json"]
+	if !ok {
+		return nil, errors.New("bundle inputs missing task.json")
+	}
+	var task reviewv1.AgentTask
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(rawTask, &task); err != nil {
+		return nil, fmt.Errorf("decode task.json: %w", err)
+	}
+	task.SrcDir = defaultWorkspace + "/src"
+	task.DiffFile = defaultWorkspace + "/.review/in/diff.patch"
+	if hasRulesPrefix(out) {
+		task.RulesDir = defaultWorkspace + "/.review/in/rules"
+	} else if _, hasRulesMD := out["rules.md"]; hasRulesMD {
+		task.RulesDir = defaultWorkspace + "/.review/in/rules.md"
+	} else {
+		task.RulesDir = defaultWorkspace + "/.review/in/rules"
+	}
+	task.OutDir = defaultWorkspace + "/.review/out"
+	if _, hasCI := out["ci_failure.log"]; hasCI && task.CiLogsFile == nil {
+		ciPath := defaultWorkspace + "/.review/in/ci_failure.log"
+		task.CiLogsFile = &ciPath
+	}
+	task.MaskedFiles = maskedFiles
+	baseRef := "base"
+	task.Git = &reviewv1.GitInfo{
+		BaseRef: &baseRef,
+		HeadRef: "pr",
+	}
+
+	encoded, err := (protojson.MarshalOptions{Indent: "  "}).Marshal(&task)
+	if err != nil {
+		return nil, fmt.Errorf("encode task.json: %w", err)
+	}
+	out["task.json"] = append(encoded, '\n')
+	return out, nil
+}
+
+// inputs key: file path relative to /workspace/.review/in; value: raw file bytes.
+func hasRulesPrefix(inputs map[string][]byte) bool {
+	for k := range inputs {
+		cleaned := path.Clean(strings.TrimLeft(k, "/"))
+		if strings.HasPrefix(cleaned, "rules/") {
+			return true
+		}
+	}
+	return false
 }
 
 func hasTraversalSegment(raw string) bool {
@@ -317,148 +432,4 @@ func stripTopDir(p string) string {
 		return cleaned[idx+1:]
 	}
 	return ""
-}
-
-func MaskInstructionFiles(src string) ([]string, error) {
-	var masked []string
-	err := filepath.WalkDir(src, func(p string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if p == src {
-			return nil
-		}
-		rel, err := filepath.Rel(src, p)
-		if err != nil {
-			return err
-		}
-		name := d.Name()
-		if d.IsDir() || d.Type()&os.ModeSymlink != 0 {
-			if maskedDirs[name] {
-				if d.Type()&os.ModeSymlink != 0 {
-					if err := os.Remove(p); err != nil {
-						return err
-					}
-				} else {
-					if err := os.RemoveAll(p); err != nil {
-						return err
-					}
-				}
-				masked = append(masked, filepath.ToSlash(rel)+"/*")
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-		}
-		if !d.IsDir() && maskedNames[name] {
-			if err := os.Remove(p); err != nil {
-				return err
-			}
-			masked = append(masked, filepath.ToSlash(rel))
-		}
-		return nil
-	})
-	slices.Sort(masked)
-	return masked, err
-}
-
-func BuildLocalGitRepo(src, patchPath string, masked []string) (string, error) {
-	if err := runGit(src, "init", "-q", "-b", "pr"); err != nil {
-		return "", err
-	}
-	if err := runGit(src, "add", "-A", "-f"); err != nil {
-		return "", err
-	}
-	headTree, err := runGitOutput(src, "write-tree")
-	if err != nil {
-		return "", err
-	}
-
-	var baseCommit string
-	if patchData, readErr := os.ReadFile(patchPath); readErr == nil && len(strings.TrimSpace(string(patchData))) > 0 {
-		args := []string{"apply", "-R", "--index", "--whitespace=nowarn"}
-		for _, pat := range masked {
-			args = append(args, "--exclude="+pat)
-		}
-		args = append(args, patchPath)
-		if applyErr := runGit(src, args...); applyErr == nil {
-			baseTree, wtErr := runGitOutput(src, "write-tree")
-			if wtErr == nil {
-				if c, cErr := runGitOutput(src, "commit-tree", baseTree, "-m", "base"); cErr == nil {
-					baseCommit = c
-					_ = runGit(src, "update-ref", "refs/heads/base", baseCommit)
-				}
-			}
-		}
-	}
-
-	commitArgs := []string{"commit-tree", headTree}
-	if baseCommit != "" {
-		commitArgs = append(commitArgs, "-p", baseCommit)
-	}
-	commitArgs = append(commitArgs, "-m", "pr head")
-	headCommit, err := runGitOutput(src, commitArgs...)
-	if err != nil {
-		return "", err
-	}
-	if err := runGit(src, "update-ref", "refs/heads/pr", headCommit); err != nil {
-		return "", err
-	}
-	if err := runGit(src, "read-tree", "--reset", "-u", headCommit); err != nil {
-		return "", err
-	}
-	if baseCommit != "" {
-		return "base", nil
-	}
-	return "", nil
-}
-
-func updateTaskJSON(taskPath string, masked []string, baseRef string) error {
-	taskBytes, err := os.ReadFile(taskPath)
-	if err != nil {
-		return err
-	}
-	var task reviewv1.AgentTask
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(taskBytes, &task); err != nil {
-		return err
-	}
-	task.MaskedFiles = masked
-	task.Git = &reviewv1.GitInfo{HeadRef: "pr"}
-	if baseRef != "" {
-		task.Git.BaseRef = &baseRef
-	}
-	updated, err := (protojson.MarshalOptions{Indent: "  "}).Marshal(&task)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(taskPath, append(updated, '\n'), 0o644)
-}
-
-func runGit(dir string, args ...string) error {
-	_, err := runGitOutput(dir, args...)
-	return err
-}
-
-func runGitOutput(dir string, args ...string) (string, error) {
-	baseArgs := append([]string{"-c", "safe.directory=*", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"}, args...)
-	cmd := exec.Command("git", baseArgs...)
-	cmd.Dir = dir
-	cmd.Env = []string{
-		"PATH=/usr/bin:/bin",
-		"HOME=/tmp",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_AUTHOR_NAME=review-loader",
-		"GIT_AUTHOR_EMAIL=loader@review.invalid",
-		"GIT_COMMITTER_NAME=review-loader",
-		"GIT_COMMITTER_EMAIL=loader@review.invalid",
-		"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
-		"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("git %v: %w: %s", args, err, strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out)), nil
 }

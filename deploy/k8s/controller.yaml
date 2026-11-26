@@ -32,28 +32,33 @@ spec:
           image: ghcr.io/zetxqx/review-controller:0.1.0
           args:
             - "--listen-addr=:8080"
+            - "--sandbox-listen-addr=:8081"
             - "--sandbox-runner=k8s"
             - "--sandbox-namespace=review-sandbox"
             - "--runtime-class=gvisor"
-            - "--adapter-sandbox-url=http://inference-adapter.review-system.svc.cluster.local:8080"
-            - "--adapter-internal-url=http://inference-adapter.review-system.svc.cluster.local:9090"
+            - "--controller-sandbox-url=http://review-controller-sandbox.review-system.svc.cluster.local:8081"
+            - "--upstream-kind=llmd-gateway"
+            - "--objective=code-review-batch"
             - "--max-concurrent-runs=1"
             - "--config=/etc/review/harness.json"
           ports:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: sandbox-api
+              containerPort: 8081
+              protocol: TCP
           env:
-            - name: DATABASE_URL
+            - name: ADAPTER_UPSTREAM_URL
               valueFrom:
-                secretKeyRef:
-                  name: review-system-secrets
-                  key: database_url
-            - name: ADAPTER_TOKEN_KEY
+                configMapKeyRef:
+                  name: review-system-config
+                  key: upstream_url
+            - name: ADAPTER_UPSTREAM_MODEL
               valueFrom:
-                secretKeyRef:
-                  name: review-system-secrets
-                  key: adapter_token_key
+                configMapKeyRef:
+                  name: review-system-config
+                  key: upstream_model
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
@@ -74,11 +79,6 @@ spec:
                 configMapKeyRef:
                   name: review-system-config
                   key: github_installation_id
-            - name: SANDBOX_LOADER_IMAGE
-              valueFrom:
-                configMapKeyRef:
-                  name: review-system-config
-                  key: sandbox_image
           readinessProbe:
             httpGet:
               path: /healthz
@@ -134,4 +134,21 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: review-controller-sandbox
+  namespace: review-system
+  labels:
+    app: review-controller
+spec:
+  type: ClusterIP
+  selector:
+    app: review-controller
+  ports:
+    - name: sandbox-api
+      port: 8081
+      targetPort: sandbox-api
       protocol: TCP

@@ -1,15 +1,20 @@
 package orchestrator
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +22,138 @@ import (
 	"github.com/zetxqx/review-agent-infra/internal/store"
 	"github.com/zetxqx/review-agent-infra/internal/telemetry"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
+	"google.golang.org/protobuf/encoding/protojson"
 )
+
+func emptyTestTarGZ(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	body := []byte("package stub\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "repo/stub.go", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+type fakeBroker struct {
+	mu  sync.Mutex
+	seq atomic.Int64
+	// key: synthetic session token; value: TaskClaims registered for that session
+	claims map[string]*reviewv1.TaskClaims
+	// key: synthetic session token; value: decoded AgentTask from the registered bundle
+	tasks map[string]*reviewv1.AgentTask
+	// key: synthetic session token; value: report protojson bytes uploaded by fake sandbox
+	reports map[string][]byte
+	// key: synthetic session token; value: usage snapshot for that session
+	usages       map[string]*reviewv1.SandboxUsage
+	defaultUsage *reviewv1.SandboxUsage
+}
+
+func newFakeBroker() *fakeBroker {
+	return &fakeBroker{
+		// key: synthetic session token; value: TaskClaims registered for that session
+		claims: make(map[string]*reviewv1.TaskClaims),
+		// key: synthetic session token; value: decoded AgentTask from the registered bundle
+		tasks: make(map[string]*reviewv1.AgentTask),
+		// key: synthetic session token; value: report protojson bytes uploaded by fake sandbox
+		reports: make(map[string][]byte),
+		// key: synthetic session token; value: usage snapshot for that session
+		usages: make(map[string]*reviewv1.SandboxUsage),
+	}
+}
+
+func readTaskFromBundle(bundlePath string) (*reviewv1.AgentTask, error) {
+	f, err := os.Open(bundlePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("task.json not found in bundle")
+		}
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimPrefix(hdr.Name, "./") == ".review/in/task.json" {
+			raw, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, err
+			}
+			var task reviewv1.AgentTask
+			if err := protojson.Unmarshal(raw, &task); err != nil {
+				return nil, err
+			}
+			return &task, nil
+		}
+	}
+}
+
+func (b *fakeBroker) RegisterSession(claims *reviewv1.TaskClaims, bundlePath string) (string, func(), error) {
+	tok := fmt.Sprintf("fake-tok-%d", b.seq.Add(1))
+	var task *reviewv1.AgentTask
+	if bundlePath != "" {
+		task, _ = readTaskFromBundle(bundlePath)
+	}
+	b.mu.Lock()
+	b.claims[tok] = claims
+	if task != nil {
+		b.tasks[tok] = task
+	}
+	b.mu.Unlock()
+	return tok, func() {}, nil
+}
+
+func (b *fakeBroker) Task(tok string) *reviewv1.AgentTask {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.tasks[tok]
+}
+
+func (b *fakeBroker) SetReport(tok string, report *reviewv1.ReviewReport) error {
+	raw, err := protojson.Marshal(report)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.reports[tok] = raw
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *fakeBroker) Claims(tok string) *reviewv1.TaskClaims {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.claims[tok]
+}
+
+func (b *fakeBroker) FinishSession(tok string) ([]byte, *reviewv1.SandboxUsage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	u := b.usages[tok]
+	if u == nil {
+		u = b.defaultUsage
+	}
+	return b.reports[tok], u
+}
 
 type fakeVCS struct {
 	mu           sync.Mutex
@@ -25,6 +161,7 @@ type fakeVCS struct {
 	diffPatch    []byte
 	tarballBytes []byte
 	published    []contract.PublishRequest
+	publishedFPs []string
 	feedback     []contract.FeedbackSample
 }
 
@@ -50,10 +187,17 @@ func (f *fakeVCS) FetchBaseRules(_ context.Context, _, _ string, _ []string) (ma
 	return map[string][]byte{"AGENTS.md": []byte("Rule 1")}, nil
 }
 
+func (f *fakeVCS) ListPublishedFingerprints(_ context.Context, _ string, _ int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.publishedFPs...), nil
+}
+
 func (f *fakeVCS) PublishReview(_ context.Context, req contract.PublishRequest) (*contract.PublishResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.published = append(f.published, req)
+	f.publishedFPs = append(f.publishedFPs, req.Fingerprints...)
 	var out []contract.PublishedComment
 	for i, ic := range req.Inlines {
 		out = append(out, contract.PublishedComment{
@@ -71,9 +215,9 @@ func (f *fakeVCS) PollFeedback(_ context.Context, _ string, _ int, _ []int64) ([
 	return f.feedback, nil
 }
 
-type fakeSandboxFunc func(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error)
+type fakeSandboxFunc func(ctx context.Context, spec contract.SandboxSpec) error
 
-func (fn fakeSandboxFunc) Run(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+func (fn fakeSandboxFunc) Run(ctx context.Context, spec contract.SandboxSpec) error {
 	return fn(ctx, spec)
 }
 
@@ -82,15 +226,14 @@ func TestAdmissionRoutingAndRateLimiting(t *testing.T) {
 	tel := telemetry.NewRegistry()
 	now := time.Now()
 	cfg := Config{
-		TokenKey:               []byte("0123456789abcdef0123456789abcdef"),
 		MaxRunsPerRepoWindow:   2,
 		MaxRunsPerAuthorWindow: 2,
 		RateLimitWindow:        time.Minute,
 		Now:                    func() time.Time { return now },
 	}
-	orch := New(cfg, st, &fakeVCS{}, fakeSandboxFunc(func(context.Context, contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
-		return nil, nil
-	}), tel)
+	orch := New(cfg, st, &fakeVCS{}, fakeSandboxFunc(func(context.Context, contract.SandboxSpec) error {
+		return nil
+	}), newFakeBroker(), tel)
 
 	forkAuto := &reviewv1.ReviewEvent{
 		EventId:     "e1",
@@ -181,7 +324,7 @@ func TestAdmissionRoutingAndRateLimiting(t *testing.T) {
 	}
 }
 
-func TestShardingShadowExecutionPartialFailureAndFeedbackPolling(t *testing.T) {
+func TestShardingShadowExecutionPartialFailureAndStatelessPRDedup(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewInMemoryStore()
 	tel := telemetry.NewRegistry()
@@ -215,7 +358,7 @@ func TestShardingShadowExecutionPartialFailureAndFeedbackPolling(t *testing.T) {
 	vcs := &fakeVCS{
 		liveHeadSHA:  "head-sha-1",
 		diffPatch:    diffPatch,
-		tarballBytes: []byte("fake-tar"),
+		tarballBytes: emptyTestTarGZ(t),
 		feedback: []contract.FeedbackSample{
 			{CommentID: 700, ThumbsUp: 3, ThumbsDown: 0},
 		},
@@ -245,27 +388,28 @@ func TestShardingShadowExecutionPartialFailureAndFeedbackPolling(t *testing.T) {
 		},
 	}
 
+	broker := newFakeBroker()
 	var mu sync.Mutex
 	var shadowCalls int
-	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
 		if spec.Role == "shadow" {
 			mu.Lock()
 			shadowCalls++
 			mu.Unlock()
-			return &reviewv1.ReviewReport{
+			return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
 				Summary: "Shadow report must never publish",
 				Provenance: &reviewv1.Provenance{
 					Profile:    spec.HarnessProfile,
 					Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
 					Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
 				},
-			}, nil
+			})
 		}
 		if spec.ShardIndex == 1 {
-			return nil, errors.New("simulated shard-1 timeout")
+			return errors.New("simulated shard-1 timeout")
 		}
 		conf := 0.95
-		return &reviewv1.ReviewReport{
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
 			Summary: "Primary shard 0 summary.",
 			Findings: []*reviewv1.ReviewFinding{
 				{
@@ -286,14 +430,13 @@ func TestShardingShadowExecutionPartialFailureAndFeedbackPolling(t *testing.T) {
 				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
 				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
 			},
-		}, nil
+		})
 	})
 
 	orch := New(Config{
-		TokenKey:       []byte("0123456789abcdef0123456789abcdef"),
 		DebounceWindow: 0,
 		Harness:        hCfg,
-	}, st, vcs, sbx, tel)
+	}, st, vcs, sbx, broker, tel)
 
 	ev := &reviewv1.ReviewEvent{
 		EventId:      "ev-sharded",
@@ -320,8 +463,8 @@ func TestShardingShadowExecutionPartialFailureAndFeedbackPolling(t *testing.T) {
 	if len(vcs.published) != 1 {
 		t.Fatalf("expected exactly 1 primary publish (shadow never publishes), got %d", len(vcs.published))
 	}
-	if !strings.Contains(vcs.published[0].Summary, "shard-1") || len(vcs.published[0].Inlines) != 1 {
-		t.Fatalf("expected partial failure note + 1 inline finding, got %+v", vcs.published[0])
+	if !strings.Contains(vcs.published[0].Summary, "shard-1") || len(vcs.published[0].Inlines) != 1 || len(vcs.published[0].Fingerprints) != 1 {
+		t.Fatalf("expected partial failure note + 1 inline finding + 1 fingerprint, got %+v", vcs.published[0])
 	}
 
 	poller := NewFeedbackPoller(st, vcs, 24*time.Hour)
@@ -337,6 +480,59 @@ func TestShardingShadowExecutionPartialFailureAndFeedbackPolling(t *testing.T) {
 	if len(scorecard) != 1 || scorecard[0].HarnessProfile != "openhands" || scorecard[0].ThumbsUp != 3 {
 		t.Fatalf("unexpected primary scorecard: %+v", scorecard)
 	}
+
+	restartedStore := store.NewInMemoryStore()
+	restartedOrch := New(Config{
+		DebounceWindow: 0,
+		Harness:        hCfg,
+	}, restartedStore, vcs, fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+		conf := 0.95
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
+			Summary: "Restarted controller rerun.",
+			Findings: []*reviewv1.ReviewFinding{
+				{
+					File:           "pkg/a.go",
+					Line:           2,
+					Side:           reviewv1.DiffSide_DIFF_SIDE_RIGHT,
+					TargetLineText: `func A() { panic("bugA") }`,
+					Anchor:         reviewv1.AnchorKind_ANCHOR_KIND_QUOTED,
+					Severity:       reviewv1.Severity_SEVERITY_HIGH,
+					Confidence:     &conf,
+					Category:       reviewv1.FindingCategory_FINDING_CATEGORY_CORRECTNESS,
+					Title:          "Unrecovered panic in A",
+					Explanation:    "Panics crash server.",
+				},
+			},
+			Provenance: &reviewv1.Provenance{
+				Profile:    spec.HarnessProfile,
+				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
+				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
+			},
+		})
+	}), broker, nil)
+
+	vcs.mu.Lock()
+	vcs.liveHeadSHA = "head-sha-2"
+	vcs.mu.Unlock()
+	if _, err := restartedOrch.HandleEvent(ctx, &reviewv1.ReviewEvent{
+		EventId:      "ev-after-restart",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     55,
+		BaseSha:      "base-sha-1",
+		HeadSha:      "head-sha-2",
+		Author:       "alice",
+		IsMaintainer: true,
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := restartedOrch.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("restarted RunOnce = %v err=%v", ran, err)
+	}
+	if len(vcs.published) != 1 {
+		t.Fatalf("expected duplicate finding suppressed across stateless restart via PR marker fingerprints, got %d publishes", len(vcs.published))
+	}
 }
 
 func TestGracefulSIGTERMReleasesLeaseToQueued(t *testing.T) {
@@ -344,21 +540,20 @@ func TestGracefulSIGTERMReleasesLeaseToQueued(t *testing.T) {
 	vcs := &fakeVCS{
 		liveHeadSHA:  "h1",
 		diffPatch:    []byte("diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -1 +1,2 @@\n package x\n+func X() {}\n"),
-		tarballBytes: []byte("t"),
+		tarballBytes: emptyTestTarGZ(t),
 	}
 
 	parentCtx, stopParent := context.WithCancel(context.Background())
-	sbx := fakeSandboxFunc(func(ctx context.Context, _ contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+	sbx := fakeSandboxFunc(func(ctx context.Context, _ contract.SandboxSpec) error {
 		stopParent()
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return ctx.Err()
 	})
 
 	orch := New(Config{
 		WorkerID:       "w-sigterm",
-		TokenKey:       []byte("0123456789abcdef0123456789abcdef"),
 		DebounceWindow: 0,
-	}, st, vcs, sbx, nil)
+	}, st, vcs, sbx, newFakeBroker(), nil)
 
 	_, err := orch.HandleEvent(context.Background(), &reviewv1.ReviewEvent{
 		EventId:      "ev-sig",
@@ -387,32 +582,32 @@ func TestGracefulSIGTERMReleasesLeaseToQueued(t *testing.T) {
 	}
 }
 
-func TestAdapterHostnameResolvedToIPLiteralForDNSDisabledSandbox(t *testing.T) {
+func TestControllerHostnameResolvedToIPLiteralForDNSDisabledSandbox(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewInMemoryStore()
 	vcs := &fakeVCS{
 		liveHeadSHA:  "h-ip",
 		diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\n"),
-		tarballBytes: []byte("t"),
+		tarballBytes: emptyTestTarGZ(t),
 	}
 
-	var seenAdapterURL string
-	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
-		seenAdapterURL = spec.AdapterURL
-		return &reviewv1.ReviewReport{
+	broker := newFakeBroker()
+	var seenControllerURL string
+	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+		seenControllerURL = spec.ControllerURL
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
 			Provenance: &reviewv1.Provenance{
 				Profile:    spec.HarnessProfile,
 				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
 				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
 			},
-		}, nil
+		})
 	})
 
 	orch := New(Config{
-		TokenKey:          []byte("0123456789abcdef0123456789abcdef"),
-		DebounceWindow:    0,
-		AdapterSandboxURL: "http://localhost:8080/v1",
-	}, st, vcs, sbx, nil)
+		DebounceWindow:       0,
+		ControllerSandboxURL: "http://localhost:8081",
+	}, st, vcs, sbx, broker, nil)
 
 	if _, err := orch.HandleEvent(ctx, &reviewv1.ReviewEvent{
 		EventId:      "ev-dns-resolve",
@@ -432,15 +627,15 @@ func TestAdapterHostnameResolvedToIPLiteralForDNSDisabledSandbox(t *testing.T) {
 		t.Fatalf("RunOnce = %v err=%v", ran, err)
 	}
 
-	parsed, err := url.Parse(seenAdapterURL)
+	parsed, err := url.Parse(seenControllerURL)
 	if err != nil {
-		t.Fatalf("parse seenAdapterURL %q: %v", seenAdapterURL, err)
+		t.Fatalf("parse seenControllerURL %q: %v", seenControllerURL, err)
 	}
 	if net.ParseIP(parsed.Hostname()) == nil {
-		t.Fatalf("expected IP literal host in SandboxSpec.AdapterURL, got %q", seenAdapterURL)
+		t.Fatalf("expected IP literal host in SandboxSpec.ControllerURL, got %q", seenControllerURL)
 	}
-	if parsed.Port() != "8080" || parsed.Path != "/v1" {
-		t.Fatalf("expected port 8080 and path /v1 preserved, got %q", seenAdapterURL)
+	if parsed.Port() != "8081" {
+		t.Fatalf("expected port 8081 preserved, got %q", seenControllerURL)
 	}
 }
 
@@ -450,38 +645,38 @@ func TestCancelInFlightIgnoresDuplicateDeliveryAndCancelsSameSHARerun(t *testing
 	vcs := &fakeVCS{
 		liveHeadSHA:  "sha-B",
 		diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func B() {}\n"),
-		tarballBytes: []byte("t"),
+		tarballBytes: emptyTestTarGZ(t),
 	}
 
 	startedB := make(chan struct{})
 	canceledB := make(chan struct{})
 	releaseB := make(chan struct{})
 	var startOnce, cancelOnce sync.Once
+	broker := newFakeBroker()
 
-	sbx := fakeSandboxFunc(func(sbxCtx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+	sbx := fakeSandboxFunc(func(sbxCtx context.Context, spec contract.SandboxSpec) error {
 		if spec.HarnessProfile == "openhands" {
 			startOnce.Do(func() { close(startedB) })
 			select {
 			case <-sbxCtx.Done():
 				cancelOnce.Do(func() { close(canceledB) })
-				return nil, sbxCtx.Err()
+				return sbxCtx.Err()
 			case <-releaseB:
 			}
 		}
-		return &reviewv1.ReviewReport{
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
 			Provenance: &reviewv1.Provenance{
 				Profile:    spec.HarnessProfile,
 				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
 				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
 			},
-		}, nil
+		})
 	})
 
 	orch := New(Config{
-		TokenKey:       []byte("0123456789abcdef0123456789abcdef"),
 		DebounceWindow: 0,
 		PollInterval:   15 * time.Millisecond,
-	}, st, vcs, sbx, nil)
+	}, st, vcs, sbx, broker, nil)
 
 	evA := &reviewv1.ReviewEvent{
 		EventId:      "deliv-commit-A",
@@ -565,5 +760,110 @@ func TestCancelInFlightIgnoresDuplicateDeliveryAndCancelsSameSHARerun(t *testing
 	case <-canceledB:
 	case <-time.After(3 * time.Second):
 		t.Fatal("expected same-SHA manual /review rerun to immediately cancel superseded auto run")
+	}
+}
+
+func TestPRTitleAndBodyPropagateToAgentTask(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewInMemoryStore()
+	vcs := &fakeVCS{
+		liveHeadSHA:  "h-meta",
+		diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\n"),
+		tarballBytes: emptyTestTarGZ(t),
+	}
+	broker := newFakeBroker()
+	var gotTask *reviewv1.AgentTask
+	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+		gotTask = broker.Task(spec.TaskToken)
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
+			Provenance: &reviewv1.Provenance{
+				Profile:    spec.HarnessProfile,
+				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
+				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
+			},
+		})
+	})
+
+	orch := New(Config{DebounceWindow: 0}, st, vcs, sbx, broker, nil)
+	if _, err := orch.HandleEvent(ctx, &reviewv1.ReviewEvent{
+		EventId:      "ev-pr-meta",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     105,
+		BaseSha:      "b1",
+		HeadSha:      "h-meta",
+		PrTitle:      "Fix lock ordering in scheduler",
+		PrBody:       "Prevents AB-BA deadlock during cache eviction.",
+		Author:       "alice",
+		IsMaintainer: true,
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := orch.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("RunOnce = %v err=%v", ran, err)
+	}
+	if gotTask == nil {
+		t.Fatal("expected AgentTask decoded from bundle")
+	}
+	if gotTask.PrTitle != "Fix lock ordering in scheduler" || gotTask.PrBody != "Prevents AB-BA deadlock during cache eviction." {
+		t.Fatalf("unexpected AgentTask PR metadata: title=%q body=%q", gotTask.PrTitle, gotTask.PrBody)
+	}
+}
+
+func TestPublishedInlineCommentsUseCleanRepoRelativePaths(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewInMemoryStore()
+	vcs := &fakeVCS{
+		liveHeadSHA:  "h-paths",
+		diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\ndiff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1,2 @@\n package b\n+func B() {}\n"),
+		tarballBytes: emptyTestTarGZ(t),
+	}
+	broker := newFakeBroker()
+	conf := 0.95
+	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
+			Provenance: &reviewv1.Provenance{
+				Profile:    spec.HarnessProfile,
+				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
+				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
+			},
+			Findings: []*reviewv1.ReviewFinding{
+				{File: "./a.go", Line: 2, TargetLineText: "func A() {}", Title: "dot slash path", Explanation: "x", Severity: reviewv1.Severity_SEVERITY_HIGH, Category: reviewv1.FindingCategory_FINDING_CATEGORY_CORRECTNESS, Side: reviewv1.DiffSide_DIFF_SIDE_RIGHT, Anchor: reviewv1.AnchorKind_ANCHOR_KIND_QUOTED, Confidence: &conf},
+				{File: "/b.go", Line: 2, TargetLineText: "func B() {}", Title: "absolute path", Explanation: "y", Severity: reviewv1.Severity_SEVERITY_HIGH, Category: reviewv1.FindingCategory_FINDING_CATEGORY_SECURITY, Side: reviewv1.DiffSide_DIFF_SIDE_RIGHT, Anchor: reviewv1.AnchorKind_ANCHOR_KIND_QUOTED, Confidence: &conf},
+			},
+		})
+	})
+
+	orch := New(Config{DebounceWindow: 0}, st, vcs, sbx, broker, nil)
+	if _, err := orch.HandleEvent(ctx, &reviewv1.ReviewEvent{
+		EventId:      "ev-paths",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     106,
+		BaseSha:      "b1",
+		HeadSha:      "h-paths",
+		Author:       "alice",
+		IsMaintainer: true,
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := orch.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("RunOnce = %v err=%v", ran, err)
+	}
+	vcs.mu.Lock()
+	defer vcs.mu.Unlock()
+	if len(vcs.published) != 1 {
+		t.Fatalf("expected one published review, got %d", len(vcs.published))
+	}
+	req := vcs.published[0]
+	if len(req.Inlines) != 2 {
+		t.Fatalf("expected two inline comments, got %+v", req.Inlines)
+	}
+	for _, ic := range req.Inlines {
+		if ic.File != "a.go" && ic.File != "b.go" {
+			t.Fatalf("inline comment path %q must be a clean repo-relative path", ic.File)
+		}
 	}
 }

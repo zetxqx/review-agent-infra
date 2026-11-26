@@ -12,7 +12,13 @@ from review_harness_kit.adapters.openhands import OpenHandsAdapter
 from review_harness_kit.adapters.pr_agent import PRAgentAdapter
 from review_harness_kit.contracts import ProcessResult, RawOutput, RunContext
 from review_harness_kit.gen.review.v1 import review_pb2
-from review_harness_kit.normalizer import EMBEDDED_SCHEMA_PATH, normalize
+from review_harness_kit.normalizer import (
+    EMBEDDED_SCHEMA_PATH,
+    ReviewablePaths,
+    anchor_finding,
+    normalize,
+    reviewable_paths_for_task,
+)
 
 
 class RecordedRequest:
@@ -329,3 +335,177 @@ def test_timed_out_harness_with_report_file_keeps_deterministic_report(tmp_path:
     assert report.provenance.exit_code == -9
     assert len(report.findings) == 1
     assert report.findings[0].file == "internal/cache.go"
+
+
+PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+def point_proxies_at_dead_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in PROXY_ENV_NAMES:
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+
+def test_llm_normalizer_ignores_ambient_proxy_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    point_proxies_at_dead_port(monkeypatch)
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    task = review_pb2.AgentTask(src_dir=str(src_dir), out_dir=str(tmp_path / "out"), model_alias="qwen-coder")
+    task.harness.profile = "openhands"
+
+    with MockNormalizeServer({"summary": "Direct route.", "findings": []}) as srv:
+        ctx = RunContext(
+            base_url=srv.base_url,
+            api_key="tok-direct",
+            home=tmp_path / "home",
+            prompt="prompt",
+            rules_text="rules",
+            schema_path=EMBEDDED_SCHEMA_PATH,
+        )
+        raw = RawOutput(kind="markdown", text="No defects found.")
+        res = ProcessResult(exit_code=0, timed_out=False, log_path=tmp_path / "harness.log")
+        report = normalize(OpenHandsAdapter(), raw, task, ctx, res)
+        assert len(srv.requests) == 1
+        assert srv.requests[0].headers.get("authorization") == "Bearer tok-direct"
+
+    assert report.provenance.status == review_pb2.REPORT_STATUS_OK
+    assert report.provenance.normalizer == review_pb2.NORMALIZER_PATH_LLM
+    assert report.summary == "Direct route."
+
+
+def make_finding(file: str, line: int, side: int = review_pb2.DIFF_SIDE_RIGHT) -> review_pb2.ReviewFinding:
+    return review_pb2.ReviewFinding(
+        file=file,
+        line=line,
+        side=side,
+        severity=review_pb2.SEVERITY_HIGH,
+        category=review_pb2.FINDING_CATEGORY_CORRECTNESS,
+        title=f"Issue in {file}",
+        explanation="Explained.",
+    )
+
+
+def test_anchor_finding_keeps_deleted_file_in_diff_as_file_level(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    reviewable = ReviewablePaths(diff_paths=frozenset({"pkg/removed.go"}))
+
+    for given in ("pkg/removed.go", "a/pkg/removed.go", "b/pkg/removed.go"):
+        anchored = anchor_finding(make_finding(given, 7), src_dir, reviewable)
+        assert anchored is not None, given
+        assert anchored.file == "pkg/removed.go"
+        assert anchored.line == 0
+        assert anchored.anchor == review_pb2.ANCHOR_KIND_DERIVED
+        assert anchored.target_line_text == ""
+
+
+def test_anchor_finding_keeps_masked_files_and_globs_as_file_level(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    reviewable = ReviewablePaths(masked_patterns=("AGENTS.md", ".codex/*"))
+
+    agents = anchor_finding(make_finding("AGENTS.md", 3), src_dir, reviewable)
+    assert agents is not None
+    assert agents.file == "AGENTS.md"
+    assert agents.line == 0
+    assert agents.anchor == review_pb2.ANCHOR_KIND_DERIVED
+
+    codex = anchor_finding(make_finding("b/.codex/config.toml", 1), src_dir, reviewable)
+    assert codex is not None
+    assert codex.file == ".codex/config.toml"
+    assert codex.line == 0
+
+
+def test_anchor_finding_rejects_hallucinated_paths_outside_diff(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src"
+    (src_dir / "pkg").mkdir(parents=True)
+    reviewable = ReviewablePaths(diff_paths=frozenset({"pkg/removed.go"}), masked_patterns=("AGENTS.md",))
+
+    assert anchor_finding(make_finding("ghost.go", 2), src_dir, reviewable) is None
+    assert anchor_finding(make_finding("b/ghost.go", 2), src_dir, reviewable) is None
+    assert anchor_finding(make_finding("pkg", 1), src_dir, reviewable) is None
+    assert anchor_finding(make_finding("pkg/removed.go", 2), src_dir) is None
+    assert anchor_finding(make_finding("../pkg/removed.go", 2), src_dir, reviewable) is None
+
+
+def test_reviewable_paths_for_task_reads_old_new_and_renamed_paths(tmp_path: Path) -> None:
+    diff_file = tmp_path / "diff.patch"
+    diff_file.write_text(
+        "diff --git a/gone.go b/gone.go\n"
+        "deleted file mode 100644\n"
+        "--- a/gone.go\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-package gone\n"
+        "diff --git a/old/name.go b/new/name.go\n"
+        "similarity index 100%\n"
+        "rename from old/name.go\n"
+        "rename to new/name.go\n"
+        "diff --git a/added.go b/added.go\n"
+        "--- /dev/null\n"
+        "+++ b/added.go\t2024-01-01 00:00:00\n"
+        "@@ -0,0 +1 @@\n"
+        "+package added\n",
+        encoding="utf-8",
+    )
+    task = review_pb2.AgentTask(diff_file=str(diff_file), masked_files=["AGENTS.md", ".codex/*"])
+    reviewable = reviewable_paths_for_task(task)
+
+    assert reviewable.diff_paths == frozenset({"gone.go", "old/name.go", "new/name.go", "added.go"})
+    assert "AGENTS.md" in reviewable
+    assert ".codex/sub/x.toml" in reviewable
+    assert "/dev/null" not in reviewable
+    assert "other.go" not in reviewable
+
+
+def test_normalize_keeps_findings_on_deleted_and_masked_files(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src"
+    (src_dir / "pkg").mkdir(parents=True)
+    (src_dir / "pkg" / "live.go").write_text("package pkg\n\nvar x = 1\n", encoding="utf-8")
+    diff_file = tmp_path / "diff.patch"
+    diff_file.write_text(
+        "diff --git a/pkg/removed.go b/pkg/removed.go\n"
+        "--- a/pkg/removed.go\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-package pkg\n"
+        "-var lock sync.Mutex\n",
+        encoding="utf-8",
+    )
+    written_report = {
+        "summary": "Mixed findings.",
+        "findings": [
+            {"file": "a/pkg/removed.go", "line": 2, "side": "DIFF_SIDE_RIGHT", "title": "Deleted lock still used"},
+            {"file": "AGENTS.md", "line": 4, "side": "DIFF_SIDE_RIGHT", "title": "Masked instructions changed"},
+            {"file": "pkg/live.go", "line": 3, "side": "DIFF_SIDE_RIGHT", "title": "Live file issue"},
+            {"file": "pkg/ghost.go", "line": 1, "side": "DIFF_SIDE_RIGHT", "title": "Hallucinated file"},
+        ],
+    }
+    task = review_pb2.AgentTask(
+        src_dir=str(src_dir),
+        diff_file=str(diff_file),
+        out_dir=str(tmp_path / "out"),
+        model_alias="qwen-coder",
+        masked_files=["AGENTS.md"],
+    )
+    task.harness.profile = "openhands"
+    ctx = RunContext(
+        base_url="http://127.0.0.1:9/v1",
+        api_key="unused",
+        home=tmp_path / "home",
+        prompt="prompt",
+        rules_text="rules",
+        schema_path=EMBEDDED_SCHEMA_PATH,
+    )
+    raw = RawOutput(kind="json", text=json.dumps(written_report))
+    res = ProcessResult(exit_code=0, timed_out=False, log_path=tmp_path / "harness.log")
+    report = normalize(OpenHandsAdapter(), raw, task, ctx, res)
+
+    assert report.provenance.normalizer == review_pb2.NORMALIZER_PATH_DETERMINISTIC
+    by_file = {f.file: f for f in report.findings}
+    assert set(by_file) == {"pkg/removed.go", "AGENTS.md", "pkg/live.go"}
+    assert by_file["pkg/removed.go"].line == 0
+    assert by_file["AGENTS.md"].line == 0
+    assert by_file["pkg/live.go"].line == 3
+    assert by_file["pkg/live.go"].target_line_text == "var x = 1"

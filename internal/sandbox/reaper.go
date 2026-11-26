@@ -49,7 +49,32 @@ func (r *OrphanPodReaper) shouldReap(pod corev1.Pod, ts time.Time) bool {
 	return ts.Sub(pod.CreationTimestamp.Time) > maxAge
 }
 
+// survivingPods key: surviving sandbox Pod name; value: true when Pod remains active.
+func (r *OrphanPodReaper) shouldReapSecret(secret corev1.Secret, survivingPods map[string]bool, ts time.Time) bool {
+	if survivingPods[secret.Name] {
+		return false
+	}
+	for _, ref := range secret.OwnerReferences {
+		if ref.Kind == "Pod" && survivingPods[ref.Name] {
+			return false
+		}
+	}
+	if len(secret.OwnerReferences) > 0 {
+		return true
+	}
+	if secret.CreationTimestamp.IsZero() {
+		return false
+	}
+	return ts.Sub(secret.CreationTimestamp.Time) > r.graceAfterTerm
+}
+
 func (r *OrphanPodReaper) ReapOnce(ctx context.Context) (int, error) {
+	secrets, err := r.clientset.CoreV1().Secrets(r.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=review-sandbox",
+	})
+	if err != nil {
+		return 0, err
+	}
 	pods, err := r.clientset.CoreV1().Pods(r.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=review-sandbox",
 	})
@@ -58,20 +83,39 @@ func (r *OrphanPodReaper) ReapOnce(ctx context.Context) (int, error) {
 	}
 	ts := r.now()
 	deleted := 0
+	// key: surviving sandbox Pod name; value: true when Pod remains active
+	survivingPods := make(map[string]bool, len(pods.Items))
 	for _, pod := range pods.Items {
 		if !r.shouldReap(pod, ts) {
+			survivingPods[pod.Name] = true
 			continue
 		}
-		err := r.clientset.CoreV1().Pods(r.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+		delErr := r.clientset.CoreV1().Pods(r.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: ptr.To(int64(0)),
 		})
-		if err == nil || apierrors.IsNotFound(err) {
-			if err == nil {
+		if delErr == nil || apierrors.IsNotFound(delErr) {
+			if delErr == nil {
 				deleted++
 			}
 			continue
 		}
-		return deleted, err
+		return deleted, delErr
+	}
+
+	for _, secret := range secrets.Items {
+		if !r.shouldReapSecret(secret, survivingPods, ts) {
+			continue
+		}
+		delErr := r.clientset.CoreV1().Secrets(r.namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: ptr.To(int64(0)),
+		})
+		if delErr == nil || apierrors.IsNotFound(delErr) {
+			if delErr == nil {
+				deleted++
+			}
+			continue
+		}
+		return deleted, delErr
 	}
 	return deleted, nil
 }

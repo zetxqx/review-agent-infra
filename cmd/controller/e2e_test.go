@@ -25,7 +25,6 @@ import (
 	"github.com/zetxqx/review-agent-infra/internal/telemetry"
 	ghvcs "github.com/zetxqx/review-agent-infra/internal/vcs/github"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
-	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -36,6 +35,12 @@ import (
 
 func TestK8sManifestsSecurityInvariants(t *testing.T) {
 	k8sDir := filepath.Join("..", "..", "deploy", "k8s")
+
+	for _, removed := range []string{"adapter.yaml", "postgres.yaml"} {
+		if _, err := os.Stat(filepath.Join(k8sDir, removed)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be deleted in 3-artifact stateless architecture", removed)
+		}
+	}
 
 	nsRaw, err := os.ReadFile(filepath.Join(k8sDir, "namespaces.yaml"))
 	if err != nil {
@@ -84,12 +89,21 @@ func TestK8sManifestsSecurityInvariants(t *testing.T) {
 	if role.Namespace != "review-sandbox" || len(role.Rules) != 2 {
 		t.Fatalf("unexpected Role in rbac.yaml: %+v", role)
 	}
+	var sawPods, sawSecrets bool
 	for _, rule := range role.Rules {
 		for _, res := range rule.Resources {
-			if res != "pods" && res != "pods/exec" {
-				t.Fatalf("unexpected RBAC resource %q granted to controller", res)
+			switch res {
+			case "pods":
+				sawPods = true
+			case "secrets":
+				sawSecrets = true
+			default:
+				t.Fatalf("unexpected RBAC resource %q granted to controller (pods/exec must be removed)", res)
 			}
 		}
+	}
+	if !sawPods || !sawSecrets {
+		t.Fatalf("expected RBAC rules for pods and secrets, got %+v", role.Rules)
 	}
 	if rb.Namespace != "review-sandbox" || len(rb.Subjects) != 1 || rb.Subjects[0].Namespace != "review-system" {
 		t.Fatalf("unexpected RoleBinding: %+v", rb)
@@ -110,54 +124,85 @@ func TestK8sManifestsSecurityInvariants(t *testing.T) {
 	if len(egress.To) != 1 || egress.To[0].NamespaceSelector == nil || egress.To[0].PodSelector == nil {
 		t.Fatalf("NetworkPolicy egress must combine namespaceSelector and podSelector in one peer: %+v", egress.To)
 	}
-	if len(egress.Ports) != 1 || egress.Ports[0].Port.IntVal != 8080 {
-		t.Fatalf("NetworkPolicy egress must restrict strictly to port 8080: %+v", egress.Ports)
+	if egress.To[0].PodSelector.MatchLabels["app"] != "review-controller" {
+		t.Fatalf("NetworkPolicy egress must target app=review-controller, got %+v", egress.To[0].PodSelector)
+	}
+	if len(egress.Ports) != 1 || egress.Ports[0].Port.IntVal != 8081 {
+		t.Fatalf("NetworkPolicy egress must restrict strictly to port 8081: %+v", egress.Ports)
 	}
 
-	for _, mf := range []string{"adapter.yaml", "controller.yaml"} {
-		raw, readErr := os.ReadFile(filepath.Join(k8sDir, mf))
-		if readErr != nil {
-			t.Fatalf("read %s: %v", mf, readErr)
+	sysNPRaw, err := os.ReadFile(filepath.Join(k8sDir, "networkpolicy-review-system.yaml"))
+	if err != nil {
+		t.Fatalf("read networkpolicy-review-system.yaml: %v", err)
+	}
+	var sysNP networkingv1.NetworkPolicy
+	if err := sigsyaml.Unmarshal(sysNPRaw, &sysNP); err != nil {
+		t.Fatalf("decode review-system NetworkPolicy: %v", err)
+	}
+	if sysNP.Namespace != "review-system" || sysNP.Spec.PodSelector.MatchLabels["app"] != "review-controller" || len(sysNP.Spec.Ingress) != 2 {
+		t.Fatalf("unexpected review-system NetworkPolicy: %+v", sysNP)
+	}
+	if sysNP.Spec.Ingress[0].Ports[0].Port.IntVal != 8080 || sysNP.Spec.Ingress[1].Ports[0].Port.IntVal != 8081 {
+		t.Fatalf("expected controller ingress rules for 8080 and 8081, got %+v", sysNP.Spec.Ingress)
+	}
+
+	ctrlRaw, err := os.ReadFile(filepath.Join(k8sDir, "controller.yaml"))
+	if err != nil {
+		t.Fatalf("read controller.yaml: %v", err)
+	}
+	ctrlText := string(ctrlRaw)
+	for _, forbidden := range []string{"DATABASE_URL", "ADAPTER_TOKEN_KEY", "SANDBOX_LOADER_IMAGE", "inference-adapter"} {
+		if strings.Contains(ctrlText, forbidden) {
+			t.Fatalf("controller.yaml must not reference %q", forbidden)
 		}
-		docs := strings.Split(string(raw), "\n---")
-		var dep appsv1.Deployment
-		if err := sigsyaml.Unmarshal([]byte(docs[0]), &dep); err != nil {
-			t.Fatalf("decode Deployment in %s: %v", mf, err)
-		}
-		var svc corev1.Service
-		if err := sigsyaml.Unmarshal([]byte(docs[1]), &svc); err != nil {
-			t.Fatalf("decode Service in %s: %v", mf, err)
-		}
-		if dep.Namespace != "review-system" || svc.Namespace != "review-system" {
-			t.Fatalf("%s resources must live in review-system", mf)
-		}
-		psc := dep.Spec.Template.Spec.SecurityContext
-		if psc == nil || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
-			t.Fatalf("%s missing RunAsNonRoot", mf)
-		}
-		csc := dep.Spec.Template.Spec.Containers[0].SecurityContext
-		if csc == nil || csc.ReadOnlyRootFilesystem == nil || !*csc.ReadOnlyRootFilesystem ||
-			csc.AllowPrivilegeEscalation == nil || *csc.AllowPrivilegeEscalation {
-			t.Fatalf("%s container securityContext not hardened: %+v", mf, csc)
-		}
+	}
+	docs := strings.Split(ctrlText, "\n---")
+	if len(docs) != 3 {
+		t.Fatalf("expected Deployment + 2 Services in controller.yaml, got %d docs", len(docs))
+	}
+	var dep appsv1.Deployment
+	if err := sigsyaml.Unmarshal([]byte(docs[0]), &dep); err != nil {
+		t.Fatalf("decode Deployment in controller.yaml: %v", err)
+	}
+	var pubSvc, sbxSvc corev1.Service
+	if err := sigsyaml.Unmarshal([]byte(docs[1]), &pubSvc); err != nil {
+		t.Fatalf("decode public Service in controller.yaml: %v", err)
+	}
+	if err := sigsyaml.Unmarshal([]byte(docs[2]), &sbxSvc); err != nil {
+		t.Fatalf("decode sandbox Service in controller.yaml: %v", err)
+	}
+	if dep.Namespace != "review-system" || pubSvc.Namespace != "review-system" || sbxSvc.Namespace != "review-system" {
+		t.Fatalf("controller.yaml resources must live in review-system")
+	}
+	if sbxSvc.Name != "review-controller-sandbox" || len(sbxSvc.Spec.Ports) != 1 || sbxSvc.Spec.Ports[0].Port != 8081 {
+		t.Fatalf("unexpected sandbox Service: %+v", sbxSvc)
+	}
+	psc := dep.Spec.Template.Spec.SecurityContext
+	if psc == nil || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
+		t.Fatalf("controller.yaml missing RunAsNonRoot")
+	}
+	csc := dep.Spec.Template.Spec.Containers[0].SecurityContext
+	if csc == nil || csc.ReadOnlyRootFilesystem == nil || !*csc.ReadOnlyRootFilesystem ||
+		csc.AllowPrivilegeEscalation == nil || *csc.AllowPrivilegeEscalation {
+		t.Fatalf("controller.yaml container securityContext not hardened: %+v", csc)
 	}
 }
 
 type gateableRunner struct {
-	inner       contract.SandboxRunner
-	blockRunSub string
-	startedCh   chan struct{}
-	canceledCh  chan struct{}
-	startedOnce sync.Once
-	cancelOnce  sync.Once
+	inner        contract.SandboxRunner
+	blockEnabled atomic.Bool
+	startedCh    chan struct{}
+	canceledCh   chan struct{}
+	startedOnce  sync.Once
+	cancelOnce   sync.Once
 }
 
-func (g *gateableRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
-	if g.blockRunSub != "" && strings.Contains(string(spec.Inputs["diff.patch"]), g.blockRunSub) {
+func (g *gateableRunner) Run(ctx context.Context, spec contract.SandboxSpec) error {
+	if g.blockEnabled.Load() {
 		g.startedOnce.Do(func() { close(g.startedCh) })
 		<-ctx.Done()
 		g.cancelOnce.Do(func() { close(g.canceledCh) })
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
 	return g.inner.Run(ctx, spec)
 }
@@ -165,7 +210,6 @@ func (g *gateableRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*r
 func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testing.T) {
 	ctx := context.Background()
 	webhookSecret := []byte("m2-webhook-hmac-secret")
-	jwtSecret := []byte("0123456789abcdef0123456789abcdef")
 
 	var upMu sync.Mutex
 	// key: x-session-id header value; value: stream turn index
@@ -230,17 +274,14 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	defer llmdUpstream.Close()
 
 	tel := telemetry.NewRegistry()
-	adapterProxy := inference.NewProxyHandler(inference.Config{
-		TokenKey:      jwtSecret,
+	sandboxProxy := inference.NewProxyHandler(inference.Config{
 		Upstream:      &inference.LlmdGatewayUpstream{BaseURL: llmdUpstream.URL, Objective: "code-review-batch"},
 		UpstreamModel: "qwen-coder",
 		ModelAlias:    "review-coder",
 		Telemetry:     tel,
 	})
-	adapterSandboxSrv := httptest.NewServer(adapterProxy.SandboxMux())
-	defer adapterSandboxSrv.Close()
-	adapterInternalSrv := httptest.NewServer(adapterProxy.InternalMux())
-	defer adapterInternalSrv.Close()
+	sandboxSrv := httptest.NewServer(sandboxProxy.SandboxMux())
+	defer sandboxSrv.Close()
 
 	type ghPostedComment struct {
 		ID       int64  `json:"id"`
@@ -251,6 +292,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	}
 	type ghPostedReview struct {
 		ID       int64  `json:"id"`
+		PR       int    `json:"-"`
 		CommitID string `json:"commit_id"`
 		Body     string `json:"body"`
 		Event    string `json:"event"`
@@ -412,8 +454,22 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/check-runs"):
 			_, _ = io.WriteString(w, `{"check_runs":[]}`)
 
-		case r.Method == http.MethodGet && (r.URL.Path == "/repos/llm-d/router/pulls/10/reviews" || r.URL.Path == "/repos/llm-d/router/pulls/20/reviews"):
-			_ = json.NewEncoder(w).Encode([]ghPostedReview{})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/10/reviews":
+			var pr10Revs []ghPostedReview
+			for _, rv := range postedReviews {
+				if rv.PR == 10 {
+					pr10Revs = append(pr10Revs, rv)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(pr10Revs)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/20/reviews":
+			var pr20Revs []ghPostedReview
+			for _, rv := range postedReviews {
+				if rv.PR == 20 {
+					pr20Revs = append(pr20Revs, rv)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(pr20Revs)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/llm-d/router/pulls/10/comments":
 			var pr10 []ghPostedComment
 			for _, c := range postedComments {
@@ -434,6 +490,10 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 			_ = json.NewEncoder(w).Encode(filtered)
 
 		case r.Method == http.MethodPost && (r.URL.Path == "/repos/llm-d/router/pulls/10/reviews" || r.URL.Path == "/repos/llm-d/router/pulls/20/reviews"):
+			prNum := 10
+			if strings.Contains(r.URL.Path, "/pulls/20/") {
+				prNum = 20
+			}
 			var body struct {
 				CommitID string `json:"commit_id"`
 				Body     string `json:"body"`
@@ -449,7 +509,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 				return
 			}
 			nextRevID++
-			rv := ghPostedReview{ID: nextRevID, CommitID: body.CommitID, Body: body.Body, Event: body.Event}
+			rv := ghPostedReview{ID: nextRevID, PR: prNum, CommitID: body.CommitID, Body: body.Body, Event: body.Event}
 			postedReviews = append(postedReviews, rv)
 			for _, c := range body.Comments {
 				nextCmtID++
@@ -473,10 +533,9 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 
 	var sandboxInvocations atomic.Int32
 	gatedSbx := &gateableRunner{
-		inner: fakeCountingRunner(localSbx, &sandboxInvocations),
-		blockRunSub: "SlowMarkerBlockHere",
-		startedCh:   make(chan struct{}),
-		canceledCh:  make(chan struct{}),
+		inner:      fakeCountingRunner(localSbx, &sandboxInvocations),
+		startedCh:  make(chan struct{}),
+		canceledCh: make(chan struct{}),
 	}
 
 	st := store.NewInMemoryStore()
@@ -496,18 +555,16 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	}
 
 	orch := orchestrator.New(orchestrator.Config{
-		WorkerID:            "e2e-worker",
-		LeaseTTL:            30 * time.Second,
-		PollInterval:        25 * time.Millisecond,
-		DebounceWindow:      0,
-		MaxConcurrentRuns:   2,
-		MaxConcurrentShards: 4,
-		AdapterSandboxURL:   adapterSandboxSrv.URL,
-		AdapterInternalURL:  adapterInternalSrv.URL,
-		TokenKey:            jwtSecret,
-		ModelAlias:          "review-coder",
-		Harness:             hCfg,
-	}, st, vcs, gatedSbx, tel)
+		WorkerID:             "e2e-worker",
+		LeaseTTL:             30 * time.Second,
+		PollInterval:         25 * time.Millisecond,
+		DebounceWindow:       0,
+		MaxConcurrentRuns:    2,
+		MaxConcurrentShards:  4,
+		ControllerSandboxURL: sandboxSrv.URL,
+		ModelAlias:           "review-coder",
+		Harness:              hCfg,
+	}, st, vcs, gatedSbx, sandboxProxy, tel)
 
 	ctrlSrv := httptest.NewServer(NewControllerMux(vcs, orch, tel))
 	defer ctrlSrv.Close()
@@ -518,9 +575,9 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	}
 	_ = healthResp.Body.Close()
 
-	sendWebhook := func(deliveryID, event string, payload string) (*http.Response, webhookResponse) {
+	sendWebhook := func(baseURL, deliveryID, event, payload string) (*http.Response, webhookResponse) {
 		t.Helper()
-		req, reqErr := http.NewRequest(http.MethodPost, ctrlSrv.URL+"/webhook/github", strings.NewReader(payload))
+		req, reqErr := http.NewRequest(http.MethodPost, baseURL+"/webhook/github", strings.NewReader(payload))
 		if reqErr != nil {
 			t.Fatal(reqErr)
 		}
@@ -537,7 +594,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 		return resp, parsed
 	}
 
-	respA, bodyA := sendWebhook("d-1", "pull_request", `{
+	respA, bodyA := sendWebhook(ctrlSrv.URL, "d-1", "pull_request", `{
 		"action": "opened",
 		"number": 10,
 		"pull_request": {
@@ -563,6 +620,9 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	ghMu.Lock()
 	if len(postedReviews) != 1 || postedReviews[0].CommitID != "commitA" || postedReviews[0].Event != "COMMENT" {
 		t.Fatalf("expected 1 COMMENT review on commitA, got %+v", postedReviews)
+	}
+	if !strings.Contains(postedReviews[0].Body, "fps:") {
+		t.Fatalf("expected embedded fingerprints in review marker, got:\n%s", postedReviews[0].Body)
 	}
 	if len(postedComments) != 1 || postedComments[0].Path != "pkg/cache/store.go" || postedComments[0].Line != 13 {
 		t.Fatalf("expected 1 inline comment at pkg/cache/store.go:13, got %+v", postedComments)
@@ -596,7 +656,22 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	liveHeadByPR[10] = "commitB"
 	ghMu.Unlock()
 
-	respB, bodyB := sendWebhook("d-2", "pull_request", `{
+	restartedStore := store.NewInMemoryStore()
+	restartedOrch := orchestrator.New(orchestrator.Config{
+		WorkerID:             "e2e-worker-restarted",
+		LeaseTTL:             30 * time.Second,
+		PollInterval:         25 * time.Millisecond,
+		DebounceWindow:       0,
+		MaxConcurrentRuns:    2,
+		MaxConcurrentShards:  4,
+		ControllerSandboxURL: sandboxSrv.URL,
+		ModelAlias:           "review-coder",
+		Harness:              hCfg,
+	}, restartedStore, vcs, gatedSbx, sandboxProxy, tel)
+	restartedCtrlSrv := httptest.NewServer(NewControllerMux(vcs, restartedOrch, tel))
+	defer restartedCtrlSrv.Close()
+
+	respB, bodyB := sendWebhook(restartedCtrlSrv.URL, "d-2", "pull_request", `{
 		"action": "synchronize",
 		"number": 10,
 		"pull_request": {
@@ -613,7 +688,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	if respB.StatusCode != http.StatusAccepted || !bodyB.Enqueued {
 		t.Fatalf("expected 202 enqueued for commitB, got code=%d body=%+v", respB.StatusCode, bodyB)
 	}
-	if ranB, runErr := orch.RunOnce(ctx); runErr != nil || !ranB {
+	if ranB, runErr := restartedOrch.RunOnce(ctx); runErr != nil || !ranB {
 		t.Fatalf("RunOnce commitB = %v err=%v", ranB, runErr)
 	}
 
@@ -622,7 +697,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 		t.Fatalf("expected 2 total reviews after commitB, got %d", len(postedReviews))
 	}
 	if len(postedComments) != 2 || postedComments[1].Path != "pkg/cache/evict.go" || postedComments[1].Line != 4 {
-		t.Fatalf("expected store.go deduplicated and ONLY evict.go:4 posted in round 2, got %+v", postedComments)
+		t.Fatalf("expected store.go deduplicated across controller restart and ONLY evict.go:4 posted in round 2, got %+v", postedComments)
 	}
 	ghMu.Unlock()
 
@@ -634,7 +709,8 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 		orch.WorkerLoop(loopCtx)
 	}()
 
-	_, _ = sendWebhook("d-3", "pull_request", `{
+	gatedSbx.blockEnabled.Store(true)
+	_, _ = sendWebhook(ctrlSrv.URL, "d-3", "pull_request", `{
 		"action": "synchronize",
 		"number": 20,
 		"pull_request": {
@@ -655,11 +731,12 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 		t.Fatal("timed out waiting for commitC sandbox to start")
 	}
 
+	gatedSbx.blockEnabled.Store(false)
 	ghMu.Lock()
 	liveHeadByPR[20] = "commitD"
 	ghMu.Unlock()
 
-	_, _ = sendWebhook("d-4", "pull_request", `{
+	_, _ = sendWebhook(ctrlSrv.URL, "d-4", "pull_request", `{
 		"action": "synchronize",
 		"number": 20,
 		"pull_request": {
@@ -706,7 +783,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 	}
 
 	invBeforeFork := sandboxInvocations.Load()
-	respForkAuto, bodyForkAuto := sendWebhook("d-5", "pull_request", `{
+	respForkAuto, bodyForkAuto := sendWebhook(ctrlSrv.URL, "d-5", "pull_request", `{
 		"action": "opened",
 		"number": 30,
 		"pull_request": {
@@ -724,7 +801,7 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 		t.Fatalf("expected untrusted fork auto PR to be skipped, got code=%d body=%+v", respForkAuto.StatusCode, bodyForkAuto)
 	}
 
-	respForkCmd, bodyForkCmd := sendWebhook("d-6", "issue_comment", `{
+	respForkCmd, bodyForkCmd := sendWebhook(ctrlSrv.URL, "d-6", "issue_comment", `{
 		"action": "created",
 		"issue": {
 			"number": 30,
@@ -749,15 +826,15 @@ func TestFullStackWebhookToGitHubPrimaryShadowDedupSupersedeAndForkGate(t *testi
 }
 
 func fakeCountingRunner(inner contract.SandboxRunner, counter *atomic.Int32) contract.SandboxRunner {
-	return runnerFunc(func(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+	return runnerFunc(func(ctx context.Context, spec contract.SandboxSpec) error {
 		counter.Add(1)
 		return inner.Run(ctx, spec)
 	})
 }
 
-type runnerFunc func(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error)
+type runnerFunc func(ctx context.Context, spec contract.SandboxSpec) error
 
-func (fn runnerFunc) Run(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+func (fn runnerFunc) Run(ctx context.Context, spec contract.SandboxSpec) error {
 	return fn(ctx, spec)
 }
 

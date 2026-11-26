@@ -2,8 +2,12 @@ package github
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -14,8 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
 type cachedToken struct {
@@ -32,7 +34,8 @@ type AppAuthenticator struct {
 	httpClient     *http.Client
 	nowFn          func() time.Time
 
-	mu sync.Mutex
+	mu       sync.Mutex
+	botLogin string
 	// key: GitHub repository "owner/repo" slug; value: resolved GitHub App installation ID
 	repoInstallations map[string]int64
 	// key: installation ID decimal string; value: cached GitHub installation access token
@@ -90,17 +93,45 @@ func (a *AppAuthenticator) HasCredentials() bool {
 	return a.staticToken != "" || (a.appID > 0 && a.privateKey != nil)
 }
 
+func (a *AppAuthenticator) AppID() int64 {
+	return a.appID
+}
+
+func (a *AppAuthenticator) UsesStaticToken() bool {
+	return a.staticToken != ""
+}
+
+func (a *AppAuthenticator) BotLogin() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.botLogin
+}
+
 func (a *AppAuthenticator) MintAppJWT() (string, error) {
 	if a.appID <= 0 || a.privateKey == nil {
 		return "", errors.New("GitHub App ID and RSA private key are required to mint App JWT")
 	}
 	now := a.nowFn()
-	claims := jwt.RegisteredClaims{
-		IssuedAt:  jwt.NewNumericDate(now.Add(-60 * time.Second)),
-		ExpiresAt: jwt.NewNumericDate(now.Add(9 * time.Minute)),
-		Issuer:    strconv.FormatInt(a.appID, 10),
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	claimsBytes, err := json.Marshal(struct {
+		IAT int64  `json:"iat"`
+		EXP int64  `json:"exp"`
+		ISS string `json:"iss"`
+	}{
+		IAT: now.Add(-60 * time.Second).Unix(),
+		EXP: now.Add(9 * time.Minute).Unix(),
+		ISS: strconv.FormatInt(a.appID, 10),
+	})
+	if err != nil {
+		return "", err
 	}
-	return jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(a.privateKey)
+	signingInput := header + "." + base64.RawURLEncoding.EncodeToString(claimsBytes)
+	digest := sha256.Sum256([]byte(signingInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, a.privateKey, crypto.SHA256, digest[:])
+	if err != nil {
+		return "", err
+	}
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
 func (a *AppAuthenticator) Check(ctx context.Context) error {
@@ -129,6 +160,16 @@ func (a *AppAuthenticator) Check(ctx context.Context) error {
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("verify GitHub App: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var appMeta struct {
+		Slug string `json:"slug"`
+	}
+	if json.Unmarshal(body, &appMeta) == nil {
+		if slug := strings.TrimSpace(appMeta.Slug); slug != "" {
+			a.mu.Lock()
+			a.botLogin = slug + "[bot]"
+			a.mu.Unlock()
+		}
 	}
 	if a.installationID > 0 {
 		if _, err := a.TokenForRepo(ctx, ""); err != nil {

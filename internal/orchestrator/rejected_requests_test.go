@@ -3,8 +3,6 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
@@ -13,12 +11,6 @@ import (
 )
 
 func TestRejectedHarnessRequestsFailShardsWithoutDeterministicReport(t *testing.T) {
-	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"jti":"any","requests":3,"normalizeRequests":1,"rejectedRequests":2}`)
-	}))
-	defer usageSrv.Close()
-
 	cases := []struct {
 		name          string
 		normalizer    reviewv1.NormalizerPath
@@ -34,10 +26,17 @@ func TestRejectedHarnessRequestsFailShardsWithoutDeterministicReport(t *testing.
 		vcs := &fakeVCS{
 			liveHeadSHA:  headSHA,
 			diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\n"),
-			tarballBytes: []byte("t"),
+			tarballBytes: emptyTestTarGZ(t),
 		}
-		sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
-			return &reviewv1.ReviewReport{
+		broker := newFakeBroker()
+		broker.defaultUsage = &reviewv1.SandboxUsage{
+			Jti:               "any",
+			Requests:          3,
+			NormalizeRequests: 1,
+			RejectedRequests:  2,
+		}
+		sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+			return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
 				Summary: "Summary produced after the request cap was reached.",
 				Findings: []*reviewv1.ReviewFinding{
 					{
@@ -57,14 +56,12 @@ func TestRejectedHarnessRequestsFailShardsWithoutDeterministicReport(t *testing.
 					Normalizer: tc.normalizer,
 					Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
 				},
-			}, nil
+			})
 		})
 
 		orch := New(Config{
-			TokenKey:           []byte("0123456789abcdef0123456789abcdef"),
-			DebounceWindow:     0,
-			AdapterInternalURL: usageSrv.URL,
-		}, st, vcs, sbx, nil)
+			DebounceWindow: 0,
+		}, st, vcs, sbx, broker, nil)
 
 		if _, err := orch.HandleEvent(ctx, &reviewv1.ReviewEvent{
 			EventId:      fmt.Sprintf("ev-rejected-%d", i),

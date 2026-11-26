@@ -8,7 +8,7 @@ import (
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 )
 
-// SandboxSpec defines the inputs, credentials, and execution constraints for one disposable sandbox run.
+// SandboxSpec defines the controller endpoint, opaque session token, and execution constraints for one disposable sandbox run.
 type SandboxSpec struct {
 	ShortRunID     string
 	ShardIndex     int
@@ -16,10 +16,7 @@ type SandboxSpec struct {
 	Role           string
 	HarnessProfile string
 	HarnessImage   string
-	TarballPath    string
-	// key: file path relative to /workspace/.review/in; value: raw file bytes
-	Inputs         map[string][]byte
-	AdapterURL     string
+	ControllerURL  string
 	TaskToken      string
 	TimeoutSeconds int
 }
@@ -51,6 +48,7 @@ type PublishRequest struct {
 	Summary      string
 	Inlines      []InlineComment
 	FileComments []InlineComment
+	Fingerprints []string
 }
 
 // PublishedComment records one posted comment ID mapped back to its dedup fingerprint.
@@ -85,13 +83,14 @@ type RunRecord struct {
 	HarnessProfile string
 }
 
-// VCSPlugin integrates webhook ingestion, repository reads, idempotent review publishing, and feedback polling.
+// VCSPlugin integrates webhook ingestion, repository reads, idempotent review publishing, PR marker dedup, and feedback polling.
 type VCSPlugin interface {
 	VerifyAndParseWebhook(ctx context.Context, headers http.Header, body []byte) (*reviewv1.ReviewEvent, error)
 	GetHeadSHA(ctx context.Context, repo string, prNumber int) (string, error)
 	FetchDiffAndTarball(ctx context.Context, repo string, prNumber int, baseSHA, headSHA string) (diffPatch []byte, tarball io.ReadCloser, err error)
 	// FetchBaseRules returns review rule payloads keyed by repository-relative file path; value is raw rule bytes.
 	FetchBaseRules(ctx context.Context, repo, baseSHA string, changedFiles []string) (map[string][]byte, error)
+	ListPublishedFingerprints(ctx context.Context, repo string, prNumber int) ([]string, error)
 	PublishReview(ctx context.Context, req PublishRequest) (*PublishResult, error)
 	PollFeedback(ctx context.Context, repo string, prNumber int, commentIDs []int64) ([]FeedbackSample, error)
 }
@@ -101,9 +100,9 @@ type CheckLogFetcher interface {
 	FetchCheckLogs(ctx context.Context, repo string, prNumber int, headSHA string, maxBytes int) ([]byte, error)
 }
 
-// SandboxRunner launches an isolated sandbox, streams inputs, executes the harness, and returns normalized findings.
+// SandboxRunner launches a single isolated sandbox executing review-kit run against the controller sandbox API.
 type SandboxRunner interface {
-	Run(ctx context.Context, spec SandboxSpec) (*reviewv1.ReviewReport, error)
+	Run(ctx context.Context, spec SandboxSpec) error
 }
 
 // ContextProvider contributes files into the sandbox context directory (/workspace/.review/in).

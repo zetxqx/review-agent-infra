@@ -4,29 +4,35 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/internal/telemetry"
-	"github.com/zetxqx/review-agent-infra/internal/token"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
-	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
 	defaultMaxBodyBytes    int64 = 16 << 20
+	defaultMaxReportBytes  int64 = 2 << 20
 	defaultMaxOutputTokens int64 = 32768
 	maxRetries                   = 4
 	maxSSELineBytes              = 4 << 20
+	taskTokenBytes               = 32
 )
 
 // key: allowlisted Chat Completions JSON field name; value: true when permitted
@@ -62,15 +68,16 @@ var responsesAllowedFields = map[string]bool{
 }
 
 type Config struct {
-	TokenKey      []byte
-	Upstream      contract.UpstreamProvider
-	UpstreamModel string
-	ModelAlias    string
-	MaxBodyBytes  int64
-	HTTPClient    *http.Client
-	BaseRetryWait time.Duration
-	MaxRetryWait  time.Duration
-	Telemetry     *telemetry.Registry
+	Upstream       contract.UpstreamProvider
+	UpstreamModel  string
+	ModelAlias     string
+	MaxBodyBytes   int64
+	MaxReportBytes int64
+	HTTPClient     *http.Client
+	BaseRetryWait  time.Duration
+	MaxRetryWait   time.Duration
+	Telemetry      *telemetry.Registry
+	Now            func() time.Time
 }
 
 type StreamPlan struct {
@@ -81,16 +88,19 @@ type StreamPlan struct {
 }
 
 type ProxyHandler struct {
-	tokenKey      []byte
-	upstream      contract.UpstreamProvider
-	upstreamModel string
-	modelAlias    string
-	maxBodyBytes  int64
-	httpClient    *http.Client
-	baseRetryWait time.Duration
-	maxRetryWait  time.Duration
-	ledgers       *LedgerStore
-	telemetry     *telemetry.Registry
+	upstream       contract.UpstreamProvider
+	upstreamModel  string
+	modelAlias     string
+	maxBodyBytes   int64
+	maxReportBytes int64
+	httpClient     *http.Client
+	baseRetryWait  time.Duration
+	maxRetryWait   time.Duration
+	telemetry      *telemetry.Registry
+	now            func() time.Time
+
+	sessionsMu sync.RWMutex
+	sessions   map[[32]byte]*ActiveSession
 
 	totalRequests    atomic.Int64
 	budgetRejections atomic.Int64
@@ -103,6 +113,10 @@ func NewProxyHandler(cfg Config) *ProxyHandler {
 	maxBody := cfg.MaxBodyBytes
 	if maxBody <= 0 {
 		maxBody = defaultMaxBodyBytes
+	}
+	maxReport := cfg.MaxReportBytes
+	if maxReport <= 0 {
+		maxReport = defaultMaxReportBytes
 	}
 	client := cfg.HTTPClient
 	if client == nil {
@@ -120,22 +134,93 @@ func NewProxyHandler(cfg Config) *ProxyHandler {
 	if alias == "" {
 		alias = "review-coder"
 	}
-	return &ProxyHandler{
-		tokenKey:      cfg.TokenKey,
-		upstream:      cfg.Upstream,
-		upstreamModel: cfg.UpstreamModel,
-		modelAlias:    alias,
-		maxBodyBytes:  maxBody,
-		httpClient:    client,
-		baseRetryWait: baseWait,
-		maxRetryWait:  maxWait,
-		ledgers:       NewLedgerStore(),
-		telemetry:     cfg.Telemetry,
+	nowFn := cfg.Now
+	if nowFn == nil {
+		nowFn = time.Now
 	}
+	return &ProxyHandler{
+		upstream:       cfg.Upstream,
+		upstreamModel:  cfg.UpstreamModel,
+		modelAlias:     alias,
+		maxBodyBytes:   maxBody,
+		maxReportBytes: maxReport,
+		httpClient:     client,
+		baseRetryWait:  baseWait,
+		maxRetryWait:   maxWait,
+		telemetry:      cfg.Telemetry,
+		now:            nowFn,
+		sessions:       make(map[[32]byte]*ActiveSession),
+	}
+}
+
+func (p *ProxyHandler) RegisterSession(claims *reviewv1.TaskClaims, bundlePath string) (string, func(), error) {
+	if claims == nil {
+		return "", nil, errors.New("claims are required")
+	}
+	rawBytes := make([]byte, taskTokenBytes)
+	if _, err := cryptorand.Read(rawBytes); err != nil {
+		return "", nil, err
+	}
+	taskToken := hex.EncodeToString(rawBytes)
+	cloned := proto.Clone(claims).(*reviewv1.TaskClaims)
+	if cloned.Jti == "" {
+		cloned.Jti = taskToken[:16]
+	}
+
+	digest := sha256.Sum256([]byte(taskToken))
+	sess := &ActiveSession{
+		token:      taskToken,
+		claims:     cloned,
+		ledger:     NewSessionLedger(cloned),
+		bundlePath: bundlePath,
+	}
+
+	nowUnix := p.now().Unix()
+	p.sessionsMu.Lock()
+	for k, existing := range p.sessions {
+		if existing.claims.Exp > 0 && existing.claims.Exp <= nowUnix {
+			delete(p.sessions, k)
+		}
+	}
+	p.sessions[digest] = sess
+	p.sessionsMu.Unlock()
+
+	var once sync.Once
+	unregister := func() {
+		once.Do(func() {
+			p.sessionsMu.Lock()
+			delete(p.sessions, digest)
+			p.sessionsMu.Unlock()
+		})
+	}
+	return taskToken, unregister, nil
+}
+
+func (p *ProxyHandler) FinishSession(taskToken string) ([]byte, *reviewv1.SandboxUsage) {
+	sess := p.lookupSession(taskToken)
+	if sess == nil {
+		return nil, nil
+	}
+	return sess.Report(), sess.ledger.Snapshot()
+}
+
+func (p *ProxyHandler) SweepExpired(nowUnix int64) int {
+	p.sessionsMu.Lock()
+	defer p.sessionsMu.Unlock()
+	removed := 0
+	for k, s := range p.sessions {
+		if s.claims.Exp > 0 && s.claims.Exp <= nowUnix {
+			delete(p.sessions, k)
+			removed++
+		}
+	}
+	return removed
 }
 
 func (p *ProxyHandler) SandboxMux() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sandbox/bundle", p.handleBundle)
+	mux.HandleFunc("POST /v1/sandbox/report", p.handleReport)
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		p.handleProxy(w, r, "chat")
 	})
@@ -146,19 +231,89 @@ func (p *ProxyHandler) SandboxMux() *http.ServeMux {
 	return mux
 }
 
-func (p *ProxyHandler) InternalMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /internal/usage/{jti}", p.handleUsage)
-	mux.HandleFunc("GET /metrics", p.handleMetrics)
-	return mux
+func (p *ProxyHandler) lookupSession(rawToken string) *ActiveSession {
+	if rawToken == "" {
+		return nil
+	}
+	digest := sha256.Sum256([]byte(rawToken))
+	p.sessionsMu.RLock()
+	sess := p.sessions[digest]
+	p.sessionsMu.RUnlock()
+	if sess == nil {
+		return nil
+	}
+	if subtle.ConstantTimeCompare([]byte(sess.token), []byte(rawToken)) != 1 {
+		return nil
+	}
+	return sess
 }
 
-func (p *ProxyHandler) Ledgers() *LedgerStore {
-	return p.ledgers
+func (p *ProxyHandler) authenticate(r *http.Request) (*ActiveSession, error) {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) < 7 || !strings.EqualFold(auth[:7], "Bearer ") {
+		return nil, errors.New("missing bearer token")
+	}
+	rawToken := strings.TrimSpace(auth[7:])
+	sess := p.lookupSession(rawToken)
+	if sess == nil {
+		return nil, errors.New("unknown task token")
+	}
+	if sess.claims.Exp > 0 && p.now().Unix() > sess.claims.Exp {
+		return nil, errors.New("expired task token")
+	}
+	return sess, nil
+}
+
+func (p *ProxyHandler) handleBundle(w http.ResponseWriter, r *http.Request) {
+	sess, err := p.authenticate(r)
+	if err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "unauthorized", "invalid task token")
+		return
+	}
+	if sess.bundlePath == "" {
+		writeOpenAIError(w, http.StatusNotFound, "bundle_not_found", "no bundle registered for session")
+		return
+	}
+	if !sess.bundleRead.CompareAndSwap(false, true) {
+		writeOpenAIError(w, http.StatusGone, "bundle_already_read", "sandbox bundle already downloaded")
+		return
+	}
+	f, openErr := os.Open(sess.bundlePath)
+	if openErr != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "bundle_open_failed", "unable to open sandbox bundle")
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/gzip")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, f)
+}
+
+func (p *ProxyHandler) handleReport(w http.ResponseWriter, r *http.Request) {
+	sess, err := p.authenticate(r)
+	if err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "unauthorized", "invalid task token")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, p.maxReportBytes)
+	raw, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(readErr, &maxErr) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "report_too_large", "sandbox report exceeds size cap")
+			return
+		}
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_report", "failed to read sandbox report")
+		return
+	}
+	sess.SetReport(raw)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
 }
 
 func (p *ProxyHandler) handleModels(w http.ResponseWriter, r *http.Request) {
-	if _, err := token.Verify(p.tokenKey, r.Header.Get("Authorization")); err != nil {
+	if _, err := p.authenticate(r); err != nil {
 		writeOpenAIError(w, http.StatusUnauthorized, "unauthorized", "invalid task token")
 		return
 	}
@@ -182,54 +337,13 @@ func (p *ProxyHandler) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (p *ProxyHandler) handleUsage(w http.ResponseWriter, r *http.Request) {
-	jti := r.PathValue("jti")
-	if jti == "" {
-		http.NotFound(w, r)
-		return
-	}
-	l, ok := p.ledgers.Get(jti)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	raw, err := (protojson.MarshalOptions{EmitUnpopulated: true}).Marshal(l.Snapshot())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(raw)
-}
-
-func (p *ProxyHandler) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprintf(
-		w,
-		"# TYPE review_adapter_requests_total counter\nreview_adapter_requests_total %d\n"+
-			"# TYPE review_adapter_budget_rejections_total counter\nreview_adapter_budget_rejections_total %d\n"+
-			"# TYPE review_adapter_tokens_total counter\n"+
-			"review_adapter_tokens_total{kind=\"prompt\"} %d\n"+
-			"review_adapter_tokens_total{kind=\"cached\"} %d\n"+
-			"review_adapter_tokens_total{kind=\"completion\"} %d\n",
-		p.totalRequests.Load(),
-		p.budgetRejections.Load(),
-		p.promptTokens.Load(),
-		p.cachedTokens.Load(),
-		p.completionTokens.Load(),
-	)
-	if p.telemetry != nil {
-		_, _ = w.Write([]byte(p.telemetry.Render()))
-	}
-}
-
 func (p *ProxyHandler) handleProxy(w http.ResponseWriter, r *http.Request, api string) {
-	claims, err := token.Verify(p.tokenKey, r.Header.Get("Authorization"))
+	sess, err := p.authenticate(r)
 	if err != nil {
 		writeOpenAIError(w, http.StatusUnauthorized, "unauthorized", "invalid task token")
 		return
 	}
+	claims := sess.claims
 	r.Body = http.MaxBytesReader(w, r.Body, p.maxBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -243,7 +357,7 @@ func (p *ProxyHandler) handleProxy(w http.ResponseWriter, r *http.Request, api s
 	}
 
 	p.totalRequests.Add(1)
-	ledger := p.ledgers.GetOrCreate(claims)
+	ledger := sess.ledger
 	phase := "harness"
 	if r.Header.Get("x-review-phase") == "normalize" {
 		phase = "normalize"
@@ -355,8 +469,11 @@ func (p *ProxyHandler) sanitizePayload(api string, raw []byte, claims *reviewv1.
 		if _, has := out["max_completion_tokens"]; has {
 			tokenKey = "max_completion_tokens"
 		}
-		if reqOut, ok := asInt64(out[tokenKey]); ok && reqOut > 0 && reqOut < maxOut {
-			maxOut = reqOut
+		for _, key := range []string{"max_completion_tokens", "max_tokens"} {
+			if reqOut, ok := asInt64(out[key]); ok && reqOut > 0 && reqOut < maxOut {
+				maxOut = reqOut
+			}
+			delete(out, key)
 		}
 		out[tokenKey] = maxOut
 		if stream {

@@ -25,9 +25,9 @@ import (
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/internal/inference"
+	"github.com/zetxqx/review-agent-infra/internal/loader"
 	"github.com/zetxqx/review-agent-infra/internal/publisher"
 	"github.com/zetxqx/review-agent-infra/internal/sandbox"
-	"github.com/zetxqx/review-agent-infra/internal/token"
 	"github.com/zetxqx/review-agent-infra/internal/vcs/github"
 	"github.com/zetxqx/review-agent-infra/internal/vcs/localgit"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
@@ -46,7 +46,6 @@ type commonFlags struct {
 	dockerImage          string
 	dockerImageSet       bool
 	dockerNetwork        string
-	loaderBin            string
 	upstreamKind         string
 	upstreamURL          string
 	upstreamURLSet       bool
@@ -62,6 +61,8 @@ type commonFlags struct {
 	concurrency          int
 	runID                string
 	supportsFileComments bool
+	// key: SHA-256 finding fingerprint hex; value: true when already published on the target PR
+	seenFingerprints map[string]bool
 }
 
 type PublishedReviewInfo struct {
@@ -113,8 +114,6 @@ type ScorecardRow struct {
 
 type liveAdapterSession struct {
 	sandboxURL   string
-	internalURL  string
-	tokenKey     []byte
 	proxy        *inference.ProxyHandler
 	mockUpstream *diffAwareMockUpstream
 	closeFn      func()
@@ -153,7 +152,6 @@ func bindCommonFlags(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.runnerKind, "runner", envOr("REVIEWCTL_RUNNER", "local"), "")
 	fs.StringVar(&c.dockerImage, "docker-image", envOr("REVIEWCTL_DOCKER_IMAGE", sandbox.DefaultSandboxImage), "")
 	fs.StringVar(&c.dockerNetwork, "docker-network", envOr("REVIEWCTL_DOCKER_NETWORK", "host"), "")
-	fs.StringVar(&c.loaderBin, "loader-bin", os.Getenv("REVIEWCTL_LOADER_BIN"), "")
 	fs.StringVar(&c.upstreamKind, "upstream-kind", envOr("REVIEWCTL_UPSTREAM_KIND", "llmd-gateway"), "")
 	fs.StringVar(&c.upstreamURL, "upstream-url", envOr("REVIEWCTL_UPSTREAM_URL", "http://127.0.0.1:8000"), "")
 	fs.StringVar(&c.upstreamKey, "upstream-api-key", os.Getenv("REVIEWCTL_UPSTREAM_API_KEY"), "")
@@ -222,6 +220,13 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 			StaticToken: ghToken,
 			APIBaseURL:  apiBase,
 		})
+		if priorFPs, listErr := vcs.ListPublishedFingerprints(ctx, ghRepo, publishPR); listErr == nil && len(priorFPs) > 0 {
+			// key: SHA-256 finding fingerprint hex; value: true when already published on the target PR
+			cfg.seenFingerprints = make(map[string]bool, len(priorFPs))
+			for _, fp := range priorFPs {
+				cfg.seenFingerprints[fp] = true
+			}
+		}
 	}
 
 	adapterSess, err := startEphemeralAdapter(cfg)
@@ -254,6 +259,12 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 				return fmt.Errorf("PR #%d remote head SHA %s does not match reviewed commit %s (pass --skip-head-check to override)", publishPR, remoteHead, commits[0].HeadSHA)
 			}
 		}
+		fingerprints := make([]string, 0, len(execRes.Pipeline.Aligned))
+		for _, a := range execRes.Pipeline.Aligned {
+			if a.Fingerprint != "" {
+				fingerprints = append(fingerprints, a.Fingerprint)
+			}
+		}
 		pubRes, pubErr := vcs.PublishReview(ctx, contract.PublishRequest{
 			Repo:         ghRepo,
 			PRNumber:     publishPR,
@@ -263,6 +274,7 @@ func runReviewCmd(ctx context.Context, args []string, stdout io.Writer) error {
 			Summary:      execRes.Pipeline.Summary,
 			Inlines:      execRes.Pipeline.Inlines,
 			FileComments: execRes.Pipeline.FileComments,
+			Fingerprints: fingerprints,
 		})
 		if pubErr != nil {
 			return pubErr
@@ -483,11 +495,6 @@ func resolveTargetCommits(ctx context.Context, cfg commonFlags) ([]localgit.Comm
 }
 
 func startEphemeralAdapter(cfg commonFlags) (*liveAdapterSession, error) {
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, err
-	}
-
 	var script *mockUpstreamScript
 	if cfg.mockScript != "" {
 		loaded, scriptErr := loadMockUpstreamScript(cfg.mockScript)
@@ -537,7 +544,6 @@ func startEphemeralAdapter(cfg commonFlags) (*liveAdapterSession, error) {
 	}
 
 	proxy := inference.NewProxyHandler(inference.Config{
-		TokenKey:      key,
 		Upstream:      up,
 		UpstreamModel: cfg.upstreamModel,
 		ModelAlias:    cfg.modelAlias,
@@ -550,29 +556,16 @@ func startEphemeralAdapter(cfg commonFlags) (*liveAdapterSession, error) {
 		}
 		return nil, err
 	}
-	intLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		_ = sbxLn.Close()
-		for _, fn := range closers {
-			fn()
-		}
-		return nil, err
-	}
 
 	sbxSrv := &http.Server{Handler: proxy.SandboxMux(), ReadHeaderTimeout: 10 * time.Second}
-	intSrv := &http.Server{Handler: proxy.InternalMux(), ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = sbxSrv.Serve(sbxLn) }()
-	go func() { _ = intSrv.Serve(intLn) }()
 
 	closers = append(closers, func() {
 		_ = sbxSrv.Close()
-		_ = intSrv.Close()
 	})
 
 	return &liveAdapterSession{
 		sandboxURL:   "http://" + sbxLn.Addr().String(),
-		internalURL:  "http://" + intLn.Addr().String(),
-		tokenKey:     key,
 		proxy:        proxy,
 		mockUpstream: mockUpstream,
 		closeFn: func() {
@@ -587,7 +580,6 @@ func buildSandboxRunner(cfg commonFlags) (contract.SandboxRunner, func(), error)
 	switch cfg.runnerKind {
 	case "local":
 		r := sandbox.NewLocalProcessRunner("")
-		r.LoaderBin = cfg.loaderBin
 		return r, func() { _ = r.Close() }, nil
 	case "docker":
 		r := sandbox.NewDockerRunner(cfg.dockerImage, cfg.dockerNetwork)
@@ -651,12 +643,8 @@ func executeProfileOnCommit(
 		MaxTotalTokens:          profile.Budget.MaxTotalTokens,
 		NormalizerReserveTokens: profile.Budget.NormalizerReserveTokens,
 		MaxOutputTokens:         32768,
-		Exp:                     time.Now().Add(time.Duration(profile.Budget.WallClockSeconds+300) * time.Second).Unix(),
+		Exp:                     time.Now().Add(time.Duration(profile.Budget.WallClockSeconds+600) * time.Second).Unix(),
 		Jti:                     jti,
-	}
-	rawToken, err := token.Mint(adapterSess.tokenKey, claims)
-	if err != nil {
-		return ExecutionMetrics{}, err
 	}
 
 	task := &reviewv1.AgentTask{
@@ -687,22 +675,40 @@ func executeProfileOnCommit(
 		inputs["rules/"+relRule] = content
 	}
 
+	bundlePath := filepath.Join(tmpTarDir, "bundle.tar.gz")
+	bundleFile, err := os.Create(bundlePath)
+	if err != nil {
+		return ExecutionMetrics{}, err
+	}
+	buildErr := loader.BuildBundleTGZ(tarPath, inputs, bundleFile)
+	closeErr := bundleFile.Close()
+	if buildErr != nil {
+		return ExecutionMetrics{}, buildErr
+	}
+	if closeErr != nil {
+		return ExecutionMetrics{}, closeErr
+	}
+
+	rawToken, unregister, err := adapterSess.proxy.RegisterSession(claims, bundlePath)
+	if err != nil {
+		return ExecutionMetrics{}, err
+	}
+	defer unregister()
+
 	harnessImage := profile.Image
 	if cfg.dockerImageSet || os.Getenv("REVIEWCTL_DOCKER_IMAGE") != "" {
 		harnessImage = cfg.dockerImage
 	}
 
 	started := time.Now()
-	report, err := runner.Run(ctx, contract.SandboxSpec{
+	err = runner.Run(ctx, contract.SandboxSpec{
 		ShortRunID:     shortSHA(commit.HeadSHA),
 		ShardIndex:     0,
 		Attempt:        0,
 		Role:           "primary",
 		HarnessProfile: profile.Name,
 		HarnessImage:   harnessImage,
-		TarballPath:    tarPath,
-		Inputs:         inputs,
-		AdapterURL:     adapterSess.sandboxURL,
+		ControllerURL:  adapterSess.sandboxURL,
 		TaskToken:      rawToken,
 		TimeoutSeconds: int(profile.Budget.WallClockSeconds),
 	})
@@ -711,7 +717,11 @@ func executeProfileOnCommit(
 		return ExecutionMetrics{}, err
 	}
 
-	usage := fetchSandboxUsage(ctx, adapterSess.internalURL, jti)
+	reportBytes, usage := adapterSess.proxy.FinishSession(rawToken)
+	report, err := contract.DecodeAndValidateReport(reportBytes)
+	if err != nil {
+		return ExecutionMetrics{}, err
+	}
 	contract.FailReportOnRejectedRequests(report, usage)
 
 	pipeOpts := publisher.DefaultPipelineOptions()
@@ -720,6 +730,7 @@ func executeProfileOnCommit(
 	pipeOpts.SupportsFileComments = cfg.supportsFileComments
 	pipeOpts.TopN = cfg.topN
 	pipeOpts.MintedTokens = []string{rawToken}
+	pipeOpts.SeenFingerprints = cfg.seenFingerprints
 
 	rawCount := len(report.GetFindings())
 	pipeRes := publisher.RunPipeline(report, diffPatch, pipeOpts)
@@ -761,33 +772,6 @@ func executeProfileOnCommit(
 		Pipeline:          pipeRes,
 		Report:            report,
 	}, nil
-}
-
-func fetchSandboxUsage(ctx context.Context, internalURL, jti string) *reviewv1.SandboxUsage {
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, internalURL+"/internal/usage/"+jti, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-	var usage reviewv1.SandboxUsage
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &usage); err != nil {
-		return nil
-	}
-	return &usage
 }
 
 func aggregateScorecard(profiles []ProfileSpec, runs []ExecutionMetrics) []ScorecardRow {

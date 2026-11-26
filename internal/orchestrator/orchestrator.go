@@ -8,9 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,15 +16,21 @@ import (
 
 	"github.com/google/uuid"
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
+	"github.com/zetxqx/review-agent-infra/internal/loader"
 	"github.com/zetxqx/review-agent-infra/internal/publisher"
+	"github.com/zetxqx/review-agent-infra/internal/sandbox"
 	"github.com/zetxqx/review-agent-infra/internal/store"
 	"github.com/zetxqx/review-agent-infra/internal/telemetry"
-	"github.com/zetxqx/review-agent-infra/internal/token"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
 var errLeaseLost = errors.New("run lease superseded or lost")
+
+type SandboxSessionBroker interface {
+	RegisterSession(claims *reviewv1.TaskClaims, bundlePath string) (taskToken string, unregister func(), err error)
+	FinishSession(taskToken string) (reportBytes []byte, usage *reviewv1.SandboxUsage)
+}
 
 type inFlightEntry struct {
 	runID   uuid.UUID
@@ -50,9 +53,9 @@ type Orchestrator struct {
 	store            store.Store
 	vcs              contract.VCSPlugin
 	sandbox          contract.SandboxRunner
+	broker           SandboxSessionBroker
 	contextProviders []contract.ContextProvider
 	telemetry        *telemetry.Registry
-	httpClient       *http.Client
 	limiter          *SlidingWindowLimiter
 	wakeCh           chan struct{}
 
@@ -65,6 +68,7 @@ func New(
 	st store.Store,
 	vcs contract.VCSPlugin,
 	sbx contract.SandboxRunner,
+	broker SandboxSessionBroker,
 	tel *telemetry.Registry,
 	providers ...contract.ContextProvider,
 ) *Orchestrator {
@@ -77,9 +81,9 @@ func New(
 		store:            st,
 		vcs:              vcs,
 		sandbox:          sbx,
+		broker:           broker,
 		contextProviders: providers,
 		telemetry:        tel,
-		httpClient:       &http.Client{Timeout: 10 * time.Second},
 		limiter:          NewSlidingWindowLimiter(),
 		wakeCh:           make(chan struct{}, 1),
 		activeRuns:       make(map[prGroupKey][]inFlightEntry),
@@ -358,6 +362,9 @@ func (o *Orchestrator) runShard(
 	shard Shard,
 	sharded bool,
 ) shardOutcome {
+	if o.broker == nil {
+		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: errors.New("sandbox session broker is not configured")}
+	}
 	jti := randomTokenHex(12)
 	runIDStr := rec.ID.String()
 	sessionID := fmt.Sprintf("%s-s%d", runIDStr, shardIdx)
@@ -382,10 +389,6 @@ func (o *Orchestrator) runShard(
 		Exp:                     o.cfg.Now().Add(time.Duration(profile.Budget.WallClockSeconds+600) * time.Second).Unix(),
 		Jti:                     jti,
 	}
-	rawToken, err := token.Mint(o.cfg.TokenKey, claims)
-	if err != nil {
-		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: err}
-	}
 
 	task := &reviewv1.AgentTask{
 		RunId:      runIDStr,
@@ -396,6 +399,8 @@ func (o *Orchestrator) runShard(
 			Options: profile.Options,
 		},
 		ModelAlias: o.cfg.ModelAlias,
+		PrTitle:    rec.PRTitle,
+		PrBody:     rec.PRBody,
 		BaseBranch: shortCommit(rec.BaseSHA),
 		CiLogsFile: ciLogsPath,
 		Budget:     profile.Budget,
@@ -413,37 +418,64 @@ func (o *Orchestrator) runShard(
 	inputs["task.json"] = append(taskBytes, '\n')
 	inputs["diff.patch"] = shard.DiffPatch
 
+	bundlePath := filepath.Join(filepath.Dir(tarPath), fmt.Sprintf("bundle-s%d-%s-%s.tar.gz", shardIdx, role, jti))
+	bundleFile, err := os.Create(bundlePath)
+	if err != nil {
+		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: err}
+	}
+	buildErr := loader.BuildBundleTGZ(tarPath, inputs, bundleFile)
+	closeErr := bundleFile.Close()
+	if buildErr != nil {
+		_ = os.Remove(bundlePath)
+		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: buildErr}
+	}
+	if closeErr != nil {
+		_ = os.Remove(bundlePath)
+		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: closeErr}
+	}
+	defer os.Remove(bundlePath)
+
+	rawToken, unregister, err := o.broker.RegisterSession(claims, bundlePath)
+	if err != nil {
+		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: err}
+	}
+	defer unregister()
+
 	shortRun := strings.ReplaceAll(runIDStr, "-", "")
 	if len(shortRun) > 8 {
 		shortRun = shortRun[:8]
 	}
 
-	resolvedAdapterURL, err := resolveSandboxAdapterURL(ctx, o.cfg.AdapterSandboxURL)
+	resolvedControllerURL, err := sandbox.ResolveSandboxURL(ctx, o.cfg.ControllerSandboxURL)
 	if err != nil {
 		return shardOutcome{shardIndex: shardIdx, shardName: shard.Name, err: err}
 	}
 
 	started := time.Now()
-	report, runErr := o.sandbox.Run(ctx, contract.SandboxSpec{
+	runErr := o.sandbox.Run(ctx, contract.SandboxSpec{
 		ShortRunID:     shortRun,
 		ShardIndex:     shardIdx,
 		Attempt:        rec.Attempt,
 		Role:           role,
 		HarnessProfile: profile.Name,
 		HarnessImage:   profile.Image,
-		TarballPath:    tarPath,
-		Inputs:         inputs,
-		AdapterURL:     resolvedAdapterURL,
+		ControllerURL:  resolvedControllerURL,
 		TaskToken:      rawToken,
 		TimeoutSeconds: int(profile.Budget.WallClockSeconds),
 	})
 	elapsed := time.Since(started)
 
-	usage := o.fetchAdapterUsage(ctx, jti)
-	contract.FailReportOnRejectedRequests(report, usage)
-	if usage != nil && o.cfg.AdapterInternalURL != "" {
-		o.telemetry.AddTokens(rec.Repo, profile.Name, usage.PromptTokens, usage.CompletionTokens, usage.CachedTokens)
+	reportBytes, usage := o.broker.FinishSession(rawToken)
+	var report *reviewv1.ReviewReport
+	if runErr == nil {
+		decoded, decErr := contract.DecodeAndValidateReport(reportBytes)
+		if decErr != nil {
+			runErr = decErr
+		} else {
+			report = decoded
+		}
 	}
+	contract.FailReportOnRejectedRequests(report, usage)
 	logShardFinished(runIDStr, shardIdx, role, profile.Name, elapsed, report, usage, runErr)
 
 	return shardOutcome{
@@ -543,6 +575,11 @@ func (o *Orchestrator) denoiseAndPublish(
 	unseenSet := make(map[string]bool, len(unseenFPs))
 	for _, fp := range unseenFPs {
 		unseenSet[fp] = true
+	}
+	if remoteFPs, remoteErr := o.vcs.ListPublishedFingerprints(ctx, rec.Repo, rec.PRNumber); remoteErr == nil {
+		for _, fp := range remoteFPs {
+			delete(unseenSet, fp)
+		}
 	}
 
 	// key: finding pointer identity key (fingerprint); value: originating shard index
@@ -650,8 +687,12 @@ func (o *Orchestrator) buildSanitizedPublishRequest(
 	var inlines []contract.InlineComment
 	var fileComments []contract.InlineComment
 	var fallbackSummary []string
+	fingerprints := make([]string, 0, len(items))
 
 	for _, it := range items {
+		if it.Fingerprint != "" {
+			fingerprints = append(fingerprints, it.Fingerprint)
+		}
 		f := it.Finding
 		f.Title = publisher.SanitizeMarkdown(f.Title, mintedTokens...)
 		f.Explanation = publisher.SanitizeMarkdown(f.Explanation, mintedTokens...)
@@ -710,6 +751,7 @@ func (o *Orchestrator) buildSanitizedPublishRequest(
 		Summary:      strings.Join(summaryParts, "\n\n"),
 		Inlines:      inlines,
 		FileComments: fileComments,
+		Fingerprints: fingerprints,
 	}
 }
 
@@ -753,37 +795,6 @@ func (o *Orchestrator) recordExecutionRow(
 		row.CompletionTokens = out.usage.CompletionTokens
 	}
 	_ = o.store.RecordHarnessExecution(recCtx, row)
-}
-
-func (o *Orchestrator) fetchAdapterUsage(ctx context.Context, jti string) *reviewv1.SandboxUsage {
-	if o.cfg.AdapterInternalURL == "" || jti == "" {
-		return nil
-	}
-	reqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-
-	endpoint := strings.TrimRight(o.cfg.AdapterInternalURL, "/") + "/internal/usage/" + jti
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := o.httpClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil
-	}
-	var usage reviewv1.SandboxUsage
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, &usage); err != nil {
-		return nil
-	}
-	return &usage
 }
 
 func (o *Orchestrator) handleRunFailure(parentCtx, runCtx context.Context, rec *store.RunRecord, profileName string, runErr error) {
@@ -859,45 +870,6 @@ func (o *Orchestrator) cancelInFlightForPR(repo string, pr int, keepRunID uuid.U
 	for _, fn := range toCancel {
 		fn()
 	}
-}
-
-func resolveSandboxAdapterURL(ctx context.Context, rawURL string) (string, error) {
-	trimmed := strings.TrimSpace(rawURL)
-	if trimmed == "" {
-		return "", nil
-	}
-	u, err := url.Parse(trimmed)
-	if err != nil {
-		return "", fmt.Errorf("parse adapter sandbox URL %q: %w", rawURL, err)
-	}
-	host := u.Hostname()
-	if host == "" || net.ParseIP(host) != nil {
-		return trimmed, nil
-	}
-
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
-	if err != nil || len(addrs) == 0 {
-		return "", fmt.Errorf("resolve adapter hostname %q for DNS-disabled sandbox: %w", host, err)
-	}
-
-	selected := addrs[0].IP
-	for _, addr := range addrs {
-		if v4 := addr.IP.To4(); v4 != nil {
-			selected = v4
-			break
-		}
-	}
-
-	if port := u.Port(); port != "" {
-		u.Host = net.JoinHostPort(selected.String(), port)
-	} else if selected.To4() == nil {
-		u.Host = "[" + selected.String() + "]"
-	} else {
-		u.Host = selected.String()
-	}
-	return u.String(), nil
 }
 
 func (o *Orchestrator) signalWake() {

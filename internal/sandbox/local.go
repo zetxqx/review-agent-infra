@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
 	"github.com/zetxqx/review-agent-infra/pkg/contract"
 )
 
@@ -25,20 +24,13 @@ var _ contract.SandboxRunner = (*LocalProcessRunner)(nil)
 
 type LocalProcessRunner struct {
 	RepoRoot         string
-	LoaderBin        string
 	PythonProjectDir string
 	UVBin            string
 	WorkParentDir    string
-	OnPrepared       func(srcDir, inDir string)
+	OnCompleted      func(workRoot string)
 
-	loaderOnce     sync.Once
-	builtLoaderBin string
-	builtLoaderDir string
-	loaderBuildErr error
-
-	pyOnce sync.Once
-	pyKit  string
-	pyErr  error
+	pyMu  sync.Mutex
+	pyKit string
 }
 
 func NewLocalProcessRunner(repoRoot string) *LocalProcessRunner {
@@ -46,13 +38,10 @@ func NewLocalProcessRunner(repoRoot string) *LocalProcessRunner {
 }
 
 func (r *LocalProcessRunner) Close() error {
-	if r.builtLoaderDir != "" {
-		return os.RemoveAll(r.builtLoaderDir)
-	}
 	return nil
 }
 
-func (r *LocalProcessRunner) Run(ctx context.Context, spec contract.SandboxSpec) (*reviewv1.ReviewReport, error) {
+func (r *LocalProcessRunner) Run(ctx context.Context, spec contract.SandboxSpec) error {
 	timeoutSec := spec.TimeoutSeconds
 	if timeoutSec <= 0 {
 		timeoutSec = 300
@@ -61,92 +50,47 @@ func (r *LocalProcessRunner) Run(ctx context.Context, spec contract.SandboxSpec)
 	runCtx, cancel := context.WithTimeout(ctx, kitTimeout+60*time.Second)
 	defer cancel()
 
-	loaderBin, err := r.ensureLoaderBin(runCtx)
-	if err != nil {
-		return nil, err
-	}
 	kitCmd, err := r.ensureReviewKit(runCtx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	workRoot, err := os.MkdirTemp(r.WorkParentDir, "review-sbx-*")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() {
+		if r.OnCompleted != nil {
+			r.OnCompleted(workRoot)
+		}
 		restoreWritableRecursive(workRoot)
 		_ = os.RemoveAll(workRoot)
 	}()
 
-	srcDir := filepath.Join(workRoot, "src")
-	inDir := filepath.Join(workRoot, ".review", "in")
-	outDir := filepath.Join(workRoot, ".review", "out")
 	scratchDir := filepath.Join(workRoot, "scratch", "home")
-	for _, d := range []string{srcDir, inDir, outDir, scratchDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(scratchDir, 0o755); err != nil {
+		return err
 	}
 
-	snapFile, err := os.Open(spec.TarballPath)
-	if err != nil {
-		return nil, fmt.Errorf("open snapshot tarball: %w", err)
-	}
-	unpackErr := runExec(runCtx, "", loaderBin, []string{"unpack-src", "--src-dir", srcDir}, snapFile, nil, 60*time.Second)
-	_ = snapFile.Close()
-	if unpackErr != nil {
-		return nil, fmt.Errorf("loader unpack-src: %w", unpackErr)
-	}
-
-	rewrittenInputs, err := rewriteTaskPaths(spec.Inputs, srcDir, inDir, outDir)
-	if err != nil {
-		return nil, err
-	}
-	inputsTar, err := buildInputsTar(rewrittenInputs)
-	if err != nil {
-		return nil, err
-	}
-	if err := runExec(runCtx, "", loaderBin, []string{"prepare", "--src-dir", srcDir, "--in-dir", inDir}, bytes.NewReader(inputsTar), nil, 30*time.Second); err != nil {
-		return nil, fmt.Errorf("loader prepare: %w", err)
-	}
-
-	if err := lockReadOnlyRecursive(srcDir); err != nil {
-		return nil, fmt.Errorf("chmod read-only src: %w", err)
-	}
-	if err := lockReadOnlyRecursive(inDir); err != nil {
-		return nil, fmt.Errorf("chmod read-only in: %w", err)
-	}
-
-	if r.OnPrepared != nil {
-		r.OnPrepared(srcDir, inDir)
-	}
-
-	// key: stdin credential JSON field name; value: adapter base URL or ephemeral JWT task token
-	credsPayload, err := json.Marshal(map[string]string{
-		"openai_base_url": spec.AdapterURL,
-		"openai_api_key":  spec.TaskToken,
+	// key: stdin bootstrap JSON field name; value: controller sandbox URL or opaque task token
+	bootstrapPayload, err := json.Marshal(map[string]string{
+		"controller_url": spec.ControllerURL,
+		"task_token":     spec.TaskToken,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	kitArgs := append(
 		slices.Clone(kitCmd[1:]),
 		"run",
-		"--in-dir", inDir,
-		"--out-dir", outDir,
+		"--workspace", workRoot,
 		"--scratch-dir", scratchDir,
 	)
-	if err := runExec(runCtx, workRoot, kitCmd[0], kitArgs, bytes.NewReader(credsPayload), nil, kitTimeout); err != nil {
-		return nil, fmt.Errorf("review-kit run: %w", err)
+	if err := runExec(runCtx, workRoot, kitCmd[0], kitArgs, bytes.NewReader(bootstrapPayload), nil, kitTimeout, spec.TaskToken); err != nil {
+		return fmt.Errorf("review-kit run: %w", err)
 	}
-
-	reportOut := &cappedBuffer{max: maxReportReadBytes}
-	if err := runExec(runCtx, "", loaderBin, []string{"read-report", "--out-dir", outDir}, nil, reportOut, 15*time.Second); err != nil {
-		return nil, fmt.Errorf("loader read-report: %w", err)
-	}
-	return decodeAndValidateReport(reportOut.Bytes())
+	return nil
 }
 
 func (r *LocalProcessRunner) resolveRepoRoot() (string, error) {
@@ -175,87 +119,52 @@ func (r *LocalProcessRunner) resolveRepoRoot() (string, error) {
 	return "", errors.New("unable to locate repository root containing go.mod")
 }
 
-func (r *LocalProcessRunner) ensureLoaderBin(ctx context.Context) (string, error) {
-	if r.LoaderBin != "" {
-		return r.LoaderBin, nil
+func (r *LocalProcessRunner) ensureReviewKit(ctx context.Context) ([]string, error) {
+	r.pyMu.Lock()
+	defer r.pyMu.Unlock()
+	if r.pyKit != "" {
+		return []string{r.pyKit}, nil
 	}
-	r.loaderOnce.Do(func() {
-		repoRoot, err := r.resolveRepoRoot()
-		if err != nil {
-			r.loaderBuildErr = err
-			return
-		}
-		prebuilt := filepath.Join(repoRoot, "bin", "loader")
-		if info, statErr := os.Stat(prebuilt); statErr == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			r.builtLoaderBin = prebuilt
-			return
-		}
-		tmpDir, err := os.MkdirTemp("", "review-loader-bin-*")
-		if err != nil {
-			r.loaderBuildErr = err
-			return
-		}
-		outBin := filepath.Join(tmpDir, "loader")
-		cmd := exec.CommandContext(ctx, "go", "build", "-o", outBin, "./cmd/loader")
-		cmd.Dir = repoRoot
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GO111MODULE=on")
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if buildErr := cmd.Run(); buildErr != nil {
-			_ = os.RemoveAll(tmpDir)
-			r.loaderBuildErr = fmt.Errorf("build cmd/loader: %w (%s)", buildErr, strings.TrimSpace(stderr.String()))
-			return
-		}
-		r.builtLoaderDir = tmpDir
-		r.builtLoaderBin = outBin
-	})
-	return r.builtLoaderBin, r.loaderBuildErr
+	kit, err := r.installReviewKit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.pyKit = kit
+	return []string{kit}, nil
 }
 
-func (r *LocalProcessRunner) ensureReviewKit(ctx context.Context) ([]string, error) {
-	r.pyOnce.Do(func() {
-		pyDir := r.PythonProjectDir
-		if pyDir == "" {
-			repoRoot, err := r.resolveRepoRoot()
-			if err != nil {
-				r.pyErr = err
-				return
-			}
-			pyDir = filepath.Join(repoRoot, "python")
-		}
-		absPyDir, err := filepath.Abs(pyDir)
+func (r *LocalProcessRunner) installReviewKit(ctx context.Context) (string, error) {
+	pyDir := r.PythonProjectDir
+	if pyDir == "" {
+		repoRoot, err := r.resolveRepoRoot()
 		if err != nil {
-			r.pyErr = err
-			return
+			return "", err
 		}
-		venvKit := filepath.Join(absPyDir, ".venv", "bin", "review-kit")
-		if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
-			r.pyKit = venvKit
-			return
-		}
-
-		uvBin, err := resolveUVBinary(r.UVBin)
-		if err != nil {
-			r.pyErr = err
-			return
-		}
-		cmd := exec.CommandContext(ctx, uvBin, "--project", absPyDir, "sync", "--quiet")
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if syncErr := cmd.Run(); syncErr != nil {
-			r.pyErr = fmt.Errorf("uv sync %s: %w (%s)", absPyDir, syncErr, strings.TrimSpace(stderr.String()))
-			return
-		}
-		if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
-			r.pyKit = venvKit
-			return
-		}
-		r.pyErr = fmt.Errorf("review-kit binary not found at %s after uv sync", venvKit)
-	})
-	if r.pyErr != nil {
-		return nil, r.pyErr
+		pyDir = filepath.Join(repoRoot, "python")
 	}
-	return []string{r.pyKit}, nil
+	absPyDir, err := filepath.Abs(pyDir)
+	if err != nil {
+		return "", err
+	}
+	venvKit := filepath.Join(absPyDir, ".venv", "bin", "review-kit")
+	if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
+		return venvKit, nil
+	}
+
+	uvBin, err := resolveUVBinary(r.UVBin)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, uvBin, "--project", absPyDir, "sync", "--quiet")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if syncErr := cmd.Run(); syncErr != nil {
+		return "", fmt.Errorf("uv sync %s: %w (%s)", absPyDir, syncErr, strings.TrimSpace(stderr.String()))
+	}
+	if info, statErr := os.Stat(venvKit); statErr == nil && !info.IsDir() {
+		return venvKit, nil
+	}
+	return "", fmt.Errorf("review-kit binary not found at %s after uv sync", venvKit)
 }
 
 func resolveUVBinary(explicit string) (string, error) {
@@ -274,40 +183,6 @@ func resolveUVBinary(explicit string) (string, error) {
 	return "", errors.New("uv binary not found in PATH or ~/.local/bin/uv")
 }
 
-func lockReadOnlyRecursive(root string) error {
-	var dirs []string
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if d.IsDir() {
-			dirs = append(dirs, p)
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		perm := fs.FileMode(0o444)
-		if info.Mode()&0o111 != 0 {
-			perm = 0o555
-		}
-		return os.Chmod(p, perm)
-	})
-	if err != nil {
-		return err
-	}
-	for i := len(dirs) - 1; i >= 0; i-- {
-		if err := os.Chmod(dirs[i], 0o555); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func restoreWritableRecursive(root string) {
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil || d.Type()&os.ModeSymlink != 0 {
@@ -322,7 +197,7 @@ func restoreWritableRecursive(root string) {
 	})
 }
 
-func runExec(ctx context.Context, cwd, bin string, args []string, stdin io.Reader, stdout io.Writer, timeout time.Duration) error {
+func runExec(ctx context.Context, cwd, bin string, args []string, stdin io.Reader, stdout io.Writer, timeout time.Duration, secretTokens ...string) error {
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -333,15 +208,16 @@ func runExec(ctx context.Context, cwd, bin string, args []string, stdin io.Reade
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
-	var stderr bytes.Buffer
+	stderr := &stderrTail{max: 4096}
 	if stdout != nil {
 		cmd.Stdout = stdout
 	} else {
 		cmd.Stdout = io.Discard
 	}
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
+	cmd.WaitDelay = execWaitDelay
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s %v: %w (%s)", filepath.Base(bin), args, err, strings.TrimSpace(stderr.String()))
+		return withStderr(fmt.Errorf("%s %v: %w", filepath.Base(bin), args, err), stderr.String(), secretTokens...)
 	}
 	return nil
 }

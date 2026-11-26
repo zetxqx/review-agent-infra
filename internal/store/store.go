@@ -21,6 +21,8 @@ type RunRecord struct {
 	ID               uuid.UUID
 	Repo             string
 	PRNumber         int
+	PRTitle          string
+	PRBody           string
 	BaseSHA          string
 	HeadSHA          string
 	TriggerType      string

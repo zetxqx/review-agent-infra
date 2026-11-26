@@ -35,11 +35,7 @@ func TestReviewWithFailedReportSkipsPublishAndReturnsError(t *testing.T) {
 	script := strings.Join([]string{
 		"#!/usr/bin/env bash",
 		"set -euo pipefail",
-		"if [[ \"$*\" == *\"read-report\"* ]]; then",
-		"  echo '{\"summary\":\"Partial deliberation before the wall clock expired.\",\"findings\":[],\"provenance\":{\"profile\":\"single-shot\",\"normalizer\":\"NORMALIZER_PATH_NONE\",\"status\":\"REPORT_STATUS_HARNESS_FAILED\"}}'",
-		"else",
-		"  cat > /dev/null",
-		"fi",
+		"python3 -c 'import json, sys, urllib.request; cfg=json.load(sys.stdin); req=urllib.request.Request(cfg[\"controller_url\"]+\"/v1/sandbox/report\", data=b\"{\\\"summary\\\":\\\"Partial deliberation before the wall clock expired.\\\",\\\"findings\\\":[],\\\"provenance\\\":{\\\"profile\\\":\\\"single-shot\\\",\\\"normalizer\\\":\\\"NORMALIZER_PATH_NONE\\\",\\\"status\\\":\\\"REPORT_STATUS_HARNESS_FAILED\\\"}}\", headers={\"Authorization\":\"Bearer \"+cfg[\"task_token\"],\"Content-Type\":\"application/json\"}, method=\"POST\"); urllib.request.urlopen(req).read()'",
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(fakeDockerDir, "docker"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

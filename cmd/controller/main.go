@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rsa"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zetxqx/review-agent-infra/internal/inference"
 	"github.com/zetxqx/review-agent-infra/internal/orchestrator"
 	"github.com/zetxqx/review-agent-infra/internal/sandbox"
 	"github.com/zetxqx/review-agent-infra/internal/store"
@@ -34,35 +33,35 @@ import (
 const maxWebhookBodyBytes = 10 << 20
 
 type controllerFlags struct {
-	listenAddr         string
-	databaseURL        string
-	inMemoryStore      bool
-	configPath         string
-	workerID           string
-	maxConcurrentRuns  int
-	debounceSeconds    int
-	leaseSeconds       int
-	sandboxRunner      string
-	sandboxNamespace   string
-	loaderImage        string
-	runtimeClass       string
-	kubeconfig         string
-	dockerImage        string
-	dockerNetwork      string
-	adapterSandboxURL  string
-	adapterInternalURL string
-	modelAlias         string
-	tokenKey           string
-	tokenKeyHex        string
-	githubAppID        int64
-	githubInstallID    int64
-	githubKeyFile      string
-	githubKeyPEM       string
-	githubToken        string
-	githubWebhookSec   string
-	githubAPIURL       string
-	reapIntervalSec    int
-	feedbackPollSec    int
+	listenAddr           string
+	sandboxListenAddr    string
+	controllerSandboxURL string
+	configPath           string
+	workerID             string
+	maxConcurrentRuns    int
+	debounceSeconds      int
+	leaseSeconds         int
+	sandboxRunner        string
+	sandboxNamespace     string
+	runtimeClass         string
+	kubeconfig           string
+	dockerImage          string
+	dockerNetwork        string
+	upstreamKind         string
+	upstreamURL          string
+	upstreamKey          string
+	upstreamModel        string
+	objective            string
+	modelAlias           string
+	githubAppID          int64
+	githubInstallID      int64
+	githubKeyFile        string
+	githubKeyPEM         string
+	githubToken          string
+	githubWebhookSec     string
+	githubAPIURL         string
+	reapIntervalSec      int
+	feedbackPollSec      int
 }
 
 func main() {
@@ -88,8 +87,8 @@ func parseControllerFlags(args []string) (controllerFlags, error) {
 		return f, err
 	}
 	fs.StringVar(&f.listenAddr, "listen-addr", envOrDefault("CONTROLLER_LISTEN_ADDR", ":8080"), "")
-	fs.StringVar(&f.databaseURL, "database-url", os.Getenv("DATABASE_URL"), "")
-	fs.BoolVar(&f.inMemoryStore, "in-memory-store", os.Getenv("CONTROLLER_IN_MEMORY_STORE") == "true", "")
+	fs.StringVar(&f.sandboxListenAddr, "sandbox-listen-addr", envOrDefault("CONTROLLER_SANDBOX_LISTEN_ADDR", ":8081"), "")
+	fs.StringVar(&f.controllerSandboxURL, "controller-sandbox-url", envOrDefault("CONTROLLER_SANDBOX_URL", "http://review-controller-sandbox.review-system.svc.cluster.local:8081"), "")
 	fs.StringVar(&f.configPath, "config", os.Getenv("CONTROLLER_CONFIG_PATH"), "")
 	fs.StringVar(&f.workerID, "worker-id", envOrDefault("CONTROLLER_WORKER_ID", defaultWorkerID()), "")
 	fs.IntVar(&f.maxConcurrentRuns, "max-concurrent-runs", 4, "")
@@ -97,16 +96,16 @@ func parseControllerFlags(args []string) (controllerFlags, error) {
 	fs.IntVar(&f.leaseSeconds, "lease-seconds", 90, "")
 	fs.StringVar(&f.sandboxRunner, "sandbox-runner", envOrDefault("SANDBOX_RUNNER", "k8s"), "")
 	fs.StringVar(&f.sandboxNamespace, "sandbox-namespace", envOrDefault("SANDBOX_NAMESPACE", "review-sandbox"), "")
-	fs.StringVar(&f.loaderImage, "loader-image", envOrDefault("SANDBOX_LOADER_IMAGE", "ghcr.io/zetxqx/review-loader:0.1.0"), "")
 	fs.StringVar(&f.runtimeClass, "runtime-class", envOrDefault("SANDBOX_RUNTIME_CLASS", "gvisor"), "")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "")
 	fs.StringVar(&f.dockerImage, "docker-image", envOrDefault("SANDBOX_DOCKER_IMAGE", sandbox.DefaultSandboxImage), "")
 	fs.StringVar(&f.dockerNetwork, "docker-network", envOrDefault("SANDBOX_DOCKER_NETWORK", "bridge"), "")
-	fs.StringVar(&f.adapterSandboxURL, "adapter-sandbox-url", envOrDefault("ADAPTER_SANDBOX_URL", "http://inference-adapter.review-system.svc.cluster.local:8080"), "")
-	fs.StringVar(&f.adapterInternalURL, "adapter-internal-url", envOrDefault("ADAPTER_INTERNAL_URL", "http://inference-adapter.review-system.svc.cluster.local:9090"), "")
+	fs.StringVar(&f.upstreamKind, "upstream-kind", envOrDefault("ADAPTER_UPSTREAM_KIND", "llmd-gateway"), "")
+	fs.StringVar(&f.upstreamURL, "upstream-url", envOrDefault("ADAPTER_UPSTREAM_URL", "http://127.0.0.1:8000"), "")
+	fs.StringVar(&f.upstreamKey, "upstream-api-key", os.Getenv("ADAPTER_UPSTREAM_API_KEY"), "")
+	fs.StringVar(&f.upstreamModel, "upstream-model", envOrDefault("ADAPTER_UPSTREAM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct"), "")
+	fs.StringVar(&f.objective, "objective", envOrDefault("ADAPTER_LLMD_OBJECTIVE", "code-review-batch"), "")
 	fs.StringVar(&f.modelAlias, "model-alias", envOrDefault("MODEL_ALIAS", "review-coder"), "")
-	fs.StringVar(&f.tokenKey, "token-key", os.Getenv("ADAPTER_TOKEN_KEY"), "")
-	fs.StringVar(&f.tokenKeyHex, "token-key-hex", os.Getenv("ADAPTER_TOKEN_KEY_HEX"), "")
 	fs.Int64Var(&f.githubAppID, "github-app-id", appIDDefault, "")
 	fs.Int64Var(&f.githubInstallID, "github-installation-id", installIDDefault, "")
 	fs.StringVar(&f.githubKeyFile, "github-private-key-file", os.Getenv("GITHUB_PRIVATE_KEY_FILE"), "")
@@ -115,11 +114,29 @@ func parseControllerFlags(args []string) (controllerFlags, error) {
 	fs.StringVar(&f.githubWebhookSec, "github-webhook-secret", os.Getenv("GITHUB_WEBHOOK_SECRET"), "")
 	fs.StringVar(&f.githubAPIURL, "github-api-url", os.Getenv("GITHUB_API_URL"), "")
 	fs.IntVar(&f.reapIntervalSec, "reap-interval-seconds", 300, "")
-	fs.IntVar(&f.feedbackPollSec, "feedback-poll-seconds", 900, "")
+	fs.IntVar(&f.feedbackPollSec, "feedback-poll-seconds", 0, "")
 	if err := fs.Parse(args); err != nil {
 		return f, err
 	}
 	return f, nil
+}
+
+func buildUpstreamProvider(f controllerFlags) (contract.UpstreamProvider, error) {
+	switch f.upstreamKind {
+	case "llmd-gateway":
+		return &inference.LlmdGatewayUpstream{
+			BaseURL:   f.upstreamURL,
+			APIKey:    f.upstreamKey,
+			Objective: f.objective,
+		}, nil
+	case "vllm-direct", "ollama":
+		return &inference.VllmDirectUpstream{
+			BaseURL: f.upstreamURL,
+			APIKey:  f.upstreamKey,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown --upstream-kind %q", f.upstreamKind)
+	}
 }
 
 func runController(ctx context.Context, args []string) error {
@@ -127,36 +144,15 @@ func runController(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	tokKey, err := resolveSigningKey(flags.tokenKey, flags.tokenKeyHex)
-	if err != nil {
-		return err
-	}
 	if strings.TrimSpace(flags.githubWebhookSec) == "" {
 		return errors.New("GitHub webhook secret is required (--github-webhook-secret or GITHUB_WEBHOOK_SECRET)")
 	}
-
-	var st store.Store
-	var closeStore func()
-	if flags.inMemoryStore {
-		st = store.NewInMemoryStore()
-		closeStore = func() {}
-	} else {
-		if flags.databaseURL == "" {
-			return errors.New("PostgreSQL DSN is required (--database-url or DATABASE_URL) unless --in-memory-store is set")
-		}
-		pool, poolErr := pgxpool.New(ctx, flags.databaseURL)
-		if poolErr != nil {
-			return fmt.Errorf("connect PostgreSQL: %w", poolErr)
-		}
-		pgSt := store.NewPGStore(pool)
-		if migErr := pgSt.Migrate(ctx); migErr != nil {
-			pool.Close()
-			return fmt.Errorf("apply PostgreSQL migrations: %w", migErr)
-		}
-		st = pgSt
-		closeStore = pool.Close
+	upstream, err := buildUpstreamProvider(flags)
+	if err != nil {
+		return err
 	}
-	defer closeStore()
+
+	st := store.NewInMemoryStore()
 
 	var privKey *rsa.PrivateKey
 	if flags.githubKeyFile != "" {
@@ -208,26 +204,27 @@ func runController(ctx context.Context, args []string) error {
 	}
 
 	tel := telemetry.NewRegistry()
+	proxy := inference.NewProxyHandler(inference.Config{
+		Upstream:      upstream,
+		UpstreamModel: flags.upstreamModel,
+		ModelAlias:    flags.modelAlias,
+		Telemetry:     tel,
+	})
+
 	orch := orchestrator.New(orchestrator.Config{
-		WorkerID:           flags.workerID,
-		LeaseTTL:           time.Duration(flags.leaseSeconds) * time.Second,
-		DebounceWindow:     time.Duration(flags.debounceSeconds) * time.Second,
-		MaxConcurrentRuns:  flags.maxConcurrentRuns,
-		AdapterSandboxURL:  flags.adapterSandboxURL,
-		AdapterInternalURL: flags.adapterInternalURL,
-		TokenKey:           tokKey,
-		ModelAlias:         flags.modelAlias,
-		Harness:            harnessCfg,
-	}, st, vcs, sbxRunner, tel)
+		WorkerID:             flags.workerID,
+		LeaseTTL:             time.Duration(flags.leaseSeconds) * time.Second,
+		DebounceWindow:       time.Duration(flags.debounceSeconds) * time.Second,
+		MaxConcurrentRuns:    flags.maxConcurrentRuns,
+		ControllerSandboxURL: flags.controllerSandboxURL,
+		ModelAlias:           flags.modelAlias,
+		Harness:              harnessCfg,
+	}, st, vcs, sbxRunner, proxy, tel)
 
 	poller := orchestrator.NewFeedbackPoller(st, vcs, 30*24*time.Hour)
 
-	mux := NewControllerMux(vcs, orch, tel)
-	srv := &http.Server{
-		Addr:              flags.listenAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	publicSrv := newPublicServer(flags.listenAddr, NewControllerMux(vcs, orch, tel))
+	sandboxSrv := newSandboxServer(flags.sandboxListenAddr, proxy.SandboxMux())
 
 	var bgWG sync.WaitGroup
 	bgWG.Add(1)
@@ -252,9 +249,14 @@ func runController(ctx context.Context, args []string) error {
 		}()
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
-		if serveErr := srv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		if serveErr := publicSrv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- serveErr
+		}
+	}()
+	go func() {
+		if serveErr := sandboxSrv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			errCh <- serveErr
 		}
 	}()
@@ -262,12 +264,17 @@ func runController(ctx context.Context, args []string) error {
 	select {
 	case <-ctx.Done():
 	case serveErr := <-errCh:
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = publicSrv.Shutdown(shutCtx)
+		_ = sandboxSrv.Shutdown(shutCtx)
+		cancel()
 		return serveErr
 	}
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
+	_ = publicSrv.Shutdown(shutCtx)
+	_ = sandboxSrv.Shutdown(shutCtx)
 	bgWG.Wait()
 	return nil
 }
@@ -367,9 +374,8 @@ func buildControllerSandbox(f controllerFlags) (contract.SandboxRunner, *sandbox
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("create Kubernetes clientset: %w", err)
 		}
-		runner := sandbox.NewK8sSandboxRunner(cs, restCfg, sandbox.K8sConfig{
+		runner := sandbox.NewK8sSandboxRunner(cs, sandbox.K8sConfig{
 			Namespace:        f.sandboxNamespace,
-			LoaderImage:      f.loaderImage,
 			RuntimeClassName: f.runtimeClass,
 		})
 		reaper := sandbox.NewOrphanPodReaper(cs, f.sandboxNamespace, 5*time.Minute)
@@ -382,36 +388,6 @@ func buildControllerSandbox(f controllerFlags) (contract.SandboxRunner, *sandbox
 	default:
 		return nil, nil, nil, fmt.Errorf("unknown --sandbox-runner %q", f.sandboxRunner)
 	}
-}
-
-func loadHarnessConfigJSON(path string) (orchestrator.HarnessConfig, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return orchestrator.HarnessConfig{}, err
-	}
-	cfg := orchestrator.DefaultHarnessConfig()
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return orchestrator.HarnessConfig{}, fmt.Errorf("decode harness config %s: %w", path, err)
-	}
-	for name, profile := range cfg.Profiles {
-		if profile.Budget == nil {
-			return orchestrator.HarnessConfig{}, fmt.Errorf("harness profile %q in %s has no budget", name, path)
-		}
-	}
-	if _, ok := cfg.Profiles[cfg.Default]; !ok {
-		return orchestrator.HarnessConfig{}, fmt.Errorf("default harness profile %q in %s is not defined", cfg.Default, path)
-	}
-	return cfg, nil
-}
-
-func resolveSigningKey(rawKey, hexKey string) ([]byte, error) {
-	if hexKey != "" {
-		return hex.DecodeString(hexKey)
-	}
-	if rawKey != "" {
-		return []byte(rawKey), nil
-	}
-	return nil, errors.New("token signing key must be set via --token-key or --token-key-hex")
 }
 
 func defaultWorkerID() string {
@@ -439,4 +415,24 @@ func envOrDefault(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func newPublicServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
+func newSandboxServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 }
