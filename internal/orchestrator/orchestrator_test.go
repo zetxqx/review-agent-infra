@@ -810,3 +810,60 @@ func TestPRTitleAndBodyPropagateToAgentTask(t *testing.T) {
 		t.Fatalf("unexpected AgentTask PR metadata: title=%q body=%q", gotTask.PrTitle, gotTask.PrBody)
 	}
 }
+
+func TestPublishedInlineCommentsUseCleanRepoRelativePaths(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewInMemoryStore()
+	vcs := &fakeVCS{
+		liveHeadSHA:  "h-paths",
+		diffPatch:    []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n package a\n+func A() {}\ndiff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1,2 @@\n package b\n+func B() {}\n"),
+		tarballBytes: emptyTestTarGZ(t),
+	}
+	broker := newFakeBroker()
+	conf := 0.95
+	sbx := fakeSandboxFunc(func(_ context.Context, spec contract.SandboxSpec) error {
+		return broker.SetReport(spec.TaskToken, &reviewv1.ReviewReport{
+			Provenance: &reviewv1.Provenance{
+				Profile:    spec.HarnessProfile,
+				Normalizer: reviewv1.NormalizerPath_NORMALIZER_PATH_DETERMINISTIC,
+				Status:     reviewv1.ReportStatus_REPORT_STATUS_OK,
+			},
+			Findings: []*reviewv1.ReviewFinding{
+				{File: "./a.go", Line: 2, TargetLineText: "func A() {}", Title: "dot slash path", Explanation: "x", Severity: reviewv1.Severity_SEVERITY_HIGH, Category: reviewv1.FindingCategory_FINDING_CATEGORY_CORRECTNESS, Side: reviewv1.DiffSide_DIFF_SIDE_RIGHT, Anchor: reviewv1.AnchorKind_ANCHOR_KIND_QUOTED, Confidence: &conf},
+				{File: "/b.go", Line: 2, TargetLineText: "func B() {}", Title: "absolute path", Explanation: "y", Severity: reviewv1.Severity_SEVERITY_HIGH, Category: reviewv1.FindingCategory_FINDING_CATEGORY_SECURITY, Side: reviewv1.DiffSide_DIFF_SIDE_RIGHT, Anchor: reviewv1.AnchorKind_ANCHOR_KIND_QUOTED, Confidence: &conf},
+			},
+		})
+	})
+
+	orch := New(Config{DebounceWindow: 0}, st, vcs, sbx, broker, nil)
+	if _, err := orch.HandleEvent(ctx, &reviewv1.ReviewEvent{
+		EventId:      "ev-paths",
+		EventKind:    reviewv1.EventKind_EVENT_KIND_REVIEW,
+		Repo:         "llm-d/router",
+		PrNumber:     106,
+		BaseSha:      "b1",
+		HeadSha:      "h-paths",
+		Author:       "alice",
+		IsMaintainer: true,
+		TriggerType:  reviewv1.TriggerType_TRIGGER_TYPE_AUTO,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := orch.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("RunOnce = %v err=%v", ran, err)
+	}
+	vcs.mu.Lock()
+	defer vcs.mu.Unlock()
+	if len(vcs.published) != 1 {
+		t.Fatalf("expected one published review, got %d", len(vcs.published))
+	}
+	req := vcs.published[0]
+	if len(req.Inlines) != 2 {
+		t.Fatalf("expected two inline comments, got %+v", req.Inlines)
+	}
+	for _, ic := range req.Inlines {
+		if ic.File != "a.go" && ic.File != "b.go" {
+			t.Fatalf("inline comment path %q must be a clean repo-relative path", ic.File)
+		}
+	}
+}

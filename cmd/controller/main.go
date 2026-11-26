@@ -390,26 +390,6 @@ func buildControllerSandbox(f controllerFlags) (contract.SandboxRunner, *sandbox
 	}
 }
 
-func loadHarnessConfigJSON(path string) (orchestrator.HarnessConfig, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return orchestrator.HarnessConfig{}, err
-	}
-	cfg := orchestrator.DefaultHarnessConfig()
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return orchestrator.HarnessConfig{}, fmt.Errorf("decode harness config %s: %w", path, err)
-	}
-	for name, profile := range cfg.Profiles {
-		if profile.Budget == nil {
-			return orchestrator.HarnessConfig{}, fmt.Errorf("harness profile %q in %s has no budget", name, path)
-		}
-	}
-	if _, ok := cfg.Profiles[cfg.Default]; !ok {
-		return orchestrator.HarnessConfig{}, fmt.Errorf("default harness profile %q in %s is not defined", cfg.Default, path)
-	}
-	return cfg, nil
-}
-
 func defaultWorkerID() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {

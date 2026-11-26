@@ -3,6 +3,7 @@ package contract
 import (
 	"fmt"
 	"math"
+	"path"
 	"strings"
 
 	reviewv1 "github.com/zetxqx/review-agent-infra/gen/go/review/v1"
@@ -31,6 +32,8 @@ func DecodeAndValidateReport(raw []byte) (*reviewv1.ReviewReport, error) {
 }
 
 // ValidateReport clips string lengths, clamps lines, clears invalid confidence values, and normalizes closed enums.
+// It rewrites each finding File to a clean repository-relative path (no leading "./" or "/") and drops findings
+// whose File is empty or escapes the repository root.
 func ValidateReport(r *reviewv1.ReviewReport) {
 	if r == nil {
 		return
@@ -41,9 +44,14 @@ func ValidateReport(r *reviewv1.ReviewReport) {
 	}
 	kept := r.Findings[:0]
 	for _, f := range r.Findings {
-		if f == nil || strings.TrimSpace(f.File) == "" || strings.TrimSpace(f.Title) == "" {
+		if f == nil || strings.TrimSpace(f.Title) == "" {
 			continue
 		}
+		cleanFile, ok := cleanRepoRelativePath(f.File)
+		if !ok {
+			continue
+		}
+		f.File = cleanFile
 		if f.Line < 0 {
 			f.Line = 0
 		}
@@ -80,6 +88,21 @@ func ValidateReport(r *reviewv1.ReviewReport) {
 		kept = append(kept, f)
 	}
 	r.Findings = kept
+}
+
+func cleanRepoRelativePath(raw string) (string, bool) {
+	p := strings.TrimSpace(raw)
+	for strings.HasPrefix(p, "./") || strings.HasPrefix(p, "/") {
+		p = strings.TrimPrefix(strings.TrimPrefix(p, "./"), "/")
+	}
+	if p == "" {
+		return "", false
+	}
+	p = path.Clean(p)
+	if p == "." || p == ".." || strings.HasPrefix(p, "../") {
+		return "", false
+	}
+	return p, true
 }
 
 // FailReportOnRejectedRequests marks r HARNESS_FAILED and returns true when the controller proxy rejected
