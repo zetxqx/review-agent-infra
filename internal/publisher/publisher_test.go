@@ -374,3 +374,96 @@ func TestRunPipelineEndToEnd(t *testing.T) {
 		t.Fatalf("inline body has unescaped slash command:\n%s", res.Inlines[0].Body)
 	}
 }
+
+func TestFormatFindingMarkdownOmitsEvidenceAndFormatsCodeFences(t *testing.T) {
+	if got := FormatFindingMarkdown(nil); got != "" {
+		t.Fatalf("nil finding = %q, want empty", got)
+	}
+
+	prose := &reviewv1.ReviewFinding{
+		Severity:    reviewv1.Severity_SEVERITY_HIGH,
+		Title:       "Lock leaked on miss",
+		Explanation: "Early return skips `RUnlock`.",
+		Suggestion:  "Call `c.mu.RUnlock()` before returning.",
+		Evidence:    "internal/router/cache.go:24",
+	}
+	gotProse := FormatFindingMarkdown(prose)
+	wantProse := "**[HIGH]** Lock leaked on miss\n\nEarly return skips `RUnlock`.\n\n**Suggestion:** Call `c.mu.RUnlock()` before returning."
+	if gotProse != wantProse {
+		t.Fatalf("prose markdown =\n%q\nwant:\n%q", gotProse, wantProse)
+	}
+	if strings.Contains(gotProse, "**Evidence:**") || strings.Contains(gotProse, "cache.go:24") {
+		t.Fatalf("evidence leaked into rendered markdown:\n%s", gotProse)
+	}
+
+	backtickFence := &reviewv1.ReviewFinding{
+		Severity:   reviewv1.Severity_SEVERITY_MEDIUM,
+		Title:      "Unclamped upper bound",
+		Suggestion: "```go\nif end >= len(lines) {\n\tend = len(lines) - 1\n}\n```",
+		Evidence:   "window_sample.go:36",
+	}
+	gotBacktick := FormatFindingMarkdown(backtickFence)
+	wantBacktick := "**[MEDIUM]** Unclamped upper bound\n\n**Suggestion:**\n```go\nif end >= len(lines) {\n\tend = len(lines) - 1\n}\n```"
+	if gotBacktick != wantBacktick {
+		t.Fatalf("backtick fence markdown =\n%q\nwant:\n%q", gotBacktick, wantBacktick)
+	}
+
+	tildeFence := &reviewv1.ReviewFinding{
+		Severity:   reviewv1.Severity_SEVERITY_LOW,
+		Title:      "Single-line fix",
+		Suggestion: "~~~suggestion\nreturn \"\"\n~~~",
+	}
+	gotTilde := FormatFindingMarkdown(tildeFence)
+	wantTilde := "**[LOW]** Single-line fix\n\n**Suggestion:**\n~~~suggestion\nreturn \"\"\n~~~"
+	if gotTilde != wantTilde {
+		t.Fatalf("tilde fence markdown =\n%q\nwant:\n%q", gotTilde, wantTilde)
+	}
+
+	proseThenFence := &reviewv1.ReviewFinding{
+		Severity:   reviewv1.Severity_SEVERITY_HIGH,
+		Title:      "Bounds check",
+		Suggestion: "Guard empty range before slicing:\n```go\nif start > end {\n\treturn \"\"\n}\n```",
+	}
+	gotProseThenFence := FormatFindingMarkdown(proseThenFence)
+	wantProseThenFence := "**[HIGH]** Bounds check\n\n**Suggestion:**\nGuard empty range before slicing:\n```go\nif start > end {\n\treturn \"\"\n}\n```"
+	if gotProseThenFence != wantProseThenFence {
+		t.Fatalf("prose+fence markdown =\n%q\nwant:\n%q", gotProseThenFence, wantProseThenFence)
+	}
+
+	hi := 0.95
+	report := &reviewv1.ReviewReport{
+		Findings: []*reviewv1.ReviewFinding{
+			{
+				File:           "internal/router/cache.go",
+				Line:           13,
+				Side:           reviewv1.DiffSide_DIFF_SIDE_RIGHT,
+				TargetLineText: `return "", false`,
+				Anchor:         reviewv1.AnchorKind_ANCHOR_KIND_QUOTED,
+				Severity:       reviewv1.Severity_SEVERITY_HIGH,
+				Confidence:     &hi,
+				Title:          "RLock leaked",
+				Explanation:    "Returns while holding read lock.",
+				Suggestion:     "```go\nc.mu.RUnlock()\nreturn \"\", false\n```",
+				Evidence:       "internal/router/cache.go:13 @maintainer secret-tok",
+			},
+		},
+	}
+	opts := DefaultPipelineOptions()
+	opts.MintedTokens = []string{"secret-tok"}
+	res := RunPipeline(report, []byte(sampleUnifiedDiff), opts)
+	if len(res.Inlines) != 1 || len(res.Aligned) != 1 {
+		t.Fatalf("pipeline counts: inlines=%d aligned=%d, want 1", len(res.Inlines), len(res.Aligned))
+	}
+	if strings.Contains(res.Inlines[0].Body, "**Evidence:**") {
+		t.Fatalf("inline body unexpectedly contains Evidence section:\n%s", res.Inlines[0].Body)
+	}
+	if !strings.Contains(res.Inlines[0].Body, "**Suggestion:**\n```go\n") {
+		t.Fatalf("inline body did not put fenced suggestion on new line:\n%s", res.Inlines[0].Body)
+	}
+	if strings.Contains(res.Aligned[0].Finding.Evidence, "secret-tok") || strings.Contains(res.Aligned[0].Finding.Evidence, "@maintainer") {
+		t.Fatalf("finding evidence was not sanitized on struct: %q", res.Aligned[0].Finding.Evidence)
+	}
+	if !strings.Contains(res.Aligned[0].Finding.Evidence, RedactedPlaceholder) {
+		t.Fatalf("finding evidence missing redaction placeholder: %q", res.Aligned[0].Finding.Evidence)
+	}
+}
