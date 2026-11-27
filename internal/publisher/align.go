@@ -301,19 +301,29 @@ func FormatFindingMarkdown(f *reviewv1.ReviewFinding) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "**[%s]** %s", severityLabel(f.Severity), f.Title)
-	if strings.TrimSpace(f.Explanation) != "" {
+	if explanation := strings.TrimSpace(f.Explanation); explanation != "" {
 		b.WriteString("\n\n")
-		b.WriteString(strings.TrimSpace(f.Explanation))
+		b.WriteString(explanation)
 	}
-	if strings.TrimSpace(f.Suggestion) != "" {
-		b.WriteString("\n\n**Suggestion:** ")
-		b.WriteString(strings.TrimSpace(f.Suggestion))
-	}
-	if strings.TrimSpace(f.Evidence) != "" {
-		b.WriteString("\n\n**Evidence:** ")
-		b.WriteString(strings.TrimSpace(f.Evidence))
+	if suggestion := strings.TrimSpace(f.Suggestion); suggestion != "" {
+		if suggestionHasCodeFence(suggestion) {
+			b.WriteString("\n\n**Suggestion:**\n")
+		} else {
+			b.WriteString("\n\n**Suggestion:** ")
+		}
+		b.WriteString(suggestion)
 	}
 	return b.String()
+}
+
+func suggestionHasCodeFence(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimLeft(line, " \t\r")
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeFindingFields(f *reviewv1.ReviewFinding, mintedTokens []string) {
