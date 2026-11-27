@@ -22,7 +22,7 @@ Field rules:
 - `targetLineText`: Copy the exact text of the flagged line from the diff.
 - `summary`: 1-2 short sentences max stating overall risk/theme (or `""` when inline findings speak for themselves). Never re-list or repeat individual findings in `summary`.
 - `explanation`: 2-4 concise sentences max stating the failure mechanism, trigger condition, and any cross-file contract (`path:line`). Do not copy code already visible in the diff hunk.
-- `suggestion`: 1-2 concise sentences or a short fenced code snippet. Use a fenced ```suggestion block only when replacing the single `targetLineText` line on `DIFF_SIDE_RIGHT`; use language fences (`go`, `python`) for multi-line snippets. Explicitly verify your suggested fix handles boundary inputs (empty inputs, negative values, `start > end`, upper-bound clamping) without introducing a secondary bug.
+- `suggestion`: 1-2 concise sentences or a short, idiomatic fenced code snippet (no dead defensive checks). Ensure the snippet resolves every defect noted in `explanation` and handles edge cases cleanly. Use ```suggestion only when replacing the single `targetLineText` line on `DIFF_SIDE_RIGHT`; otherwise use a language fence (`go`, `python`).
 - `evidence`: Short 1-line `path:line` citation only (`<= 200` chars); do not paste multi-line source blocks.
 
 ## Pull request
